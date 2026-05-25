@@ -1,22 +1,31 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ProviderError {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum ModelError {
+    #[error("rate limited: {message}")]
     RateLimit {
         retry_after: Option<Duration>,
         message: String,
     },
-    Auth {
-        message: String,
-    },
+    #[error("authentication failed: {message}")]
+    Auth { message: String },
+    #[error("request timed out")]
     Timeout,
-    ServerError {
-        message: String,
-    },
-    Unknown {
-        message: String,
-    },
+    #[error("server error: {message}")]
+    Server { message: String },
+    #[error("model protocol error: {message}")]
+    Protocol { message: String },
+    #[error("unknown model error: {message}")]
+    Unknown { message: String },
 }
 
-pub type ModelResult<T> = Result<T, ProviderError>;
+impl ModelError {
+    pub fn protocol(message: impl Into<String>) -> Self {
+        Self::Protocol {
+            message: message.into(),
+        }
+    }
+}
+
+pub type ModelResult<T> = Result<T, ModelError>;

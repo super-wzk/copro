@@ -1,6 +1,6 @@
 use crate::request::GenerateRequest;
 use crate::stream::ModelStream;
 
-pub trait ChatModel {
-    fn stream(&'_ self, request: GenerateRequest) -> ModelStream<'_>;
+pub trait ChatModel: Send + Sync {
+    fn stream(&self, request: GenerateRequest) -> ModelStream<'_>;
 }
