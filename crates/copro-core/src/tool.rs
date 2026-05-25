@@ -1,8 +1,22 @@
-use crate::types::ToolDefinition;
 use schemars::JsonSchema;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolChoice {
+    Auto,
+    None,
+    Required,
+    Specific { name: String },
+}
 
 pub trait Tool {
     type Input: DeserializeOwned + JsonSchema;
