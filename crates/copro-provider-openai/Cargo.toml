@@ -1,0 +1,15 @@
+[package]
+name = "copro-provider-openai"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+copro-core.workspace = true
+async-openai.workspace = true
+async-stream.workspace = true
+base64.workspace = true
+futures-util.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

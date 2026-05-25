@@ -1,17 +1,15 @@
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum ModelError {
-    #[error("rate limited: {message}")]
-    RateLimit {
-        retry_after: Option<Duration>,
-        message: String,
-    },
-    #[error("authentication failed: {message}")]
-    Auth { message: String },
+    #[error("provider not found: {provider_id}")]
+    ProviderNotFound { provider_id: String },
+    #[error("provider factory not found: {factory_kind}")]
+    ProviderFactoryNotFound { factory_kind: String },
     #[error("request timed out")]
     Timeout,
+    #[error("client error: {message}")]
+    Client { message: String },
     #[error("server error: {message}")]
     Server { message: String },
     #[error("model protocol error: {message}")]
@@ -21,6 +19,12 @@ pub enum ModelError {
 }
 
 impl ModelError {
+    pub fn client(message: impl Into<String>) -> Self {
+        Self::Client {
+            message: message.into(),
+        }
+    }
+
     pub fn protocol(message: impl Into<String>) -> Self {
         Self::Protocol {
             message: message.into(),

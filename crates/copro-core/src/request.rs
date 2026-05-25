@@ -3,18 +3,10 @@ use crate::tool::{ToolChoice, ToolDefinition};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ThinkingOptions {
-    Disabled,
-    BudgetTokens { tokens: u32 },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GenerateOptions {
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
-    pub thinking: Option<ThinkingOptions>,
     pub timeout: Option<Duration>,
 }
 

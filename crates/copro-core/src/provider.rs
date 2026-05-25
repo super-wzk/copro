@@ -41,7 +41,7 @@ where
 
     fn chat_model_json(&self, model_id: &str, config: Value) -> ModelResult<Arc<dyn ChatModel>> {
         let config = serde_json::from_value::<P::Config>(config).map_err(|error| {
-            ModelError::protocol(format!("invalid provider model config: {error}"))
+            ModelError::client(format!("invalid provider model config: {error}"))
         })?;
 
         self.chat_model(model_id, config)
@@ -83,7 +83,7 @@ where
 
     fn build_provider_json(&self, config: Value) -> ModelResult<Arc<dyn ErasedModelProvider>> {
         let config = serde_json::from_value::<F::Config>(config)
-            .map_err(|error| ModelError::protocol(format!("invalid provider config: {error}")))?;
+            .map_err(|error| ModelError::client(format!("invalid provider config: {error}")))?;
 
         self.build_provider(config)
     }
@@ -131,9 +131,11 @@ impl ProviderRegistry {
         factory_kind: &str,
         config: Value,
     ) -> ModelResult<Option<Arc<dyn ErasedModelProvider>>> {
-        let factory = self
-            .factory(factory_kind)
-            .ok_or_else(|| factory_not_found(factory_kind))?;
+        let factory =
+            self.factory(factory_kind)
+                .ok_or_else(|| ModelError::ProviderFactoryNotFound {
+                    factory_kind: factory_kind.to_string(),
+                })?;
         let provider = factory.build_provider_json(config)?;
 
         Ok(self.register_provider_erased(provider_id, provider))
@@ -179,7 +181,7 @@ impl ProviderRegistry {
             Some(provider) => provider.list_models(),
             None => {
                 let provider_id = provider_id.to_string();
-                Box::pin(async move { Err(provider_not_found(&provider_id)) })
+                Box::pin(async move { Err(ModelError::ProviderNotFound { provider_id }) })
             }
         }
     }
@@ -192,21 +194,11 @@ impl ProviderRegistry {
     ) -> ModelResult<Arc<dyn ChatModel>> {
         let provider = self
             .provider(provider_id)
-            .ok_or_else(|| provider_not_found(provider_id))?;
+            .ok_or_else(|| ModelError::ProviderNotFound {
+                provider_id: provider_id.to_string(),
+            })?;
 
         provider.chat_model_json(model_id, config)
-    }
-}
-
-fn provider_not_found(provider_id: &str) -> ModelError {
-    ModelError::Unknown {
-        message: format!("provider not found: {provider_id}"),
-    }
-}
-
-fn factory_not_found(factory_kind: &str) -> ModelError {
-    ModelError::Unknown {
-        message: format!("provider factory not found: {factory_kind}"),
     }
 }
 
@@ -354,6 +346,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(models[0].id, "test-model");
+    }
+
+    #[test]
+    fn registry_reports_missing_provider() {
+        let registry = ProviderRegistry::new();
+        let Err(error) = registry.chat_model_json("missing", "model", serde_json::json!({})) else {
+            panic!("expected missing provider error");
+        };
+
+        assert_eq!(
+            error,
+            ModelError::ProviderNotFound {
+                provider_id: "missing".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn registry_reports_missing_factory() {
+        let mut registry = ProviderRegistry::new();
+        let Err(error) = registry.upsert_provider_json("local", "missing", serde_json::json!({}))
+        else {
+            panic!("expected missing factory error");
+        };
+
+        assert_eq!(
+            error,
+            ModelError::ProviderFactoryNotFound {
+                factory_kind: "missing".to_string(),
+            }
+        );
     }
 
     #[test]
