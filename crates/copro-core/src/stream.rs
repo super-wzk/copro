@@ -93,13 +93,11 @@ impl AssistantStreamState {
         if self.content.len() <= content_index {
             self.content.resize_with(content_index + 1, || None);
         }
-
-        match &mut self.content[content_index] {
-            Some(state) => state.apply_delta(content_index, delta),
-            slot @ None => {
-                *slot = Some(AssistantContentState::from_delta(delta));
-                Ok(())
-            }
+        if let Some(state) = &mut self.content[content_index] {
+            state.apply_delta(content_index, delta)
+        } else {
+            self.content[content_index] = Some(AssistantContentState::from_delta(delta));
+            Ok(())
         }
     }
 }
