@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
-pub enum ModelError {
+pub enum Error {
+    #[error("model not found: {model_id}")]
+    ModelNotFound { model_id: String },
     #[error("provider not found: {provider_id}")]
     ProviderNotFound { provider_id: String },
-    #[error("provider factory not found: {factory_kind}")]
-    ProviderFactoryNotFound { factory_kind: String },
     #[error("request timed out")]
     Timeout,
     #[error("client error: {message}")]
@@ -18,7 +18,7 @@ pub enum ModelError {
     Unknown { message: String },
 }
 
-impl ModelError {
+impl Error {
     pub fn client(message: impl Into<String>) -> Self {
         Self::Client {
             message: message.into(),
@@ -32,4 +32,4 @@ impl ModelError {
     }
 }
 
-pub type ModelResult<T> = Result<T, ModelError>;
+pub type Result<T> = std::result::Result<T, Error>;

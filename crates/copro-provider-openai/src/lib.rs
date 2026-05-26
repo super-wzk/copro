@@ -1,4 +1,3 @@
-mod capabilities;
 mod config;
 mod error;
 mod provider;
@@ -9,6 +8,4 @@ pub use config::{
     OpenAiImageGenerationTool, OpenAiResponsesModelConfig, OpenAiResponsesProviderConfig,
     OpenAiResponsesRequestOptions,
 };
-pub use provider::{
-    OpenAiResponsesChatModel, OpenAiResponsesProvider, OpenAiResponsesProviderFactory,
-};
+pub use provider::{OpenAiResponsesChat, OpenAiResponsesProvider, gpt_5_4, gpt_5_5};

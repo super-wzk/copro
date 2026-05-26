@@ -1,7 +1,4 @@
-use crate::error::{ModelError, ModelResult};
-use crate::request::GenerateRequest;
-use crate::response::GenerateResponse;
-use crate::stream::{ModelStream, OutputStreamState};
+use crate::error::{Error, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -9,7 +6,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 
-pub type ModelFuture<'a, T> = Pin<Box<dyn Future<Output = ModelResult<T>> + Send + 'a>>;
+pub type ModelFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,26 +55,25 @@ impl ModelCapabilities {
         self
     }
 
-    pub fn extra<T>(&self) -> ModelResult<T>
+    pub fn extra<T>(&self) -> Result<T>
     where
         T: DeserializeOwned,
     {
-        serde_json::from_value(Value::Object(self.extra.clone())).map_err(|error| {
-            ModelError::client(format!("invalid model capabilities extra: {error}"))
-        })
+        serde_json::from_value(Value::Object(self.extra.clone()))
+            .map_err(|error| Error::client(format!("invalid model capabilities extra: {error}")))
     }
 
-    pub fn insert_extra<T>(&mut self, extra: T) -> ModelResult<()>
+    pub fn insert_extra<T>(&mut self, extra: T) -> Result<()>
     where
         T: Serialize,
     {
         let value = serde_json::to_value(extra).map_err(|error| {
-            ModelError::client(format!(
+            Error::client(format!(
                 "failed to serialize model capabilities extra: {error}"
             ))
         })?;
         let Value::Object(extra) = value else {
-            return Err(ModelError::client(
+            return Err(Error::client(
                 "model capabilities extra must serialize to a JSON object",
             ));
         };
@@ -86,7 +82,7 @@ impl ModelCapabilities {
         Ok(())
     }
 
-    pub fn with_extra<T>(mut self, extra: T) -> ModelResult<Self>
+    pub fn with_extra<T>(mut self, extra: T) -> Result<Self>
     where
         T: Serialize,
     {
@@ -102,20 +98,78 @@ impl ModelCapabilities {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
-    pub display_name: Option<String>,
+    pub name: Option<String>,
     pub capabilities: ModelCapabilities,
 }
 
-pub trait ChatModel: Send + Sync {
-    /// Starts a streaming generation request.
-    ///
-    /// Implementations should return promptly and defer network I/O until the
-    /// returned stream is polled, so runtimes can apply deadlines and cancellation.
-    fn stream(&self, request: GenerateRequest) -> ModelStream<'_>;
+/// A locally configured model entry bound to a provider instance.
+///
+/// `provider_id` points at a registered provider in `ProviderRegistry`., while
+/// `id` is the model identifier used both by the registry and by that provider
+/// (for example `gpt-5.5` for OpenAI). This keeps model discovery and model
+/// configuration out of provider implementations: providers only know how to
+/// construct a chat model for an explicit id and provider-specific config.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDefinition {
+    pub provider_id: String,
+    pub id: String,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub capabilities: ModelCapabilities,
+    #[serde(default = "default_model_config")]
+    pub config: Value,
+}
 
-    fn generate(&self, request: GenerateRequest) -> ModelFuture<'_, GenerateResponse> {
-        Box::pin(async move { OutputStreamState::collect(self.stream(request)).await })
+impl ModelDefinition {
+    pub fn new(provider_id: impl Into<String>, id: impl Into<String>) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            id: id.into(),
+            name: None,
+            capabilities: ModelCapabilities::default(),
+            config: default_model_config(),
+        }
     }
+
+    pub fn info(&self) -> ModelInfo {
+        ModelInfo {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            capabilities: self.capabilities.clone(),
+        }
+    }
+
+    pub fn config<T>(&self) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        serde_json::from_value(self.config.clone())
+            .map_err(|error| Error::client(format!("invalid model config: {error}")))
+    }
+
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    pub fn with_capabilities(mut self, capabilities: ModelCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    pub fn with_config<T>(mut self, config: T) -> Result<Self>
+    where
+        T: Serialize,
+    {
+        self.config = serde_json::to_value(config)
+            .map_err(|error| Error::client(format!("failed to serialize model config: {error}")))?;
+        Ok(self)
+    }
+}
+
+fn default_model_config() -> Value {
+    Value::Object(Map::new())
 }
 
 #[cfg(test)]
@@ -165,7 +219,7 @@ mod tests {
 
         let error = capabilities.extra::<TestExtra>().unwrap_err();
 
-        assert!(matches!(error, ModelError::Client { .. }));
+        assert!(matches!(error, Error::Client { .. }));
     }
 
     #[test]
@@ -174,6 +228,6 @@ mod tests {
 
         let error = capabilities.insert_extra(42).unwrap_err();
 
-        assert!(matches!(error, ModelError::Client { .. }));
+        assert!(matches!(error, Error::Client { .. }));
     }
 }

@@ -20,7 +20,6 @@ copro-provider-openai = { path = "crates/copro-provider-openai" }
 
 async-openai = { version = "0.40.2", default-features = false, features = [
   "byot",
-  "model",
   "responses",
   "rustls",
 ] }

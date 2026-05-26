@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::capabilities::infer_capabilities;
 use crate::config::{OpenAiResponsesModelConfig, OpenAiResponsesProviderConfig};
 use crate::error::map_openai_error;
 use crate::request::build_response_body;
@@ -8,22 +7,13 @@ use crate::stream::OpenAiEventMapper;
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 use async_openai::types::responses::ResponseStreamEvent;
-use copro_core::error::{ModelError, ModelResult};
-use copro_core::model::{ChatModel, ModelFuture, ModelInfo};
-use copro_core::provider::ModelProvider;
+use copro_core::error::{Error, Result};
+use copro_core::model::{InputModality, ModelCapabilities, ModelDefinition, ModelFeature};
+use copro_core::provider::{Chat, Provider};
 use copro_core::request::GenerateRequest;
 use copro_core::stream::ModelStream;
-use copro_derive::CoproProviderFactory;
 use futures_util::StreamExt;
 use serde_json::Value;
-
-#[derive(Debug, Clone, Copy, Default, CoproProviderFactory)]
-#[provider(
-    kind = "openai-responses",
-    config = OpenAiResponsesProviderConfig,
-    provider = OpenAiResponsesProvider
-)]
-pub struct OpenAiResponsesProviderFactory;
 
 #[derive(Clone)]
 pub struct OpenAiResponsesProvider {
@@ -36,51 +26,76 @@ impl OpenAiResponsesProvider {
             client: Client::with_config(openai_config(config)),
         }
     }
+
+    /// Build a [`ModelDefinition`] bound to this provider.
+    pub fn model_definition(
+        &self,
+        id: impl Into<String>,
+        config: OpenAiResponsesModelConfig,
+    ) -> Result<ModelDefinition> {
+        ModelDefinition::new(self.id(), id).with_config(config)
+    }
 }
 
-impl ModelProvider for OpenAiResponsesProvider {
-    type Config = OpenAiResponsesModelConfig;
+/// Pre-built [`ModelDefinition`] for `gpt-5.5` with default configuration.
+pub fn gpt_5_5() -> Result<ModelDefinition> {
+    ModelDefinition::new("openai-responses", "gpt-5.5")
+        .with_capabilities(
+            ModelCapabilities::default()
+                .with_input_modality(InputModality::Text)
+                .with_input_modality(InputModality::Image)
+                .with_feature(ModelFeature::NativeStreaming)
+                .with_feature(ModelFeature::Tools)
+                .with_feature(ModelFeature::ToolChoice)
+                .with_feature(ModelFeature::Thinking),
+        )
+        .with_config(OpenAiResponsesModelConfig::default())
+}
 
-    fn list_models(&self) -> ModelFuture<'_, Vec<ModelInfo>> {
-        let client = self.client.clone();
+/// Pre-built [`ModelDefinition`] for `gpt-5.4` with default configuration.
+pub fn gpt_5_4() -> Result<ModelDefinition> {
+    ModelDefinition::new("openai-responses", "gpt-5.4")
+        .with_capabilities(
+            ModelCapabilities::default()
+                .with_input_modality(InputModality::Text)
+                .with_input_modality(InputModality::Image)
+                .with_feature(ModelFeature::NativeStreaming)
+                .with_feature(ModelFeature::Tools)
+                .with_feature(ModelFeature::ToolChoice)
+                .with_feature(ModelFeature::Thinking),
+        )
+        .with_config(OpenAiResponsesModelConfig::default())
+}
 
-        Box::pin(async move {
-            let response = client.models().list().await.map_err(map_openai_error)?;
-            let mut models = response
-                .data
-                .into_iter()
-                .map(|model| ModelInfo {
-                    capabilities: infer_capabilities(&model.id),
-                    display_name: None,
-                    id: model.id,
-                })
-                .collect::<Vec<_>>();
-            models.sort_by(|left, right| left.id.cmp(&right.id));
-            Ok(models)
-        })
+impl Provider for OpenAiResponsesProvider {
+    fn id(&self) -> &str {
+        "openai-responses"
     }
 
-    fn chat_model(&self, model_id: &str, config: Self::Config) -> ModelResult<Arc<dyn ChatModel>> {
-        if model_id.trim().is_empty() {
-            return Err(ModelError::client("OpenAI model id cannot be empty"));
+    fn chat(&self, id: &str, config: Value) -> Result<Arc<dyn Chat>> {
+        let model_config: OpenAiResponsesModelConfig = serde_json::from_value(config)
+            .map_err(|e| Error::client(format!("invalid model config: {e}")))?;
+
+        if id.trim().is_empty() {
+            return Err(Error::client("OpenAI model id cannot be empty"));
         }
 
-        Ok(Arc::new(OpenAiResponsesChatModel {
+        Ok(Arc::new(OpenAiResponsesChat {
             client: self.client.clone(),
-            model_config: config,
-            model_id: model_id.to_string(),
+            model_config,
+            model_id: id.to_string(),
         }))
     }
 }
 
 #[derive(Clone)]
-pub struct OpenAiResponsesChatModel {
+pub struct OpenAiResponsesChat {
     client: Client<OpenAIConfig>,
     model_id: String,
     model_config: OpenAiResponsesModelConfig,
 }
 
-impl ChatModel for OpenAiResponsesChatModel {
+impl Chat for OpenAiResponsesChat {
     fn stream(&self, request: GenerateRequest) -> ModelStream<'_> {
         let body = match build_response_body(&self.model_id, &self.model_config, request) {
             Ok(body) => body,
@@ -109,7 +124,7 @@ impl ChatModel for OpenAiResponsesChatModel {
 async fn create_response_stream(
     client: &Client<OpenAIConfig>,
     body: Value,
-) -> ModelResult<async_openai::types::responses::ResponseStream> {
+) -> Result<async_openai::types::responses::ResponseStream> {
     let responses = client.responses();
     responses
         .create_stream_byot::<_, ResponseStreamEvent>(body)
@@ -119,7 +134,7 @@ async fn create_response_stream(
 
 async fn next_openai_event(
     stream: &mut async_openai::types::responses::ResponseStream,
-) -> ModelResult<Option<ResponseStreamEvent>> {
+) -> Result<Option<ResponseStreamEvent>> {
     stream.next().await.transpose().map_err(map_openai_error)
 }
 

@@ -1,4 +1,4 @@
-use crate::error::{ModelError, ModelResult};
+use crate::error::{Error, Result};
 use crate::message::Message;
 use crate::tool::{HostedToolSpec, ToolChoice, ToolDefinition};
 use serde::de::DeserializeOwned;
@@ -15,26 +15,26 @@ pub struct GenerateRequestOptions {
 }
 
 impl GenerateRequestOptions {
-    pub fn extra<T>(&self) -> ModelResult<T>
+    pub fn extra<T>(&self) -> Result<T>
     where
         T: DeserializeOwned,
     {
         serde_json::from_value(Value::Object(self.extra.clone())).map_err(|error| {
-            ModelError::client(format!("invalid generate request options extra: {error}"))
+            Error::client(format!("invalid generate request options extra: {error}"))
         })
     }
 
-    pub fn insert_extra<T>(&mut self, extra: T) -> ModelResult<()>
+    pub fn insert_extra<T>(&mut self, extra: T) -> Result<()>
     where
         T: Serialize,
     {
         let value = serde_json::to_value(extra).map_err(|error| {
-            ModelError::client(format!(
+            Error::client(format!(
                 "failed to serialize generate request options extra: {error}"
             ))
         })?;
         let Value::Object(extra) = value else {
-            return Err(ModelError::client(
+            return Err(Error::client(
                 "generate request options extra must serialize to a JSON object",
             ));
         };
@@ -43,7 +43,7 @@ impl GenerateRequestOptions {
         Ok(())
     }
 
-    pub fn with_extra<T>(mut self, extra: T) -> ModelResult<Self>
+    pub fn with_extra<T>(mut self, extra: T) -> Result<Self>
     where
         T: Serialize,
     {
@@ -114,7 +114,7 @@ mod tests {
 
         let error = options.extra::<TestExtension>().unwrap_err();
 
-        assert!(matches!(error, ModelError::Client { .. }));
+        assert!(matches!(error, Error::Client { .. }));
     }
 
     #[test]
@@ -123,6 +123,6 @@ mod tests {
 
         let error = options.insert_extra(42).unwrap_err();
 
-        assert!(matches!(error, ModelError::Client { .. }));
+        assert!(matches!(error, Error::Client { .. }));
     }
 }

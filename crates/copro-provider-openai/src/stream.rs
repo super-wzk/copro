@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_openai::types::responses::ResponseStreamEvent;
 use base64::Engine;
-use copro_core::error::{ModelError, ModelResult};
+use copro_core::error::{Error, Result};
 use copro_core::message::ImageContent;
 use copro_core::response::{FinishReason, Usage};
 use copro_core::stream::{OutputContentDelta, OutputStreamEvent};
@@ -74,7 +74,7 @@ impl OpenAiEventMapper {
     pub(crate) fn map_event(
         &mut self,
         event: ResponseStreamEvent,
-    ) -> ModelResult<Vec<OutputStreamEvent>> {
+    ) -> Result<Vec<OutputStreamEvent>> {
         match event {
             ResponseStreamEvent::ResponseOutputTextDelta(event) => Ok(vec![self.delta(
                 StreamKey::text(event.output_index, event.content_index),
@@ -153,7 +153,7 @@ impl OpenAiEventMapper {
             ResponseStreamEvent::ResponseFailed(event) => {
                 Err(crate::error::response_error(event.response))
             }
-            ResponseStreamEvent::ResponseError(event) => Err(ModelError::protocol(format!(
+            ResponseStreamEvent::ResponseError(event) => Err(Error::protocol(format!(
                 "OpenAI stream error: {}{}",
                 event.message,
                 event
@@ -170,9 +170,9 @@ impl OpenAiEventMapper {
         output_index: u32,
         item: &impl Serialize,
         done: bool,
-    ) -> ModelResult<Vec<OutputStreamEvent>> {
+    ) -> Result<Vec<OutputStreamEvent>> {
         let item = serde_json::to_value(item).map_err(|error| {
-            ModelError::protocol(format!("failed to serialize OpenAI output item: {error}"))
+            Error::protocol(format!("failed to serialize OpenAI output item: {error}"))
         })?;
         if done && let Some(image) = image_from_item(&item)? {
             return Ok(vec![self.delta(
@@ -239,7 +239,7 @@ struct ToolCallDelta {
     arguments: String,
 }
 
-fn image_from_item(item: &Value) -> ModelResult<Option<ImageContent>> {
+fn image_from_item(item: &Value) -> Result<Option<ImageContent>> {
     if item.get("type").and_then(Value::as_str) != Some("image_generation_call") {
         return Ok(None);
     }
@@ -251,11 +251,11 @@ fn image_from_item(item: &Value) -> ModelResult<Option<ImageContent>> {
     decode_openai_image_base64(image_base64).map(Some)
 }
 
-fn decode_openai_image_base64(image_base64: &str) -> ModelResult<ImageContent> {
+fn decode_openai_image_base64(image_base64: &str) -> Result<ImageContent> {
     let data = base64::engine::general_purpose::STANDARD
         .decode(image_base64)
         .map_err(|error| {
-            ModelError::protocol(format!("failed to decode OpenAI image output: {error}"))
+            Error::protocol(format!("failed to decode OpenAI image output: {error}"))
         })?;
 
     Ok(ImageContent::Data {

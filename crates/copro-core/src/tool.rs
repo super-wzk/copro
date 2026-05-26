@@ -1,4 +1,4 @@
-use crate::error::{ModelError, ModelResult};
+use crate::error::{Error, Result};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -27,30 +27,30 @@ impl HostedToolSpec {
         }
     }
 
-    pub fn parameters<T>(&self) -> ModelResult<T>
+    pub fn parameters<T>(&self) -> Result<T>
     where
         T: DeserializeOwned,
     {
         serde_json::from_value(Value::Object(self.parameters.clone())).map_err(|error| {
-            ModelError::client(format!(
+            Error::client(format!(
                 "invalid hosted tool `{}` parameters: {error}",
                 self.kind
             ))
         })
     }
 
-    pub fn insert_parameters<T>(&mut self, parameters: T) -> ModelResult<()>
+    pub fn insert_parameters<T>(&mut self, parameters: T) -> Result<()>
     where
         T: Serialize,
     {
         let value = serde_json::to_value(parameters).map_err(|error| {
-            ModelError::client(format!(
+            Error::client(format!(
                 "failed to serialize hosted tool `{}` parameters: {error}",
                 self.kind
             ))
         })?;
         let Value::Object(parameters) = value else {
-            return Err(ModelError::client(format!(
+            return Err(Error::client(format!(
                 "hosted tool `{}` parameters must serialize to a JSON object",
                 self.kind
             )));
@@ -60,7 +60,7 @@ impl HostedToolSpec {
         Ok(())
     }
 
-    pub fn with_parameters<T>(mut self, parameters: T) -> ModelResult<Self>
+    pub fn with_parameters<T>(mut self, parameters: T) -> Result<Self>
     where
         T: Serialize,
     {
@@ -86,14 +86,14 @@ pub trait Tool {
     type Output: Serialize;
     fn name(&self) -> &str;
     fn description(&self) -> &str;
-    fn call(&self, input: Self::Input) -> Result<Self::Output, String>;
+    fn call(&self, input: Self::Input) -> std::result::Result<Self::Output, String>;
 }
 
 pub trait ErasedTool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameters(&self) -> Value;
-    fn call_json(&self, args: Value) -> Result<Value, String>;
+    fn call_json(&self, args: Value) -> std::result::Result<Value, String>;
 }
 
 impl<T: Tool + Send + Sync> ErasedTool for T {
@@ -107,7 +107,7 @@ impl<T: Tool + Send + Sync> ErasedTool for T {
         let schema = schemars::schema_for!(T::Input);
         serde_json::to_value(schema).unwrap_or_default()
     }
-    fn call_json(&self, args: Value) -> Result<Value, String> {
+    fn call_json(&self, args: Value) -> std::result::Result<Value, String> {
         let input = serde_json::from_value::<T::Input>(args).map_err(|e| e.to_string())?;
         let output = self.call(input)?;
         serde_json::to_value(output).map_err(|e| e.to_string())
@@ -126,7 +126,7 @@ impl From<&dyn ErasedTool> for ToolDefinition {
 
 #[cfg(test)]
 mod tests {
-    use crate::error::ModelError;
+    use crate::error::Error;
     use crate::tool::{ErasedTool, HostedToolSpec, Tool};
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
@@ -179,7 +179,7 @@ mod tests {
 
         let error = tool.insert_parameters(42).unwrap_err();
 
-        assert!(matches!(error, ModelError::Client { .. }));
+        assert!(matches!(error, Error::Client { .. }));
     }
 
     #[test]

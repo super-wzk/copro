@@ -1,4 +1,4 @@
-use copro_core::error::{ModelError, ModelResult};
+use copro_core::error::{Error, Result};
 use copro_core::stream::{ModelStream, OutputStreamEvent};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -36,14 +36,14 @@ impl RequestDeadline {
             .map(|expires_at| expires_at.saturating_duration_since(Instant::now()))
     }
 
-    pub async fn run<F, T>(&self, future: F) -> ModelResult<T>
+    pub async fn run<F, T>(&self, future: F) -> Result<T>
     where
         F: Future<Output = T>,
     {
         match self.expires_at {
             Some(expires_at) => tokio::time::timeout_at(expires_at, future)
                 .await
-                .map_err(|_| ModelError::Timeout),
+                .map_err(|_| Error::Timeout),
             None => Ok(future.await),
         }
     }
@@ -51,7 +51,7 @@ impl RequestDeadline {
     pub async fn next_model_event(
         &self,
         stream: &mut ModelStream<'_>,
-    ) -> ModelResult<Option<OutputStreamEvent>> {
+    ) -> Result<Option<OutputStreamEvent>> {
         self.run(stream.next()).await?.transpose()
     }
 }
@@ -85,7 +85,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(error, ModelError::Timeout);
+        assert_eq!(error, Error::Timeout);
     }
 
     #[tokio::test(start_paused = true)]
@@ -106,7 +106,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(error, ModelError::Timeout);
+        assert_eq!(error, Error::Timeout);
     }
 
     #[tokio::test]
@@ -129,12 +129,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn deadline_times_out_pending_model_stream() {
         let deadline = RequestDeadline::from_timeout(Some(Duration::from_secs(5)));
-        let mut stream: ModelStream<'_> = Box::pin(futures_util::stream::pending::<
-            ModelResult<OutputStreamEvent>,
-        >());
+        let mut stream: ModelStream<'_> =
+            Box::pin(futures_util::stream::pending::<Result<OutputStreamEvent>>());
 
         let error = deadline.next_model_event(&mut stream).await.unwrap_err();
 
-        assert_eq!(error, ModelError::Timeout);
+        assert_eq!(error, Error::Timeout);
     }
 }

@@ -1,98 +1,36 @@
-use crate::error::{ModelError, ModelResult};
-use crate::model::{ChatModel, ModelFuture, ModelInfo};
-use schemars::JsonSchema;
-use serde::de::DeserializeOwned;
+use crate::error::{Error, Result};
+use crate::model::{ModelDefinition, ModelFuture, ModelInfo};
+use crate::request::GenerateRequest;
+use crate::response::GenerateResponse;
+use crate::stream::{ModelStream, OutputStreamState};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-pub trait ModelProvider: Send + Sync {
-    type Config: DeserializeOwned + JsonSchema + Send + Sync + 'static;
+/// A live chat session bound to a specific model through a provider.
+pub trait Chat: Send + Sync {
+    /// Starts a streaming generation request.
+    fn stream(&self, request: GenerateRequest) -> ModelStream<'_>;
 
-    fn list_models(&self) -> ModelFuture<'_, Vec<ModelInfo>>;
-
-    fn model_config_schema(&self) -> Value {
-        let schema = schemars::schema_for!(Self::Config);
-        serde_json::to_value(schema).unwrap_or_default()
-    }
-
-    fn chat_model(&self, model_id: &str, config: Self::Config) -> ModelResult<Arc<dyn ChatModel>>;
-}
-
-pub trait ErasedModelProvider: Send + Sync {
-    fn list_models(&self) -> ModelFuture<'_, Vec<ModelInfo>>;
-
-    fn model_config_schema(&self) -> Value;
-
-    fn chat_model_json(&self, model_id: &str, config: Value) -> ModelResult<Arc<dyn ChatModel>>;
-}
-
-impl<P> ErasedModelProvider for P
-where
-    P: ModelProvider,
-{
-    fn list_models(&self) -> ModelFuture<'_, Vec<ModelInfo>> {
-        ModelProvider::list_models(self)
-    }
-
-    fn model_config_schema(&self) -> Value {
-        ModelProvider::model_config_schema(self)
-    }
-
-    fn chat_model_json(&self, model_id: &str, config: Value) -> ModelResult<Arc<dyn ChatModel>> {
-        let config = serde_json::from_value::<P::Config>(config).map_err(|error| {
-            ModelError::client(format!("invalid provider model config: {error}"))
-        })?;
-
-        self.chat_model(model_id, config)
+    fn generate(&self, request: GenerateRequest) -> ModelFuture<'_, GenerateResponse> {
+        Box::pin(async move { OutputStreamState::collect(self.stream(request)).await })
     }
 }
 
-pub trait ProviderFactory: Send + Sync {
-    type Config: DeserializeOwned + JsonSchema + Send + Sync + 'static;
+/// An API backend that constructs [`Chat`] instances for upstream model ids.
+pub trait Provider: Send + Sync {
+    /// Globally unique provider identifier (e.g. `"openai-responses"`).
+    fn id(&self) -> &str;
 
-    fn kind(&self) -> &str;
-
-    fn provider_config_schema(&self) -> Value {
-        let schema = schemars::schema_for!(Self::Config);
-        serde_json::to_value(schema).unwrap_or_default()
-    }
-
-    fn build_provider(&self, config: Self::Config) -> ModelResult<Arc<dyn ErasedModelProvider>>;
+    fn chat(&self, id: &str, config: Value) -> Result<Arc<dyn Chat>>;
 }
 
-pub trait ErasedProviderFactory: Send + Sync {
-    fn kind(&self) -> &str;
-
-    fn provider_config_schema(&self) -> Value;
-
-    fn build_provider_json(&self, config: Value) -> ModelResult<Arc<dyn ErasedModelProvider>>;
-}
-
-impl<F> ErasedProviderFactory for F
-where
-    F: ProviderFactory,
-{
-    fn kind(&self) -> &str {
-        ProviderFactory::kind(self)
-    }
-
-    fn provider_config_schema(&self) -> Value {
-        ProviderFactory::provider_config_schema(self)
-    }
-
-    fn build_provider_json(&self, config: Value) -> ModelResult<Arc<dyn ErasedModelProvider>> {
-        let config = serde_json::from_value::<F::Config>(config)
-            .map_err(|error| ModelError::client(format!("invalid provider config: {error}")))?;
-
-        self.build_provider(config)
-    }
-}
-
+/// Central registry that owns providers (API backends) and models (capability
+/// descriptors bound to a provider).
 #[derive(Default)]
 pub struct ProviderRegistry {
-    factories: BTreeMap<String, Arc<dyn ErasedProviderFactory>>,
-    providers: BTreeMap<String, Arc<dyn ErasedModelProvider>>,
+    providers: BTreeMap<String, Arc<dyn Provider>>,
+    models: BTreeMap<String, ModelDefinition>,
 }
 
 impl ProviderRegistry {
@@ -100,316 +38,208 @@ impl ProviderRegistry {
         Self::default()
     }
 
-    pub fn register_factory<F>(&mut self, factory: F) -> Option<Arc<dyn ErasedProviderFactory>>
+    // ---- providers ----------------------------------------------------------
+
+    pub fn register_provider<P>(&mut self, provider: P) -> Option<Arc<dyn Provider>>
     where
-        F: ErasedProviderFactory + 'static,
+        P: Provider + 'static,
     {
-        self.register_factory_erased(Arc::new(factory))
+        let id = provider.id().to_string();
+        self.providers.insert(id, Arc::new(provider))
     }
 
-    pub fn register_factory_erased(
-        &mut self,
-        factory: Arc<dyn ErasedProviderFactory>,
-    ) -> Option<Arc<dyn ErasedProviderFactory>> {
-        let kind = factory.kind().to_string();
-        self.factories.insert(kind, factory)
+    pub fn remove_provider(&mut self, id: &str) -> Option<Arc<dyn Provider>> {
+        self.providers.remove(id)
     }
 
-    pub fn factory(&self, kind: &str) -> Option<&dyn ErasedProviderFactory> {
-        self.factories.get(kind).map(|factory| factory.as_ref())
+    pub fn provider(&self, id: &str) -> Option<&dyn Provider> {
+        self.providers.get(id).map(|p| p.as_ref())
     }
 
-    pub fn factories(&self) -> impl Iterator<Item = (&str, &dyn ErasedProviderFactory)> {
-        self.factories
-            .iter()
-            .map(|(kind, factory)| (kind.as_str(), factory.as_ref()))
+    // ---- models -------------------------------------------------------------
+
+    pub fn register_model(&mut self, model: ModelDefinition) -> Option<ModelDefinition> {
+        let id = model.id.clone();
+        self.models.insert(id, model)
     }
 
-    pub fn upsert_provider_json(
-        &mut self,
-        provider_id: &str,
-        factory_kind: &str,
-        config: Value,
-    ) -> ModelResult<Option<Arc<dyn ErasedModelProvider>>> {
-        let factory =
-            self.factory(factory_kind)
-                .ok_or_else(|| ModelError::ProviderFactoryNotFound {
-                    factory_kind: factory_kind.to_string(),
+    pub fn remove_model(&mut self, model_id: &str) -> Option<ModelDefinition> {
+        self.models.remove(model_id)
+    }
+
+    pub fn model(&self, model_id: &str) -> Option<&ModelDefinition> {
+        self.models.get(model_id)
+    }
+
+    pub fn list_models(&self) -> Vec<ModelInfo> {
+        self.models.values().map(|model| model.info()).collect()
+    }
+
+    pub fn chat(&self, model_id: &str) -> Result<Arc<dyn Chat>> {
+        let model = self.model(model_id).ok_or_else(|| Error::ModelNotFound {
+            model_id: model_id.to_string(),
+        })?;
+        let provider =
+            self.provider(&model.provider_id)
+                .ok_or_else(|| Error::ProviderNotFound {
+                    provider_id: model.provider_id.clone(),
                 })?;
-        let provider = factory.build_provider_json(config)?;
 
-        Ok(self.register_provider_erased(provider_id, provider))
-    }
-
-    pub fn register_provider<P>(
-        &mut self,
-        provider_id: &str,
-        provider: P,
-    ) -> Option<Arc<dyn ErasedModelProvider>>
-    where
-        P: ErasedModelProvider + 'static,
-    {
-        self.register_provider_erased(provider_id, Arc::new(provider))
-    }
-
-    pub fn register_provider_erased(
-        &mut self,
-        provider_id: &str,
-        provider: Arc<dyn ErasedModelProvider>,
-    ) -> Option<Arc<dyn ErasedModelProvider>> {
-        self.providers.insert(provider_id.to_string(), provider)
-    }
-
-    pub fn remove_provider(&mut self, provider_id: &str) -> Option<Arc<dyn ErasedModelProvider>> {
-        self.providers.remove(provider_id)
-    }
-
-    pub fn provider(&self, provider_id: &str) -> Option<&dyn ErasedModelProvider> {
-        self.providers
-            .get(provider_id)
-            .map(|provider| provider.as_ref())
-    }
-
-    pub fn providers(&self) -> impl Iterator<Item = (&str, &dyn ErasedModelProvider)> {
-        self.providers
-            .iter()
-            .map(|(provider_id, provider)| (provider_id.as_str(), provider.as_ref()))
-    }
-
-    pub fn list_models(&self, provider_id: &str) -> ModelFuture<'_, Vec<ModelInfo>> {
-        match self.provider(provider_id) {
-            Some(provider) => provider.list_models(),
-            None => {
-                let provider_id = provider_id.to_string();
-                Box::pin(async move { Err(ModelError::ProviderNotFound { provider_id }) })
-            }
-        }
-    }
-
-    pub fn chat_model_json(
-        &self,
-        provider_id: &str,
-        model_id: &str,
-        config: Value,
-    ) -> ModelResult<Arc<dyn ChatModel>> {
-        let provider = self
-            .provider(provider_id)
-            .ok_or_else(|| ModelError::ProviderNotFound {
-                provider_id: provider_id.to_string(),
-            })?;
-
-        provider.chat_model_json(model_id, config)
+        provider.chat(&model.id, model.config.clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{InputModality, ModelCapabilities, ModelFeature, ModelInfo};
+    use crate::model::{InputModality, ModelCapabilities, ModelFeature};
     use crate::request::GenerateRequest;
     use crate::stream::ModelStream;
-    use futures_util::FutureExt;
-    use schemars::JsonSchema;
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
 
-    #[derive(Debug, Deserialize, JsonSchema)]
-    struct TestProviderConfig {
-        expected_model_suffix: String,
+    // ---- test provider ------------------------------------------------------
+
+    #[derive(Debug)]
+    struct TestProvider {
+        expected_id: String,
+        expected_suffix: String,
     }
 
-    #[derive(Debug, Deserialize, JsonSchema)]
-    struct TestModelConfig {
-        suffix: String,
+    impl TestProvider {
+        fn new(expected_id: &str, expected_suffix: &str) -> Self {
+            Self {
+                expected_id: expected_id.to_string(),
+                expected_suffix: expected_suffix.to_string(),
+            }
+        }
     }
 
-    struct TestProviderFactory;
-
-    impl ProviderFactory for TestProviderFactory {
-        type Config = TestProviderConfig;
-
-        fn kind(&self) -> &str {
+    impl Provider for TestProvider {
+        fn id(&self) -> &str {
             "test"
         }
 
-        fn build_provider(
-            &self,
-            config: Self::Config,
-        ) -> ModelResult<Arc<dyn ErasedModelProvider>> {
-            Ok(Arc::new(TestProvider {
-                expected_model_suffix: config.expected_model_suffix,
-            }))
-        }
-    }
+        fn chat(&self, id: &str, config: Value) -> Result<Arc<dyn Chat>> {
+            let cfg: TestModelConfig = serde_json::from_value(config)
+                .map_err(|e| Error::client(format!("invalid model config: {e}")))?;
 
-    struct TestProvider {
-        expected_model_suffix: String,
-    }
-
-    impl ModelProvider for TestProvider {
-        type Config = TestModelConfig;
-
-        fn list_models(&self) -> ModelFuture<'_, Vec<ModelInfo>> {
-            Box::pin(async { Ok(vec![test_model_info("test-model")]) })
-        }
-
-        fn chat_model(
-            &self,
-            _model_id: &str,
-            config: Self::Config,
-        ) -> ModelResult<Arc<dyn ChatModel>> {
-            if config.suffix != self.expected_model_suffix {
-                return Err(ModelError::protocol(format!(
-                    "expected model suffix {}, got {}",
-                    self.expected_model_suffix, config.suffix
+            if id != self.expected_id {
+                return Err(Error::protocol(format!(
+                    "expected id {}, got {}",
+                    self.expected_id, id
                 )));
             }
-
-            Ok(Arc::new(TestModel))
+            if cfg.suffix != self.expected_suffix {
+                return Err(Error::protocol(format!(
+                    "expected suffix {}, got {}",
+                    self.expected_suffix, cfg.suffix
+                )));
+            }
+            Ok(Arc::new(TestChat))
         }
     }
 
-    struct TestModel;
+    struct TestChat;
 
-    impl ChatModel for TestModel {
+    impl Chat for TestChat {
         fn stream(&self, _request: GenerateRequest) -> ModelStream<'_> {
             Box::pin(futures_util::stream::empty())
         }
     }
 
-    fn test_provider() -> TestProvider {
-        TestProvider {
-            expected_model_suffix: "configured".to_string(),
-        }
+    // ---- config types -------------------------------------------------------
+
+    #[derive(Debug, Deserialize, Serialize)]
+    struct TestModelConfig {
+        suffix: String,
     }
 
-    fn test_model_info(id: &str) -> ModelInfo {
-        ModelInfo {
-            id: id.to_string(),
-            display_name: None,
-            capabilities: ModelCapabilities::default()
-                .with_input_modality(InputModality::Text)
-                .with_feature(ModelFeature::NativeStreaming),
-        }
-    }
+    // ---- helpers ------------------------------------------------------------
 
-    #[test]
-    fn erased_provider_parses_typed_config() {
-        let provider: Box<dyn ErasedModelProvider> = Box::new(test_provider());
-        provider
-            .chat_model_json("model", serde_json::json!({ "suffix": "configured" }))
-            .unwrap();
-    }
-
-    #[test]
-    fn erased_provider_exposes_config_schema() {
-        let provider: Box<dyn ErasedModelProvider> = Box::new(test_provider());
-        let schema = provider.model_config_schema();
-
-        assert_eq!(schema["title"], "TestModelConfig");
-    }
-
-    #[test]
-    fn erased_factory_parses_provider_config() {
-        let factory: Box<dyn ErasedProviderFactory> = Box::new(TestProviderFactory);
-        let provider = factory
-            .build_provider_json(serde_json::json!({ "expected_model_suffix": "configured" }))
-            .unwrap();
-
-        provider
-            .chat_model_json("model", serde_json::json!({ "suffix": "configured" }))
-            .unwrap();
-    }
-
-    #[test]
-    fn registry_routes_model_construction_by_provider() {
-        let mut registry = ProviderRegistry::new();
-        registry.register_provider("test", test_provider());
-
-        registry
-            .chat_model_json(
-                "test",
-                "model",
-                serde_json::json!({ "suffix": "configured" }),
+    fn test_model(provider_id: &str, id: &str, suffix: &str) -> ModelDefinition {
+        ModelDefinition::new(provider_id, id)
+            .with_name("Test Model")
+            .with_capabilities(
+                ModelCapabilities::default()
+                    .with_input_modality(InputModality::Text)
+                    .with_feature(ModelFeature::NativeStreaming),
             )
+            .with_config(TestModelConfig {
+                suffix: suffix.to_string(),
+            })
+            .unwrap()
+    }
+
+    // ---- tests --------------------------------------------------------------
+
+    #[test]
+    fn provider_chat_passes_id_and_config() {
+        let provider = TestProvider::new("gpt-4", "configured");
+        provider
+            .chat("gpt-4", serde_json::json!({"suffix": "configured"}))
             .unwrap();
     }
 
     #[test]
-    fn registry_lists_provider_models() {
+    fn registry_routes_chat_through_model_and_provider() {
         let mut registry = ProviderRegistry::new();
-        registry.register_provider("test", test_provider());
+        registry.register_provider(TestProvider::new("gpt-4", "cfg"));
+        registry.register_model(test_model("test", "gpt-4", "cfg"));
 
-        let models = registry
-            .list_models("test")
-            .now_or_never()
-            .unwrap()
-            .unwrap();
+        registry.chat("gpt-4").unwrap();
+    }
 
-        assert_eq!(models[0].id, "test-model");
+    #[test]
+    fn registry_lists_registered_models() {
+        let mut registry = ProviderRegistry::new();
+        registry.register_model(test_model("test", "gpt-4", "cfg"));
+
+        let models = registry.list_models();
+        assert_eq!(models[0].id, "gpt-4");
+        assert_eq!(models[0].name.as_deref(), Some("Test Model"));
+    }
+
+    #[test]
+    fn registry_reports_missing_model() {
+        let registry = ProviderRegistry::new();
+        let Err(e) = registry.chat("missing") else {
+            panic!("expected error")
+        };
+        assert_eq!(
+            e,
+            Error::ModelNotFound {
+                model_id: "missing".into()
+            }
+        );
     }
 
     #[test]
     fn registry_reports_missing_provider() {
-        let registry = ProviderRegistry::new();
-        let Err(error) = registry.chat_model_json("missing", "model", serde_json::json!({})) else {
-            panic!("expected missing provider error");
-        };
+        let mut registry = ProviderRegistry::new();
+        registry.register_model(test_model("missing", "gpt-4", "cfg"));
 
+        let Err(e) = registry.chat("gpt-4") else {
+            panic!("expected error")
+        };
         assert_eq!(
-            error,
-            ModelError::ProviderNotFound {
-                provider_id: "missing".to_string(),
+            e,
+            Error::ProviderNotFound {
+                provider_id: "missing".into()
             }
         );
     }
 
     #[test]
-    fn registry_reports_missing_factory() {
+    fn registry_replace_provider() {
         let mut registry = ProviderRegistry::new();
-        let Err(error) = registry.upsert_provider_json("local", "missing", serde_json::json!({}))
-        else {
-            panic!("expected missing factory error");
-        };
+        registry.register_provider(TestProvider::new("m1", "first"));
+        registry.register_model(test_model("test", "m1", "first"));
+        registry.chat("m1").unwrap();
 
-        assert_eq!(
-            error,
-            ModelError::ProviderFactoryNotFound {
-                factory_kind: "missing".to_string(),
-            }
-        );
-    }
+        registry.register_provider(TestProvider::new("m1", "second"));
+        assert!(registry.chat("m1").is_err());
 
-    #[test]
-    fn registry_replaces_provider_from_factory_config() {
-        let mut registry = ProviderRegistry::new();
-        registry.register_factory(TestProviderFactory);
-
-        registry
-            .upsert_provider_json(
-                "local",
-                "test",
-                serde_json::json!({ "expected_model_suffix": "first" }),
-            )
-            .unwrap();
-        registry
-            .chat_model_json("local", "model", serde_json::json!({ "suffix": "first" }))
-            .unwrap();
-
-        registry
-            .upsert_provider_json(
-                "local",
-                "test",
-                serde_json::json!({ "expected_model_suffix": "second" }),
-            )
-            .unwrap();
-
-        assert!(
-            registry
-                .chat_model_json("local", "model", serde_json::json!({ "suffix": "first" }))
-                .is_err()
-        );
-        registry
-            .chat_model_json("local", "model", serde_json::json!({ "suffix": "second" }))
-            .unwrap();
+        registry.register_model(test_model("test", "m1", "second"));
+        registry.chat("m1").unwrap();
     }
 }

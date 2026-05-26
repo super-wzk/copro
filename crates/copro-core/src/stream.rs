@@ -36,7 +36,7 @@ pub enum OutputContentDelta {
     },
 }
 
-pub type ModelStream<'a> = Pin<Box<dyn Stream<Item = ModelResult<OutputStreamEvent>> + Send + 'a>>;
+pub type ModelStream<'a> = Pin<Box<dyn Stream<Item = Result<OutputStreamEvent>> + Send + 'a>>;
 
 #[derive(Debug, Default)]
 pub struct OutputStreamState {
@@ -49,7 +49,7 @@ impl OutputStreamState {
         Self::default()
     }
 
-    pub async fn collect(mut stream: ModelStream<'_>) -> ModelResult<GenerateResponse> {
+    pub async fn collect(mut stream: ModelStream<'_>) -> Result<GenerateResponse> {
         let mut state = Self::new();
 
         while let Some(event) = stream.next().await {
@@ -58,12 +58,12 @@ impl OutputStreamState {
             }
         }
 
-        Err(ModelError::protocol("stream ended before finished event"))
+        Err(Error::protocol("stream ended before finished event"))
     }
 
-    pub fn apply(&mut self, event: OutputStreamEvent) -> ModelResult<Option<GenerateResponse>> {
+    pub fn apply(&mut self, event: OutputStreamEvent) -> Result<Option<GenerateResponse>> {
         if self.finished {
-            return Err(ModelError::protocol("stream already finished"));
+            return Err(Error::protocol("stream already finished"));
         }
 
         match event {
@@ -87,7 +87,7 @@ impl OutputStreamState {
         }
     }
 
-    fn apply_delta(&mut self, content_index: usize, delta: OutputContentDelta) -> ModelResult<()> {
+    fn apply_delta(&mut self, content_index: usize, delta: OutputContentDelta) -> Result<()> {
         if self.content.len() <= content_index {
             self.content.resize_with(content_index + 1, || None);
         }
@@ -130,11 +130,11 @@ impl OutputContentState {
         }
     }
 
-    fn apply_delta(&mut self, content_index: usize, delta: OutputContentDelta) -> ModelResult<()> {
+    fn apply_delta(&mut self, content_index: usize, delta: OutputContentDelta) -> Result<()> {
         match self {
             Self::Thinking(text) => {
                 let OutputContentDelta::Thinking { text: delta } = delta else {
-                    return Err(ModelError::protocol(format!(
+                    return Err(Error::protocol(format!(
                         "content delta type changed at index {content_index}"
                     )));
                 };
@@ -142,7 +142,7 @@ impl OutputContentState {
             }
             Self::Text(text) => {
                 let OutputContentDelta::Text { text: delta } = delta else {
-                    return Err(ModelError::protocol(format!(
+                    return Err(Error::protocol(format!(
                         "content delta type changed at index {content_index}"
                     )));
                 };
@@ -150,7 +150,7 @@ impl OutputContentState {
             }
             Self::Image(image) => {
                 let OutputContentDelta::Image { image: delta } = delta else {
-                    return Err(ModelError::protocol(format!(
+                    return Err(Error::protocol(format!(
                         "content delta type changed at index {content_index}"
                     )));
                 };
@@ -167,7 +167,7 @@ impl OutputContentState {
                     arguments: delta_arguments,
                 } = delta
                 else {
-                    return Err(ModelError::protocol(format!(
+                    return Err(Error::protocol(format!(
                         "content delta type changed at index {content_index}"
                     )));
                 };
@@ -184,7 +184,7 @@ impl OutputContentState {
         Ok(())
     }
 
-    fn finish(self) -> ModelResult<OutputContent> {
+    fn finish(self) -> Result<OutputContent> {
         match self {
             Self::Thinking(text) => Ok(OutputContent::Thinking { text }),
             Self::Text(text) => Ok(OutputContent::Text { text }),
@@ -194,39 +194,35 @@ impl OutputContentState {
                 name,
                 arguments,
             } => Ok(OutputContent::ToolCall {
-                id: id.ok_or_else(|| ModelError::protocol("tool call is missing id"))?,
-                name: name.ok_or_else(|| ModelError::protocol("tool call is missing name"))?,
+                id: id.ok_or_else(|| Error::protocol("tool call is missing id"))?,
+                name: name.ok_or_else(|| Error::protocol("tool call is missing name"))?,
                 arguments: parse_arguments(&arguments)?,
             }),
         }
     }
 }
 
-fn finish_output_content(
-    content: Vec<Option<OutputContentState>>,
-) -> ModelResult<Vec<OutputContent>> {
+fn finish_output_content(content: Vec<Option<OutputContentState>>) -> Result<Vec<OutputContent>> {
     content
         .into_iter()
         .enumerate()
         .map(|(index, detail)| {
             let detail = detail
-                .ok_or_else(|| ModelError::protocol(format!("missing content at index {index}")))?;
+                .ok_or_else(|| Error::protocol(format!("missing content at index {index}")))?;
             detail.finish()
         })
         .collect()
 }
 
-fn parse_arguments(arguments: &str) -> ModelResult<Map<String, Value>> {
+fn parse_arguments(arguments: &str) -> Result<Map<String, Value>> {
     if arguments.trim().is_empty() {
         return Ok(Map::new());
     }
 
     match serde_json::from_str::<Value>(arguments) {
         Ok(Value::Object(arguments)) => Ok(arguments),
-        Ok(_) => Err(ModelError::protocol(
-            "tool call arguments must be a JSON object",
-        )),
-        Err(error) => Err(ModelError::protocol(format!(
+        Ok(_) => Err(Error::protocol("tool call arguments must be a JSON object")),
+        Err(error) => Err(Error::protocol(format!(
             "failed to parse tool call arguments: {error}"
         ))),
     }

@@ -1,5 +1,5 @@
 use base64::Engine;
-use copro_core::error::{ModelError, ModelResult};
+use copro_core::error::{Error, Result};
 use copro_core::message::{InputContent, Message, OutputContent, ToolResultStatus};
 use copro_core::tool::{HostedToolSpec, ToolChoice, ToolDefinition};
 use serde::Serialize;
@@ -11,7 +11,7 @@ pub(crate) fn build_response_body(
     model_id: &str,
     model_config: &OpenAiResponsesModelConfig,
     request: copro_core::request::GenerateRequest,
-) -> ModelResult<Value> {
+) -> Result<Value> {
     let request_options = request.options.extra::<OpenAiResponsesRequestOptions>()?;
     let mut body = Map::new();
     body.insert("model".to_string(), Value::String(model_id.to_string()));
@@ -79,7 +79,7 @@ fn is_protected_response_body_key(key: &str) -> bool {
     matches!(key, "input" | "model" | "stream")
 }
 
-fn build_input_items(messages: Vec<Message>) -> ModelResult<Vec<Value>> {
+fn build_input_items(messages: Vec<Message>) -> Result<Vec<Value>> {
     let mut items = Vec::new();
     for message in messages {
         items.extend(build_message_items(message)?);
@@ -87,7 +87,7 @@ fn build_input_items(messages: Vec<Message>) -> ModelResult<Vec<Value>> {
     Ok(items)
 }
 
-fn build_message_items(message: Message) -> ModelResult<Vec<Value>> {
+fn build_message_items(message: Message) -> Result<Vec<Value>> {
     match message {
         Message::System { content } => Ok(vec![message_item("system", input_content(content)?)]),
         Message::User { content } => Ok(vec![message_item("user", input_content(content)?)]),
@@ -119,11 +119,11 @@ fn message_item(role: &str, content: Vec<Value>) -> Value {
     })
 }
 
-fn input_content(content: Vec<InputContent>) -> ModelResult<Vec<Value>> {
+fn input_content(content: Vec<InputContent>) -> Result<Vec<Value>> {
     content.into_iter().map(input_content_part).collect()
 }
 
-fn input_content_part(content: InputContent) -> ModelResult<Value> {
+fn input_content_part(content: InputContent) -> Result<Value> {
     match content {
         InputContent::Text { text } => Ok(json!({
             "type": "input_text",
@@ -139,7 +139,7 @@ fn input_content_part(content: InputContent) -> ModelResult<Value> {
     }
 }
 
-fn build_output_items(content: Vec<OutputContent>) -> ModelResult<Vec<Value>> {
+fn build_output_items(content: Vec<OutputContent>) -> Result<Vec<Value>> {
     let mut message_content = Vec::new();
     let mut items = Vec::new();
 
@@ -150,12 +150,12 @@ fn build_output_items(content: Vec<OutputContent>) -> ModelResult<Vec<Value>> {
                 "text": text,
             })),
             OutputContent::Thinking { .. } => {
-                return Err(ModelError::client(
+                return Err(Error::client(
                     "OpenAI Responses provider cannot replay generic thinking content",
                 ));
             }
             OutputContent::Image { .. } => {
-                return Err(ModelError::client(
+                return Err(Error::client(
                     "OpenAI Responses provider cannot replay generic image output",
                 ));
             }
@@ -180,13 +180,13 @@ fn build_output_items(content: Vec<OutputContent>) -> ModelResult<Vec<Value>> {
     Ok(items)
 }
 
-fn tool_output_content(content: Vec<InputContent>) -> ModelResult<String> {
+fn tool_output_content(content: Vec<InputContent>) -> Result<String> {
     let mut text = Vec::new();
     for content in content {
         match content {
             InputContent::Text { text: part } => text.push(part),
             InputContent::Image { .. } => {
-                return Err(ModelError::client(
+                return Err(Error::client(
                     "OpenAI function call outputs only support text content",
                 ));
             }
@@ -198,7 +198,7 @@ fn tool_output_content(content: Vec<InputContent>) -> ModelResult<String> {
 fn build_request_tools(
     function_tools: Vec<ToolDefinition>,
     hosted_tools: Vec<HostedToolSpec>,
-) -> ModelResult<Vec<Value>> {
+) -> Result<Vec<Value>> {
     let mut tools = build_function_tools(function_tools);
 
     for tool in hosted_tools {
@@ -222,10 +222,10 @@ fn build_function_tools(tools: Vec<ToolDefinition>) -> Vec<Value> {
         .collect()
 }
 
-fn build_hosted_tool(tool: HostedToolSpec) -> ModelResult<Value> {
+fn build_hosted_tool(tool: HostedToolSpec) -> Result<Value> {
     let kind = tool.kind.trim().to_string();
     if kind.is_empty() {
-        return Err(ModelError::client("hosted tool kind cannot be empty"));
+        return Err(Error::client("hosted tool kind cannot be empty"));
     }
 
     let mut parameters = tool.parameters;

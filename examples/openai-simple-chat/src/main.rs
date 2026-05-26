@@ -1,5 +1,5 @@
 use copro_core::message::{ImageContent, InputContent, Message, OutputContent};
-use copro_core::provider::ModelProvider;
+use copro_core::provider::ProviderRegistry;
 use copro_core::request::{GenerateRequest, GenerateRequestOptions};
 use copro_provider_openai::{
     OpenAiImageGenerationTool, OpenAiResponsesModelConfig, OpenAiResponsesProvider,
@@ -28,16 +28,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         project: env_var("OPENAI_PROJECT"),
     });
 
-    // let models = ModelProvider::list_models(&provider).await?;
-    // println!("Models: {:?}", models);
-
-    let model = provider.chat_model(
-        &model_id,
+    let mut registry = ProviderRegistry::new();
+    let model_def = provider.model_definition(
+        model_id.clone(),
         OpenAiResponsesModelConfig {
             store: Some(false),
             ..OpenAiResponsesModelConfig::default()
         },
     )?;
+    registry.register_provider(provider);
+    registry.register_model(model_def);
+
+    let model = registry.chat(&model_id)?;
 
     let options = GenerateRequestOptions {
         temperature: Some(0.2),
