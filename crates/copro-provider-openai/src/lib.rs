@@ -4,22 +4,22 @@ use async_openai::error::OpenAIError;
 use async_openai::types::responses::ResponseStreamEvent;
 use base64::Engine;
 use copro_core::error::{ModelError, ModelResult};
-use copro_core::message::{AssistantContent, InputContent, Message, ToolResultStatus};
+use copro_core::message::{ImageContent, InputContent, Message, OutputContent, ToolResultStatus};
 use copro_core::model::{
     ChatModel, InputModality, ModelCapabilities, ModelFeature, ModelFuture, ModelInfo,
 };
-use copro_core::provider::{ErasedModelProvider, ModelProvider, ProviderFactory};
+use copro_core::provider::ModelProvider;
 use copro_core::request::GenerateRequest;
 use copro_core::response::{FinishReason, Usage};
-use copro_core::stream::{AssistantContentDetail, AssistantContentEvent, ModelStream};
-use copro_core::tool::{ToolChoice, ToolDefinition};
+use copro_core::stream::{ModelStream, OutputContentDelta, OutputStreamEvent};
+use copro_core::tool::{HostedToolSpec, ToolChoice, ToolDefinition};
+use copro_derive::{CoproHostedTool, CoproProviderFactory};
 use futures_util::StreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, rename_all = "camelCase")]
@@ -37,23 +37,32 @@ pub struct OpenAiResponsesModelConfig {
     pub parallel_tool_calls: Option<bool>,
     pub reasoning_effort: Option<String>,
     pub reasoning_summary: Option<String>,
-    pub extra_body: BTreeMap<String, Value>,
+    pub extra_body: Map<String, Value>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, rename_all = "camelCase")]
+pub struct OpenAiResponsesRequestOptions {
+    pub extra_body: Map<String, Value>,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, CoproHostedTool,
+)]
+#[serde(default)]
+#[hosted_tool(kind = "image_generation")]
+pub struct OpenAiImageGenerationTool {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_images: Option<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Default, CoproProviderFactory)]
+#[provider(
+    kind = "openai-responses",
+    config = OpenAiResponsesProviderConfig,
+    provider = OpenAiResponsesProvider
+)]
 pub struct OpenAiResponsesProviderFactory;
-
-impl ProviderFactory for OpenAiResponsesProviderFactory {
-    type Config = OpenAiResponsesProviderConfig;
-
-    fn kind(&self) -> &str {
-        "openai-responses"
-    }
-
-    fn build_provider(&self, config: Self::Config) -> ModelResult<Arc<dyn ErasedModelProvider>> {
-        Ok(Arc::new(OpenAiResponsesProvider::new(config)))
-    }
-}
 
 #[derive(Clone)]
 pub struct OpenAiResponsesProvider {
@@ -112,7 +121,6 @@ pub struct OpenAiResponsesChatModel {
 
 impl ChatModel for OpenAiResponsesChatModel {
     fn stream(&self, request: GenerateRequest) -> ModelStream<'_> {
-        let timeout = request.options.timeout;
         let body = match build_response_body(&self.model_id, &self.model_config, request) {
             Ok(body) => body,
             Err(error) => return Box::pin(futures_util::stream::once(async move { Err(error) })),
@@ -120,11 +128,11 @@ impl ChatModel for OpenAiResponsesChatModel {
         let client = self.client.clone();
 
         Box::pin(async_stream::try_stream! {
-            let mut stream = create_response_stream(&client, body, timeout).await?;
+            let mut stream = create_response_stream(&client, body).await?;
             let mut mapper = OpenAiEventMapper::new();
 
             loop {
-                let next = next_openai_event(&mut stream, timeout).await?;
+                let next = next_openai_event(&mut stream).await?;
                 let Some(event) = next else {
                     break;
                 };
@@ -140,32 +148,18 @@ impl ChatModel for OpenAiResponsesChatModel {
 async fn create_response_stream(
     client: &Client<OpenAIConfig>,
     body: Value,
-    timeout: Option<Duration>,
 ) -> ModelResult<async_openai::types::responses::ResponseStream> {
     let responses = client.responses();
-    let create = responses.create_stream_byot::<_, ResponseStreamEvent>(body);
-
-    match timeout {
-        Some(timeout) => tokio::time::timeout(timeout, create)
-            .await
-            .map_err(|_| ModelError::Timeout)?
-            .map_err(map_openai_error),
-        None => create.await.map_err(map_openai_error),
-    }
+    responses
+        .create_stream_byot::<_, ResponseStreamEvent>(body)
+        .await
+        .map_err(map_openai_error)
 }
 
 async fn next_openai_event(
     stream: &mut async_openai::types::responses::ResponseStream,
-    timeout: Option<Duration>,
 ) -> ModelResult<Option<ResponseStreamEvent>> {
-    let next = match timeout {
-        Some(timeout) => tokio::time::timeout(timeout, stream.next())
-            .await
-            .map_err(|_| ModelError::Timeout)?,
-        None => stream.next().await,
-    };
-
-    next.transpose().map_err(map_openai_error)
+    stream.next().await.transpose().map_err(map_openai_error)
 }
 
 fn openai_config(config: OpenAiResponsesProviderConfig) -> OpenAIConfig {
@@ -199,6 +193,7 @@ fn build_response_body(
     model_config: &OpenAiResponsesModelConfig,
     request: GenerateRequest,
 ) -> ModelResult<Value> {
+    let request_options = request.options.extra::<OpenAiResponsesRequestOptions>()?;
     let mut body = Map::new();
     body.insert("model".to_string(), Value::String(model_id.to_string()));
     body.insert(
@@ -210,8 +205,9 @@ fn build_response_body(
     insert_optional_json(&mut body, "temperature", request.options.temperature);
     insert_optional_json(&mut body, "max_output_tokens", request.options.max_tokens);
 
-    if let Some(tools) = request.tools.filter(|tools| !tools.is_empty()) {
-        body.insert("tools".to_string(), Value::Array(build_tools(tools)));
+    let tools = build_request_tools(request.tools, request.hosted_tools)?;
+    if !tools.is_empty() {
+        body.insert("tools".to_string(), Value::Array(tools));
     }
     insert_optional_value(
         &mut body,
@@ -220,6 +216,7 @@ fn build_response_body(
     );
 
     insert_model_config(&mut body, model_config);
+    insert_extra_body(&mut body, &request_options.extra_body);
 
     Ok(Value::Object(body))
 }
@@ -250,7 +247,7 @@ fn insert_optional_value(body: &mut Map<String, Value>, key: &str, value: Option
     }
 }
 
-fn insert_extra_body(body: &mut Map<String, Value>, extra_body: &BTreeMap<String, Value>) {
+fn insert_extra_body(body: &mut Map<String, Value>, extra_body: &Map<String, Value>) {
     for (key, value) in extra_body {
         if is_protected_response_body_key(key) {
             continue;
@@ -275,7 +272,7 @@ fn build_message_items(message: Message) -> ModelResult<Vec<Value>> {
     match message {
         Message::System { content } => Ok(vec![message_item("system", input_content(content)?)]),
         Message::User { content } => Ok(vec![message_item("user", input_content(content)?)]),
-        Message::Assistant { content } => build_assistant_items(content),
+        Message::Assistant { content } => build_output_items(content),
         Message::Tool {
             call_id,
             name: _,
@@ -323,22 +320,27 @@ fn input_content_part(content: InputContent) -> ModelResult<Value> {
     }
 }
 
-fn build_assistant_items(content: Vec<AssistantContent>) -> ModelResult<Vec<Value>> {
+fn build_output_items(content: Vec<OutputContent>) -> ModelResult<Vec<Value>> {
     let mut message_content = Vec::new();
     let mut items = Vec::new();
 
     for content in content {
         match content {
-            AssistantContent::Text { text } => message_content.push(json!({
+            OutputContent::Text { text } => message_content.push(json!({
                 "type": "output_text",
                 "text": text,
             })),
-            AssistantContent::Thinking { .. } => {
+            OutputContent::Thinking { .. } => {
                 return Err(ModelError::client(
                     "OpenAI Responses provider cannot replay generic thinking content",
                 ));
             }
-            AssistantContent::ToolCall {
+            OutputContent::Image { .. } => {
+                return Err(ModelError::client(
+                    "OpenAI Responses provider cannot replay generic image output",
+                ));
+            }
+            OutputContent::ToolCall {
                 id,
                 name,
                 arguments,
@@ -374,7 +376,20 @@ fn tool_output_content(content: Vec<InputContent>) -> ModelResult<String> {
     Ok(text.join("\n"))
 }
 
-fn build_tools(tools: Vec<ToolDefinition>) -> Vec<Value> {
+fn build_request_tools(
+    function_tools: Vec<ToolDefinition>,
+    hosted_tools: Vec<HostedToolSpec>,
+) -> ModelResult<Vec<Value>> {
+    let mut tools = build_function_tools(function_tools);
+
+    for tool in hosted_tools {
+        tools.push(build_hosted_tool(tool)?);
+    }
+
+    Ok(tools)
+}
+
+fn build_function_tools(tools: Vec<ToolDefinition>) -> Vec<Value> {
     tools
         .into_iter()
         .map(|tool| {
@@ -386,6 +401,17 @@ fn build_tools(tools: Vec<ToolDefinition>) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn build_hosted_tool(tool: HostedToolSpec) -> ModelResult<Value> {
+    let kind = tool.kind.trim().to_string();
+    if kind.is_empty() {
+        return Err(ModelError::client("hosted tool kind cannot be empty"));
+    }
+
+    let mut parameters = tool.parameters;
+    parameters.insert("type".to_string(), Value::String(kind));
+    Ok(Value::Object(parameters))
 }
 
 fn build_tool_choice(tool_choice: ToolChoice) -> Value {
@@ -415,6 +441,7 @@ fn build_reasoning(model_config: &OpenAiResponsesModelConfig) -> Option<Value> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum StreamContentKind {
+    Image,
     Thinking,
     Text,
     ToolCall,
@@ -444,6 +471,14 @@ impl StreamKey {
         }
     }
 
+    fn image(output_index: u32) -> Self {
+        Self {
+            output_index,
+            content_index: 0,
+            kind: StreamContentKind::Image,
+        }
+    }
+
     fn tool_call(output_index: u32) -> Self {
         Self {
             output_index,
@@ -466,19 +501,19 @@ impl OpenAiEventMapper {
         Self::default()
     }
 
-    fn map_event(&mut self, event: ResponseStreamEvent) -> ModelResult<Vec<AssistantContentEvent>> {
+    fn map_event(&mut self, event: ResponseStreamEvent) -> ModelResult<Vec<OutputStreamEvent>> {
         match event {
             ResponseStreamEvent::ResponseOutputTextDelta(event) => Ok(vec![self.delta(
                 StreamKey::text(event.output_index, event.content_index),
-                AssistantContentDetail::Text { text: event.delta },
+                OutputContentDelta::Text { text: event.delta },
             )]),
             ResponseStreamEvent::ResponseReasoningSummaryTextDelta(event) => Ok(vec![self.delta(
                 StreamKey::thinking(event.output_index, event.summary_index),
-                AssistantContentDetail::Thinking { text: event.delta },
+                OutputContentDelta::Thinking { text: event.delta },
             )]),
             ResponseStreamEvent::ResponseReasoningTextDelta(event) => Ok(vec![self.delta(
                 StreamKey::thinking(event.output_index, event.content_index),
-                AssistantContentDetail::Thinking { text: event.delta },
+                OutputContentDelta::Thinking { text: event.delta },
             )]),
             ResponseStreamEvent::ResponseOutputItemAdded(event) => {
                 self.map_output_item(event.output_index, &event.item, false)
@@ -492,7 +527,7 @@ impl OpenAiEventMapper {
                 self.streamed_tool_arguments.insert(key);
                 Ok(vec![self.delta(
                     key,
-                    AssistantContentDetail::ToolCall {
+                    OutputContentDelta::ToolCall {
                         id: None,
                         name: None,
                         arguments: event.delta,
@@ -509,15 +544,23 @@ impl OpenAiEventMapper {
                 };
                 Ok(vec![self.delta(
                     key,
-                    AssistantContentDetail::ToolCall {
+                    OutputContentDelta::ToolCall {
                         id: None,
                         name: event.name,
                         arguments,
                     },
                 )])
             }
+            ResponseStreamEvent::ResponseImageGenerationCallPartialImage(event) => {
+                Ok(vec![self.delta(
+                    StreamKey::image(event.output_index),
+                    OutputContentDelta::Image {
+                        image: decode_openai_image_base64(&event.partial_image_b64)?,
+                    },
+                )])
+            }
             ResponseStreamEvent::ResponseCompleted(event) => {
-                Ok(vec![AssistantContentEvent::Finished {
+                Ok(vec![OutputStreamEvent::Finished {
                     reason: self.finish_reason(FinishReason::Stop),
                     usage: event.response.usage.map(|usage| Usage {
                         input_tokens: Some(usage.input_tokens.into()),
@@ -526,7 +569,7 @@ impl OpenAiEventMapper {
                 }])
             }
             ResponseStreamEvent::ResponseIncomplete(event) => {
-                Ok(vec![AssistantContentEvent::Finished {
+                Ok(vec![OutputStreamEvent::Finished {
                     reason: self.finish_reason(FinishReason::Length),
                     usage: event.response.usage.map(|usage| Usage {
                         input_tokens: Some(usage.input_tokens.into()),
@@ -552,10 +595,17 @@ impl OpenAiEventMapper {
         output_index: u32,
         item: &impl Serialize,
         done: bool,
-    ) -> ModelResult<Vec<AssistantContentEvent>> {
+    ) -> ModelResult<Vec<OutputStreamEvent>> {
         let item = serde_json::to_value(item).map_err(|error| {
             ModelError::protocol(format!("failed to serialize OpenAI output item: {error}"))
         })?;
+        if done && let Some(image) = image_from_item(&item)? {
+            return Ok(vec![self.delta(
+                StreamKey::image(output_index),
+                OutputContentDelta::Image { image },
+            )]);
+        }
+
         let Some(tool_call) = tool_call_from_item(&item) else {
             return Ok(Vec::new());
         };
@@ -571,7 +621,7 @@ impl OpenAiEventMapper {
 
         Ok(vec![self.delta(
             key,
-            AssistantContentDetail::ToolCall {
+            OutputContentDelta::ToolCall {
                 id: tool_call.id,
                 name: tool_call.name,
                 arguments,
@@ -579,9 +629,9 @@ impl OpenAiEventMapper {
         )])
     }
 
-    fn delta(&mut self, key: StreamKey, delta: AssistantContentDetail) -> AssistantContentEvent {
+    fn delta(&mut self, key: StreamKey, delta: OutputContentDelta) -> OutputStreamEvent {
         let content_index = self.content_index(key);
-        AssistantContentEvent::Delta {
+        OutputStreamEvent::Delta {
             content_index,
             delta,
         }
@@ -612,6 +662,31 @@ struct ToolCallDelta {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
+}
+
+fn image_from_item(item: &Value) -> ModelResult<Option<ImageContent>> {
+    if item.get("type").and_then(Value::as_str) != Some("image_generation_call") {
+        return Ok(None);
+    }
+
+    let Some(image_base64) = item.get("result").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+
+    decode_openai_image_base64(image_base64).map(Some)
+}
+
+fn decode_openai_image_base64(image_base64: &str) -> ModelResult<ImageContent> {
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(image_base64)
+        .map_err(|error| {
+            ModelError::protocol(format!("failed to decode OpenAI image output: {error}"))
+        })?;
+
+    Ok(ImageContent::Data {
+        mime_type: "image/png".to_string(),
+        data,
+    })
 }
 
 fn tool_call_from_item(item: &Value) -> Option<ToolCallDelta> {
@@ -724,10 +799,11 @@ fn is_reasoning_model(model_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use copro_core::request::GenerateOptions;
+    use base64::Engine as _;
+    use copro_core::request::GenerateRequestOptions;
 
-    fn empty_options() -> GenerateOptions {
-        GenerateOptions::default()
+    fn empty_options() -> GenerateRequestOptions {
+        GenerateRequestOptions::default()
     }
 
     #[test]
@@ -738,9 +814,10 @@ mod tests {
                     text: "hello".to_string(),
                 }],
             }],
-            tools: None,
+            tools: Vec::new(),
+            hosted_tools: Vec::new(),
             tool_choice: None,
-            options: GenerateOptions {
+            options: GenerateRequestOptions {
                 temperature: Some(0.2),
                 max_tokens: Some(128),
                 ..empty_options()
@@ -771,11 +848,12 @@ mod tests {
                     text: "weather".to_string(),
                 }],
             }],
-            tools: Some(vec![ToolDefinition {
+            tools: vec![ToolDefinition {
                 name: "weather".to_string(),
                 description: "Get weather".to_string(),
                 parameters: json!({"type":"object"}),
-            }]),
+            }],
+            hosted_tools: Vec::new(),
             tool_choice: Some(ToolChoice::Specific {
                 name: "weather".to_string(),
             }),
@@ -802,7 +880,7 @@ mod tests {
             parallel_tool_calls: Some(true),
             reasoning_effort: Some("medium".to_string()),
             reasoning_summary: Some("auto".to_string()),
-            extra_body: BTreeMap::from([("metadata".to_string(), json!({"trace_id": "req_123"}))]),
+            extra_body: Map::from_iter([("metadata".to_string(), json!({"trace_id": "req_123"}))]),
         };
         let request = GenerateRequest {
             messages: vec![Message::User {
@@ -810,7 +888,8 @@ mod tests {
                     text: "hello".to_string(),
                 }],
             }],
-            tools: None,
+            tools: Vec::new(),
+            hosted_tools: Vec::new(),
             tool_choice: None,
             options: empty_options(),
         };
@@ -827,7 +906,7 @@ mod tests {
     #[test]
     fn extra_body_cannot_override_required_response_fields() {
         let model_config = OpenAiResponsesModelConfig {
-            extra_body: BTreeMap::from([
+            extra_body: Map::from_iter([
                 ("input".to_string(), json!([])),
                 ("model".to_string(), json!("wrong-model")),
                 ("stream".to_string(), json!(false)),
@@ -841,7 +920,8 @@ mod tests {
                     text: "hello".to_string(),
                 }],
             }],
-            tools: None,
+            tools: Vec::new(),
+            hosted_tools: Vec::new(),
             tool_choice: None,
             options: empty_options(),
         };
@@ -852,6 +932,123 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["metadata"]["allowed"], true);
+    }
+
+    #[test]
+    fn maps_request_extra_body() {
+        let model_config = OpenAiResponsesModelConfig {
+            extra_body: Map::from_iter([(
+                "metadata".to_string(),
+                json!({"source": "model-config"}),
+            )]),
+            ..OpenAiResponsesModelConfig::default()
+        };
+        let mut options = empty_options();
+        options
+            .insert_extra(OpenAiResponsesRequestOptions {
+                extra_body: Map::from_iter([
+                    ("metadata".to_string(), json!({"source": "request"})),
+                    ("model".to_string(), json!("wrong-model")),
+                ]),
+            })
+            .unwrap();
+        let request = GenerateRequest {
+            messages: vec![Message::User {
+                content: vec![InputContent::Text {
+                    text: "hello".to_string(),
+                }],
+            }],
+            tools: Vec::new(),
+            hosted_tools: Vec::new(),
+            tool_choice: None,
+            options,
+        };
+
+        let body = build_response_body("gpt-4.1-mini", &model_config, request).unwrap();
+
+        assert_eq!(body["model"], "gpt-4.1-mini");
+        assert_eq!(body["metadata"]["source"], "request");
+    }
+
+    #[test]
+    fn maps_hosted_response_tools() {
+        let request = GenerateRequest {
+            messages: vec![Message::User {
+                content: vec![InputContent::Text {
+                    text: "draw a cat".to_string(),
+                }],
+            }],
+            tools: Vec::new(),
+            hosted_tools: vec![
+                OpenAiImageGenerationTool {
+                    partial_images: Some(2),
+                }
+                .try_into()
+                .unwrap(),
+            ],
+            tool_choice: Some(ToolChoice::Required),
+            options: empty_options(),
+        };
+
+        let body = build_response_body("gpt-5.5", &OpenAiResponsesModelConfig::default(), request)
+            .unwrap();
+
+        assert_eq!(body["tools"][0]["type"], "image_generation");
+        assert_eq!(body["tools"][0]["partial_images"], 2);
+        assert_eq!(body["tool_choice"], "required");
+    }
+
+    #[test]
+    fn maps_openai_partial_image_event() {
+        let image_base64 = base64::engine::general_purpose::STANDARD.encode([1_u8, 2, 3]);
+        let mut mapper = OpenAiEventMapper::new();
+
+        let events = mapper
+            .map_event(
+                ResponseStreamEvent::ResponseImageGenerationCallPartialImage(
+                    async_openai::types::responses::ResponseImageGenCallPartialImageEvent {
+                        sequence_number: 0,
+                        output_index: 0,
+                        item_id: "image_call".to_string(),
+                        partial_image_index: 0,
+                        partial_image_b64: image_base64,
+                    },
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(
+            events,
+            vec![OutputStreamEvent::Delta {
+                content_index: 0,
+                delta: OutputContentDelta::Image {
+                    image: ImageContent::Data {
+                        mime_type: "image/png".to_string(),
+                        data: vec![1, 2, 3],
+                    },
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn maps_openai_final_image_item() {
+        let image_base64 = base64::engine::general_purpose::STANDARD.encode([4_u8, 5, 6]);
+        let image = image_from_item(&json!({
+            "type": "image_generation_call",
+            "id": "image_call",
+            "status": "completed",
+            "result": image_base64,
+        }))
+        .unwrap();
+
+        assert_eq!(
+            image,
+            Some(ImageContent::Data {
+                mime_type: "image/png".to_string(),
+                data: vec![4, 5, 6],
+            })
+        );
     }
 
     #[test]

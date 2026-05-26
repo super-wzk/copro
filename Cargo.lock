@@ -159,6 +159,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "copro-agent"
+version = "0.1.0"
+dependencies = [
+ "copro-core",
+ "futures-util",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "copro-core"
 version = "0.1.0"
 dependencies = [
@@ -170,6 +180,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "copro-derive"
+version = "0.1.0"
+dependencies = [
+ "copro-core",
+ "futures-util",
+ "proc-macro2",
+ "quote",
+ "schemars",
+ "serde",
+ "serde_json",
+ "syn",
+]
+
+[[package]]
 name = "copro-provider-openai"
 version = "0.1.0"
 dependencies = [
@@ -177,11 +201,11 @@ dependencies = [
  "async-stream",
  "base64",
  "copro-core",
+ "copro-derive",
  "futures-util",
  "schemars",
  "serde",
  "serde_json",
- "tokio",
 ]
 
 [[package]]
@@ -809,6 +833,16 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "openai-simple-chat"
+version = "0.1.0"
+dependencies = [
+ "copro-core",
+ "copro-provider-openai",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "openssl-probe"

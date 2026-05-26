@@ -1,5 +1,5 @@
 use crate::error::*;
-use crate::message::{AssistantContent, Message};
+use crate::message::{ImageContent, Message, OutputContent};
 use crate::response::*;
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -7,10 +7,10 @@ use serde_json::{Map, Value};
 use std::pin::Pin;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AssistantContentEvent {
+pub enum OutputStreamEvent {
     Delta {
         content_index: usize,
-        delta: AssistantContentDetail,
+        delta: OutputContentDelta,
     },
     Finished {
         reason: FinishReason,
@@ -19,12 +19,15 @@ pub enum AssistantContentEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AssistantContentDetail {
+pub enum OutputContentDelta {
     Thinking {
         text: String,
     },
     Text {
         text: String,
+    },
+    Image {
+        image: ImageContent,
     },
     ToolCall {
         id: Option<String>,
@@ -33,16 +36,15 @@ pub enum AssistantContentDetail {
     },
 }
 
-pub type ModelStream<'a> =
-    Pin<Box<dyn Stream<Item = ModelResult<AssistantContentEvent>> + Send + 'a>>;
+pub type ModelStream<'a> = Pin<Box<dyn Stream<Item = ModelResult<OutputStreamEvent>> + Send + 'a>>;
 
 #[derive(Debug, Default)]
-pub struct AssistantStreamState {
-    content: Vec<Option<AssistantContentState>>,
+pub struct OutputStreamState {
+    content: Vec<Option<OutputContentState>>,
     finished: bool,
 }
 
-impl AssistantStreamState {
+impl OutputStreamState {
     pub fn new() -> Self {
         Self::default()
     }
@@ -59,24 +61,24 @@ impl AssistantStreamState {
         Err(ModelError::protocol("stream ended before finished event"))
     }
 
-    pub fn apply(&mut self, event: AssistantContentEvent) -> ModelResult<Option<GenerateResponse>> {
+    pub fn apply(&mut self, event: OutputStreamEvent) -> ModelResult<Option<GenerateResponse>> {
         if self.finished {
             return Err(ModelError::protocol("stream already finished"));
         }
 
         match event {
-            AssistantContentEvent::Delta {
+            OutputStreamEvent::Delta {
                 content_index,
                 delta,
             } => {
                 self.apply_delta(content_index, delta)?;
                 Ok(None)
             }
-            AssistantContentEvent::Finished { reason, usage } => {
+            OutputStreamEvent::Finished { reason, usage } => {
                 self.finished = true;
                 Ok(Some(GenerateResponse {
                     message: Message::Assistant {
-                        content: finish_content(std::mem::take(&mut self.content))?,
+                        content: finish_output_content(std::mem::take(&mut self.content))?,
                     },
                     finish_reason: reason,
                     usage,
@@ -85,27 +87,24 @@ impl AssistantStreamState {
         }
     }
 
-    fn apply_delta(
-        &mut self,
-        content_index: usize,
-        delta: AssistantContentDetail,
-    ) -> ModelResult<()> {
+    fn apply_delta(&mut self, content_index: usize, delta: OutputContentDelta) -> ModelResult<()> {
         if self.content.len() <= content_index {
             self.content.resize_with(content_index + 1, || None);
         }
         if let Some(state) = &mut self.content[content_index] {
             state.apply_delta(content_index, delta)
         } else {
-            self.content[content_index] = Some(AssistantContentState::from_delta(delta));
+            self.content[content_index] = Some(OutputContentState::from_delta(delta));
             Ok(())
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum AssistantContentState {
+enum OutputContentState {
     Thinking(String),
     Text(String),
+    Image(ImageContent),
     ToolCall {
         id: Option<String>,
         name: Option<String>,
@@ -113,12 +112,13 @@ enum AssistantContentState {
     },
 }
 
-impl AssistantContentState {
-    fn from_delta(delta: AssistantContentDetail) -> Self {
+impl OutputContentState {
+    fn from_delta(delta: OutputContentDelta) -> Self {
         match delta {
-            AssistantContentDetail::Thinking { text } => Self::Thinking(text),
-            AssistantContentDetail::Text { text } => Self::Text(text),
-            AssistantContentDetail::ToolCall {
+            OutputContentDelta::Thinking { text } => Self::Thinking(text),
+            OutputContentDelta::Text { text } => Self::Text(text),
+            OutputContentDelta::Image { image } => Self::Image(image),
+            OutputContentDelta::ToolCall {
                 id,
                 name,
                 arguments,
@@ -130,14 +130,10 @@ impl AssistantContentState {
         }
     }
 
-    fn apply_delta(
-        &mut self,
-        content_index: usize,
-        delta: AssistantContentDetail,
-    ) -> ModelResult<()> {
+    fn apply_delta(&mut self, content_index: usize, delta: OutputContentDelta) -> ModelResult<()> {
         match self {
             Self::Thinking(text) => {
-                let AssistantContentDetail::Thinking { text: delta } = delta else {
+                let OutputContentDelta::Thinking { text: delta } = delta else {
                     return Err(ModelError::protocol(format!(
                         "content delta type changed at index {content_index}"
                     )));
@@ -145,19 +141,27 @@ impl AssistantContentState {
                 text.push_str(&delta);
             }
             Self::Text(text) => {
-                let AssistantContentDetail::Text { text: delta } = delta else {
+                let OutputContentDelta::Text { text: delta } = delta else {
                     return Err(ModelError::protocol(format!(
                         "content delta type changed at index {content_index}"
                     )));
                 };
                 text.push_str(&delta);
             }
+            Self::Image(image) => {
+                let OutputContentDelta::Image { image: delta } = delta else {
+                    return Err(ModelError::protocol(format!(
+                        "content delta type changed at index {content_index}"
+                    )));
+                };
+                *image = delta;
+            }
             Self::ToolCall {
                 id,
                 name,
                 arguments,
             } => {
-                let AssistantContentDetail::ToolCall {
+                let OutputContentDelta::ToolCall {
                     id: delta_id,
                     name: delta_name,
                     arguments: delta_arguments,
@@ -180,15 +184,16 @@ impl AssistantContentState {
         Ok(())
     }
 
-    fn finish(self) -> ModelResult<AssistantContent> {
+    fn finish(self) -> ModelResult<OutputContent> {
         match self {
-            Self::Thinking(text) => Ok(AssistantContent::Thinking { text }),
-            Self::Text(text) => Ok(AssistantContent::Text { text }),
+            Self::Thinking(text) => Ok(OutputContent::Thinking { text }),
+            Self::Text(text) => Ok(OutputContent::Text { text }),
+            Self::Image(image) => Ok(OutputContent::Image { image }),
             Self::ToolCall {
                 id,
                 name,
                 arguments,
-            } => Ok(AssistantContent::ToolCall {
+            } => Ok(OutputContent::ToolCall {
                 id: id.ok_or_else(|| ModelError::protocol("tool call is missing id"))?,
                 name: name.ok_or_else(|| ModelError::protocol("tool call is missing name"))?,
                 arguments: parse_arguments(&arguments)?,
@@ -197,9 +202,9 @@ impl AssistantContentState {
     }
 }
 
-fn finish_content(
-    content: Vec<Option<AssistantContentState>>,
-) -> ModelResult<Vec<AssistantContent>> {
+fn finish_output_content(
+    content: Vec<Option<OutputContentState>>,
+) -> ModelResult<Vec<OutputContent>> {
     content
         .into_iter()
         .enumerate()
@@ -233,27 +238,27 @@ mod tests {
 
     #[test]
     fn state_collects_text() {
-        let mut state = AssistantStreamState::new();
+        let mut state = OutputStreamState::new();
 
         state
-            .apply(AssistantContentEvent::Delta {
+            .apply(OutputStreamEvent::Delta {
                 content_index: 0,
-                delta: AssistantContentDetail::Text {
+                delta: OutputContentDelta::Text {
                     text: "Hel".to_string(),
                 },
             })
             .unwrap();
         state
-            .apply(AssistantContentEvent::Delta {
+            .apply(OutputStreamEvent::Delta {
                 content_index: 0,
-                delta: AssistantContentDetail::Text {
+                delta: OutputContentDelta::Text {
                     text: "lo".to_string(),
                 },
             })
             .unwrap();
 
         let response = state
-            .apply(AssistantContentEvent::Finished {
+            .apply(OutputStreamEvent::Finished {
                 reason: FinishReason::Stop,
                 usage: None,
             })
@@ -263,9 +268,108 @@ mod tests {
         assert_eq!(
             response.message,
             Message::Assistant {
-                content: vec![AssistantContent::Text {
+                content: vec![OutputContent::Text {
                     text: "Hello".to_string()
                 }]
+            }
+        );
+    }
+
+    #[test]
+    fn image_delta_replaces_previous_image_at_same_index() {
+        let mut state = OutputStreamState::new();
+
+        state
+            .apply(OutputStreamEvent::Delta {
+                content_index: 0,
+                delta: OutputContentDelta::Image {
+                    image: ImageContent::Url {
+                        url: "data:image/png;base64,partial".to_string(),
+                    },
+                },
+            })
+            .unwrap();
+        state
+            .apply(OutputStreamEvent::Delta {
+                content_index: 0,
+                delta: OutputContentDelta::Image {
+                    image: ImageContent::Url {
+                        url: "data:image/png;base64,final".to_string(),
+                    },
+                },
+            })
+            .unwrap();
+
+        let response = state
+            .apply(OutputStreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            response.message,
+            Message::Assistant {
+                content: vec![OutputContent::Image {
+                    image: ImageContent::Url {
+                        url: "data:image/png;base64,final".to_string(),
+                    }
+                }]
+            }
+        );
+    }
+
+    #[test]
+    fn image_deltas_at_different_indices_collect_multiple_images() {
+        let mut state = OutputStreamState::new();
+
+        state
+            .apply(OutputStreamEvent::Delta {
+                content_index: 0,
+                delta: OutputContentDelta::Image {
+                    image: ImageContent::Url {
+                        url: "data:image/png;base64,first".to_string(),
+                    },
+                },
+            })
+            .unwrap();
+        state
+            .apply(OutputStreamEvent::Delta {
+                content_index: 1,
+                delta: OutputContentDelta::Image {
+                    image: ImageContent::Data {
+                        mime_type: "image/png".to_string(),
+                        data: vec![1, 2, 3],
+                    },
+                },
+            })
+            .unwrap();
+
+        let response = state
+            .apply(OutputStreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            response.message,
+            Message::Assistant {
+                content: vec![
+                    OutputContent::Image {
+                        image: ImageContent::Url {
+                            url: "data:image/png;base64,first".to_string(),
+                        }
+                    },
+                    OutputContent::Image {
+                        image: ImageContent::Data {
+                            mime_type: "image/png".to_string(),
+                            data: vec![1, 2, 3],
+                        }
+                    }
+                ]
             }
         );
     }

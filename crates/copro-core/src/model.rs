@@ -1,7 +1,8 @@
-use crate::error::ModelResult;
+use crate::error::{ModelError, ModelResult};
 use crate::request::GenerateRequest;
 use crate::response::GenerateResponse;
-use crate::stream::{AssistantStreamState, ModelStream};
+use crate::stream::{ModelStream, OutputStreamState};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
@@ -34,8 +35,8 @@ pub struct ModelCapabilities {
     pub features: BTreeSet<ModelFeature>,
     pub context_window: Option<u64>,
     pub max_output_tokens: Option<u64>,
-    #[serde(default)]
-    pub extensions: Map<String, Value>,
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub extra: Map<String, Value>,
 }
 
 impl ModelCapabilities {
@@ -56,6 +57,46 @@ impl ModelCapabilities {
         self.input_modalities.insert(modality);
         self
     }
+
+    pub fn extra<T>(&self) -> ModelResult<T>
+    where
+        T: DeserializeOwned,
+    {
+        serde_json::from_value(Value::Object(self.extra.clone())).map_err(|error| {
+            ModelError::client(format!("invalid model capabilities extra: {error}"))
+        })
+    }
+
+    pub fn insert_extra<T>(&mut self, extra: T) -> ModelResult<()>
+    where
+        T: Serialize,
+    {
+        let value = serde_json::to_value(extra).map_err(|error| {
+            ModelError::client(format!(
+                "failed to serialize model capabilities extra: {error}"
+            ))
+        })?;
+        let Value::Object(extra) = value else {
+            return Err(ModelError::client(
+                "model capabilities extra must serialize to a JSON object",
+            ));
+        };
+
+        self.extra.extend(extra);
+        Ok(())
+    }
+
+    pub fn with_extra<T>(mut self, extra: T) -> ModelResult<Self>
+    where
+        T: Serialize,
+    {
+        self.insert_extra(extra)?;
+        Ok(self)
+    }
+
+    pub fn remove_extra(&mut self, key: &str) -> Option<Value> {
+        self.extra.remove(key)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,9 +107,73 @@ pub struct ModelInfo {
 }
 
 pub trait ChatModel: Send + Sync {
+    /// Starts a streaming generation request.
+    ///
+    /// Implementations should return promptly and defer network I/O until the
+    /// returned stream is polled, so runtimes can apply deadlines and cancellation.
     fn stream(&self, request: GenerateRequest) -> ModelStream<'_>;
 
     fn generate(&self, request: GenerateRequest) -> ModelFuture<'_, GenerateResponse> {
-        Box::pin(async move { AssistantStreamState::collect(self.stream(request)).await })
+        Box::pin(async move { OutputStreamState::collect(self.stream(request)).await })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    #[serde(default)]
+    struct TestExtra {
+        value: Option<String>,
+    }
+
+    #[test]
+    fn typed_extra_round_trips() {
+        let mut capabilities = ModelCapabilities::default();
+        capabilities
+            .insert_extra(TestExtra {
+                value: Some("configured".to_string()),
+            })
+            .unwrap();
+
+        let extra = capabilities.extra::<TestExtra>().unwrap();
+
+        assert_eq!(
+            extra,
+            TestExtra {
+                value: Some("configured".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn empty_extra_deserializes_to_default() {
+        let capabilities = ModelCapabilities::default();
+
+        let extra = capabilities.extra::<TestExtra>().unwrap();
+
+        assert_eq!(extra, TestExtra::default());
+    }
+
+    #[test]
+    fn invalid_extra_reports_client_error() {
+        let mut capabilities = ModelCapabilities::default();
+        capabilities
+            .extra
+            .insert("value".to_string(), serde_json::json!(42));
+
+        let error = capabilities.extra::<TestExtra>().unwrap_err();
+
+        assert!(matches!(error, ModelError::Client { .. }));
+    }
+
+    #[test]
+    fn non_object_extra_is_rejected() {
+        let mut capabilities = ModelCapabilities::default();
+
+        let error = capabilities.insert_extra(42).unwrap_err();
+
+        assert!(matches!(error, ModelError::Client { .. }));
     }
 }

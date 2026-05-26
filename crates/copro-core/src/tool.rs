@@ -1,13 +1,76 @@
+use crate::error::{ModelError, ModelResult};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HostedToolSpec {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub parameters: Map<String, Value>,
+}
+
+impl HostedToolSpec {
+    pub fn new(kind: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            parameters: Map::new(),
+        }
+    }
+
+    pub fn parameters<T>(&self) -> ModelResult<T>
+    where
+        T: DeserializeOwned,
+    {
+        serde_json::from_value(Value::Object(self.parameters.clone())).map_err(|error| {
+            ModelError::client(format!(
+                "invalid hosted tool `{}` parameters: {error}",
+                self.kind
+            ))
+        })
+    }
+
+    pub fn insert_parameters<T>(&mut self, parameters: T) -> ModelResult<()>
+    where
+        T: Serialize,
+    {
+        let value = serde_json::to_value(parameters).map_err(|error| {
+            ModelError::client(format!(
+                "failed to serialize hosted tool `{}` parameters: {error}",
+                self.kind
+            ))
+        })?;
+        let Value::Object(parameters) = value else {
+            return Err(ModelError::client(format!(
+                "hosted tool `{}` parameters must serialize to a JSON object",
+                self.kind
+            )));
+        };
+
+        self.parameters.extend(parameters);
+        Ok(())
+    }
+
+    pub fn with_parameters<T>(mut self, parameters: T) -> ModelResult<Self>
+    where
+        T: Serialize,
+    {
+        self.insert_parameters(parameters)?;
+        Ok(self)
+    }
+
+    pub fn remove_parameter(&mut self, key: &str) -> Option<Value> {
+        self.parameters.remove(key)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,9 +126,10 @@ impl From<&dyn ErasedTool> for ToolDefinition {
 
 #[cfg(test)]
 mod tests {
-    use crate::tool::{ErasedTool, Tool};
+    use crate::error::ModelError;
+    use crate::tool::{ErasedTool, HostedToolSpec, Tool};
     use schemars::JsonSchema;
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
 
     #[derive(Deserialize, JsonSchema)]
     struct HelloArgs {
@@ -84,6 +148,38 @@ mod tests {
         fn call(&self, input: Self::Input) -> Result<Self::Output, String> {
             Ok(format!("Hello {}!", input.text))
         }
+    }
+
+    #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+    #[serde(default)]
+    struct TestHostedParameters {
+        partial_images: Option<u8>,
+    }
+
+    #[test]
+    fn hosted_tool_parameters_round_trip() {
+        let tool = HostedToolSpec::new("image_generation")
+            .with_parameters(TestHostedParameters {
+                partial_images: Some(2),
+            })
+            .unwrap();
+
+        assert_eq!(tool.kind, "image_generation");
+        assert_eq!(
+            tool.parameters::<TestHostedParameters>().unwrap(),
+            TestHostedParameters {
+                partial_images: Some(2),
+            }
+        );
+    }
+
+    #[test]
+    fn hosted_tool_rejects_non_object_parameters() {
+        let mut tool = HostedToolSpec::new("image_generation");
+
+        let error = tool.insert_parameters(42).unwrap_err();
+
+        assert!(matches!(error, ModelError::Client { .. }));
     }
 
     #[test]

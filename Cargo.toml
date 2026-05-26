@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/copro-core", "crates/copro-provider-openai"]
+members = [
+  "crates/copro-agent",
+  "crates/copro-core",
+  "crates/copro-derive",
+  "crates/copro-provider-openai",
+  "examples/*",
+]
 resolver = "3"
 
 [workspace.package]
@@ -7,13 +13,16 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+copro-agent = { path = "crates/copro-agent" }
 copro-core = { path = "crates/copro-core" }
+copro-derive = { path = "crates/copro-derive" }
+copro-provider-openai = { path = "crates/copro-provider-openai" }
 
 async-openai = { version = "0.40.2", default-features = false, features = [
-    "byot",
-    "model",
-    "responses",
-    "rustls",
+  "byot",
+  "model",
+  "responses",
+  "rustls",
 ] }
 async-stream = "0.3"
 base64 = "0.22"
@@ -21,6 +30,9 @@ config = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 futures-util = "0.3"
+proc-macro2 = "1"
+quote = "1"
 schemars = "1.2.1"
+syn = { version = "2", features = ["derive", "parsing", "printing"] }
 thiserror = "2"
 tokio = { version = "1", features = ["time"] }

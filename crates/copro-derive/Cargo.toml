@@ -1,14 +1,18 @@
 [package]
-name = "copro-provider-openai"
+name = "copro-derive"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+proc-macro = true
+
 [dependencies]
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true
+
+[dev-dependencies]
 copro-core.workspace = true
-copro-derive.workspace = true
-async-openai.workspace = true
-async-stream.workspace = true
-base64.workspace = true
 futures-util.workspace = true
 schemars.workspace = true
 serde.workspace = true

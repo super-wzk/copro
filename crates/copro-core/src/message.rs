@@ -22,12 +22,21 @@ pub enum InputContent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum AssistantContent {
+pub enum ImageContent {
+    Url { url: String },
+    Data { mime_type: String, data: Vec<u8> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OutputContent {
     Text {
         text: String,
     },
     Thinking {
         text: String,
+    },
+    Image {
+        image: ImageContent,
     },
     ToolCall {
         id: String,
@@ -45,7 +54,7 @@ pub enum Message {
         content: Vec<InputContent>,
     },
     Assistant {
-        content: Vec<AssistantContent>,
+        content: Vec<OutputContent>,
     },
     Tool {
         call_id: String,
