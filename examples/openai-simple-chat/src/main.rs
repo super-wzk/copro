@@ -28,6 +28,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         project: env_var("OPENAI_PROJECT"),
     });
 
+    // let models = ModelProvider::list_models(&provider).await?;
+    // println!("Models: {:?}", models);
+
     let model = provider.chat_model(
         &model_id,
         OpenAiResponsesModelConfig {
