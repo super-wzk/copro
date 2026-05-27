@@ -1,10 +1,10 @@
 [workspace]
 members = [
-  "crates/copro-agent",
-  "crates/copro-core",
-  "crates/copro-derive",
-  "crates/copro-provider-openai",
-  "examples/*",
+    "crates/copro-agent",
+    "crates/copro-core",
+    "crates/copro-derive",
+    "crates/copro-provider-openai",
+    "examples/*",
 ]
 resolver = "3"
 
@@ -19,9 +19,9 @@ copro-derive = { path = "crates/copro-derive" }
 copro-provider-openai = { path = "crates/copro-provider-openai" }
 
 async-openai = { version = "0.40.2", default-features = false, features = [
-  "byot",
-  "responses",
-  "rustls",
+    "byot",
+    "responses",
+    "rustls",
 ] }
 async-stream = "0.3"
 base64 = "0.22"

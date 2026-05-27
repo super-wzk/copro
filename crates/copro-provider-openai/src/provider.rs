@@ -6,7 +6,6 @@ use crate::request::build_response_body;
 use crate::stream::OpenAiEventMapper;
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
-use async_openai::types::responses::ResponseStreamEvent;
 use copro_core::error::{Error, Result};
 use copro_core::model::{InputModality, ModelCapabilities, ModelDefinition, ModelFeature};
 use copro_core::provider::{Chat, Provider};
@@ -124,17 +123,17 @@ impl Chat for OpenAiResponsesChat {
 async fn create_response_stream(
     client: &Client<OpenAIConfig>,
     body: Value,
-) -> Result<async_openai::types::responses::ResponseStream> {
+) -> Result<async_openai::types::stream::StreamResponse<Value>> {
     let responses = client.responses();
     responses
-        .create_stream_byot::<_, ResponseStreamEvent>(body)
+        .create_stream_byot::<_, Value>(body)
         .await
         .map_err(map_openai_error)
 }
 
 async fn next_openai_event(
-    stream: &mut async_openai::types::responses::ResponseStream,
-) -> Result<Option<ResponseStreamEvent>> {
+    stream: &mut async_openai::types::stream::StreamResponse<Value>,
+) -> Result<Option<Value>> {
     stream.next().await.transpose().map_err(map_openai_error)
 }
 
