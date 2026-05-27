@@ -1,30 +1,29 @@
 use crate::event::{AgentEvent, AgentStream};
 use crate::hook::{AgentHook, ToolDecision};
+use crate::tools::ToolProvider;
 use copro_core::error::{Error, Result};
 use copro_core::message::{
     InputContent, Message, OutputContent, ToolCall, ToolResult, ToolResultStatus,
 };
 use copro_core::request::{GenerateRequest, GenerateRequestOptions};
 use copro_core::stream::{Model, ModelStream, OutputStreamEvent, OutputStreamState};
-use copro_core::tool::{ErasedTool, ToolDefinition};
 use futures_util::StreamExt;
-use serde_json::Value;
 use std::sync::Arc;
 
 /// Conversational agent bound to one model with tools, hooks, and conversation state.
 pub struct Agent {
     pub model: Arc<dyn Model>,
-    pub tools: Vec<Arc<dyn ErasedTool>>,
+    pub tools: Arc<dyn ToolProvider>,
     pub hooks: Vec<Arc<dyn AgentHook>>,
     pub max_tool_rounds: usize,
     pub messages: Vec<Message>,
 }
 
 impl Agent {
-    pub fn new(model: Arc<dyn Model>) -> Self {
+    pub fn new(model: Arc<dyn Model>, tools: Arc<dyn ToolProvider>) -> Self {
         Self {
             model,
-            tools: Vec::new(),
+            tools,
             hooks: Vec::new(),
             max_tool_rounds: 10,
             messages: Vec::new(),
@@ -50,7 +49,7 @@ impl Agent {
                         }
                         model_rounds += 1;
 
-                        let mut request = self.build_request(self.messages.clone());
+                        let mut request = self.build_request(self.messages.clone()).await?;
                         self.apply_before_request(&mut request).await?;
                         TurnState::ModelStreaming {
                             stream: model.stream(request),
@@ -91,10 +90,11 @@ impl Agent {
 
                                 let usage = response.usage.clone();
                                 let mut output_content = into_assistant_content(response.message)?;
-                                self.apply_on_output_finished(&mut output_content).await?;
+                                self.apply_before_output_commit(&mut output_content).await?;
                                 self.messages.push(normalize_for_history(Message::Assistant(
                                     output_content.clone(),
                                 )));
+                                self.apply_after_output_commit(&output_content).await?;
                                 yield AgentEvent::OutputFinished {
                                     content: output_content.clone(),
                                     reason,
@@ -117,18 +117,16 @@ impl Agent {
                             let OutputContent::ToolCall(mut tool) = item else {
                                 continue;
                             };
-                            let mut result = match self.apply_before_tool_execute(&mut tool).await? {
-                                ToolDecision::Allow => {
-                                    self.execute_tool(&tool).await
-                                }
+                            let mut result = match self.apply_before_tool_call(&mut tool).await? {
+                                ToolDecision::Allow => self.tools.execute(tool.clone()).await?,
                                 ToolDecision::Reject { reason } => ToolResult {
-                                    call_id: tool.id,
-                                    name: tool.name,
+                                    call_id: tool.id.clone(),
+                                    name: tool.name.clone(),
                                     status: ToolResultStatus::Error,
                                     content: vec![InputContent::Text(reason)],
                                 },
                             };
-                            self.apply_after_tool_result(&mut result).await?;
+                            self.apply_after_tool_call(&tool, &mut result).await?;
                             self.messages.push(Message::Tool(result.clone()));
                             yield AgentEvent::ToolResult(result);
                         }
@@ -141,17 +139,14 @@ impl Agent {
         })
     }
 
-    fn build_request(&self, messages: Vec<Message>) -> GenerateRequest {
-        let tool_defs: Vec<ToolDefinition> =
-            self.tools.iter().map(|tool| tool.as_ref().into()).collect();
-
-        GenerateRequest {
+    async fn build_request(&self, messages: Vec<Message>) -> Result<GenerateRequest> {
+        Ok(GenerateRequest {
             messages,
-            tools: tool_defs,
+            tools: self.tools.definitions().await?,
             hosted_tools: Vec::new(),
             tool_choice: None,
             options: GenerateRequestOptions::default(),
-        }
+        })
     }
 
     async fn apply_before_request(&self, request: &mut GenerateRequest) -> Result<()> {
@@ -161,9 +156,9 @@ impl Agent {
         Ok(())
     }
 
-    async fn apply_before_tool_execute(&self, tool: &mut ToolCall) -> Result<ToolDecision> {
+    async fn apply_before_tool_call(&self, tool: &mut ToolCall) -> Result<ToolDecision> {
         for hook in &self.hooks {
-            match hook.before_tool_execute(tool).await? {
+            match hook.before_tool_call(tool).await? {
                 ToolDecision::Allow => {}
                 decision => return Ok(decision),
             }
@@ -171,47 +166,25 @@ impl Agent {
         Ok(ToolDecision::Allow)
     }
 
-    async fn apply_after_tool_result(&self, result: &mut ToolResult) -> Result<()> {
+    async fn apply_after_tool_call(&self, tool: &ToolCall, result: &mut ToolResult) -> Result<()> {
         for hook in &self.hooks {
-            hook.after_tool_result(result).await?;
+            hook.after_tool_call(tool, result).await?;
         }
         Ok(())
     }
 
-    async fn apply_on_output_finished(&self, content: &mut Vec<OutputContent>) -> Result<()> {
+    async fn apply_before_output_commit(&self, content: &mut Vec<OutputContent>) -> Result<()> {
         for hook in &self.hooks {
-            hook.on_output_finished(content).await?;
+            hook.before_output_commit(content).await?;
         }
         Ok(())
     }
 
-    async fn execute_tool(&self, call: &ToolCall) -> ToolResult {
-        let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) else {
-            return ToolResult {
-                call_id: call.id.clone(),
-                name: call.name.clone(),
-                status: ToolResultStatus::Error,
-                content: vec![InputContent::Text(format!("unknown tool: {}", call.name))],
-            };
-        };
-
-        match tool.call_json(Value::Object(call.arguments.clone())).await {
-            Ok(output) => {
-                let text = serde_json::to_string(&output).unwrap_or_else(|_| format!("{output:?}"));
-                ToolResult {
-                    call_id: call.id.clone(),
-                    name: call.name.clone(),
-                    status: ToolResultStatus::Success,
-                    content: vec![InputContent::Text(text)],
-                }
-            }
-            Err(error) => ToolResult {
-                call_id: call.id.clone(),
-                name: call.name.clone(),
-                status: ToolResultStatus::Error,
-                content: vec![InputContent::Text(error)],
-            },
+    async fn apply_after_output_commit(&self, content: &[OutputContent]) -> Result<()> {
+        for hook in &self.hooks {
+            hook.after_output_commit(content).await?;
         }
+        Ok(())
     }
 }
 

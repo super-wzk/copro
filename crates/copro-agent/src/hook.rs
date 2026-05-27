@@ -10,20 +10,24 @@ pub trait AgentHook: Send + Sync {
         Ok(())
     }
 
-    async fn before_tool_execute(&self, _tool: &mut ToolCall) -> Result<ToolDecision> {
+    async fn before_tool_call(&self, _tool: &mut ToolCall) -> Result<ToolDecision> {
         Ok(ToolDecision::Allow)
     }
 
-    async fn after_tool_result(&self, _result: &mut ToolResult) -> Result<()> {
+    async fn after_tool_call(&self, _tool: &ToolCall, _result: &mut ToolResult) -> Result<()> {
         Ok(())
     }
 
-    async fn on_output_finished(&self, _content: &mut Vec<OutputContent>) -> Result<()> {
+    async fn before_output_commit(&self, _content: &mut Vec<OutputContent>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn after_output_commit(&self, _content: &[OutputContent]) -> Result<()> {
         Ok(())
     }
 }
 
-/// Decision returned by [`AgentHook::before_tool_execute`].
+/// Decision returned by [`AgentHook::before_tool_call`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolDecision {
     Allow,

@@ -233,6 +233,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "copro-tools"
+version = "0.1.0"
+dependencies = [
+ "copro-agent",
+ "copro-core",
+ "serde_json",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1358,6 +1367,7 @@ dependencies = [
  "copro-agent",
  "copro-core",
  "copro-provider-openai",
+ "copro-tools",
  "futures-util",
  "schemars",
  "serde",

@@ -1,10 +1,12 @@
-use copro_agent::{Agent, AgentEvent, AgentHook, async_trait};
+use copro_agent::{Agent, AgentEvent, AgentHook, ToolProvider, async_trait};
 use copro_core::error::Result;
-use copro_core::message::{InputContent, Message, OutputContent, ToolResult, ToolResultStatus};
+use copro_core::message::{
+    InputContent, Message, OutputContent, ToolCall, ToolResult, ToolResultStatus,
+};
 use copro_core::request::GenerateRequest;
 use copro_core::response::FinishReason;
 use copro_core::stream::{Model, ModelStream, OutputContentDelta, OutputStreamEvent};
-use copro_core::tool::ErasedTool;
+use copro_core::tool::{ErasedTool, ToolDefinition};
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::sync::Arc;
@@ -54,7 +56,7 @@ async fn run_stream_commits_assistant_message() {
 }
 
 #[tokio::test]
-async fn on_output_finished_hook_can_modify_output() {
+async fn before_output_commit_hook_can_modify_output() {
     let mut agent = test_agent(vec![
         OutputStreamEvent::Delta {
             content_index: 0,
@@ -92,10 +94,12 @@ async fn on_output_finished_hook_can_modify_output() {
 
 #[tokio::test]
 async fn run_stream_awaits_async_erased_tool() {
-    let mut agent = Agent::new(Arc::new(ToolThenDoneModel {
-        calls: AtomicUsize::new(0),
-    }));
-    agent.tools.push(Arc::new(AsyncDoubleTool));
+    let mut agent = Agent::new(
+        Arc::new(ToolThenDoneModel {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(DoubleToolProvider),
+    );
 
     let events = agent
         .run_stream()
@@ -126,16 +130,62 @@ async fn run_stream_awaits_async_erased_tool() {
 }
 
 fn test_agent(events: Vec<OutputStreamEvent>) -> Agent {
-    Agent::new(Arc::new(TestModel { events }))
+    Agent::new(Arc::new(TestModel { events }), Arc::new(EmptyToolProvider))
 }
 
 struct RedactHook;
 
 #[async_trait]
 impl AgentHook for RedactHook {
-    async fn on_output_finished(&self, content: &mut Vec<OutputContent>) -> Result<()> {
+    async fn before_output_commit(&self, content: &mut Vec<OutputContent>) -> Result<()> {
         *content = vec![OutputContent::Text("redacted".to_string())];
         Ok(())
+    }
+}
+
+struct EmptyToolProvider;
+
+#[async_trait]
+impl ToolProvider for EmptyToolProvider {
+    async fn definitions(&self) -> Result<Vec<ToolDefinition>> {
+        Ok(Vec::new())
+    }
+
+    async fn execute(&self, _call: ToolCall) -> Result<ToolResult> {
+        unreachable!("empty runtime has no tools")
+    }
+}
+
+struct DoubleToolProvider;
+
+#[async_trait]
+impl ToolProvider for DoubleToolProvider {
+    async fn definitions(&self) -> Result<Vec<ToolDefinition>> {
+        Ok(vec![ToolDefinition {
+            name: "double".to_string(),
+            description: "Double an integer.".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }])
+    }
+
+    async fn execute(&self, call: ToolCall) -> Result<ToolResult> {
+        let ToolCall {
+            id,
+            name,
+            arguments,
+        } = call;
+        let output = AsyncDoubleTool
+            .call_json(Value::Object(arguments))
+            .await
+            .map_err(copro_core::error::Error::client)?;
+        let text = serde_json::to_string(&output).unwrap_or_else(|_| format!("{output:?}"));
+
+        Ok(ToolResult {
+            call_id: id,
+            name,
+            status: ToolResultStatus::Success,
+            content: vec![InputContent::Text(text)],
+        })
     }
 }
 

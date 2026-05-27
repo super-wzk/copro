@@ -5,6 +5,7 @@ members = [
   "crates/copro-core",
   "crates/copro-derive",
   "crates/copro-provider-openai",
+  "crates/copro-tools",
   "examples/*",
 ]
 resolver = "3"
@@ -19,6 +20,7 @@ copro-config = { path = "crates/copro-config" }
 copro-core = { path = "crates/copro-core" }
 copro-derive = { path = "crates/copro-derive" }
 copro-provider-openai = { path = "crates/copro-provider-openai" }
+copro-tools = { path = "crates/copro-tools" }
 
 async-openai = { version = "0.40.2", default-features = false, features = [
   "byot",

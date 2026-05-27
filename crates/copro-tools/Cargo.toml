@@ -1,0 +1,9 @@
+[package]
+name = "copro-tools"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+copro-agent.workspace = true
+copro-core.workspace = true
+serde_json.workspace = true
