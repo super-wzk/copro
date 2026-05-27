@@ -1,3 +1,5 @@
+pub use copro_core::async_trait;
+
 pub mod runtime;
 
 mod agent;

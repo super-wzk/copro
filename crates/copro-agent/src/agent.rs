@@ -47,7 +47,7 @@ impl Agent {
 
             for _round in 0..self.max_tool_rounds {
                 let mut request = self.build_request(self.messages.clone());
-                self.apply_before_request(&mut request)?;
+                self.apply_before_request(&mut request).await?;
                 let mut stream = chat.stream(request);
                 let mut output_state = OutputStreamState::new();
 
@@ -81,7 +81,7 @@ impl Agent {
                             let finish_reason = response.finish_reason;
                             let usage = response.usage.clone();
                             let mut assistant_message = response.message;
-                            self.apply_on_output_finished(&mut assistant_message)?;
+                            self.apply_on_output_finished(&mut assistant_message).await?;
                             let output_content = assistant_content(&assistant_message)?;
                             let has_tool_calls = output_content
                                 .iter()
@@ -111,9 +111,9 @@ impl Agent {
                                         name: name.clone(),
                                         arguments: arguments.clone(),
                                     };
-                                    let result = match self.apply_before_tool_execute(&mut tool)? {
+                                    let result = match self.apply_before_tool_execute(&mut tool).await? {
                                         ToolDecision::Allow => {
-                                            self.execute_tool(&tool.name, &tool.arguments)
+                                            self.execute_tool(&tool.name, &tool.arguments).await
                                         }
                                         ToolDecision::Reject { reason } => ToolExecutionResult {
                                             status: ToolResultStatus::Error,
@@ -126,7 +126,7 @@ impl Agent {
                                         status: result.status,
                                         content: result.content,
                                     };
-                                    self.apply_after_tool_result(&mut result)?;
+                                    self.apply_after_tool_result(&mut result).await?;
                                     let tool_message = Message::Tool {
                                         call_id: result.call_id.clone(),
                                         name: result.name.clone(),
@@ -168,16 +168,19 @@ impl Agent {
         }
     }
 
-    fn apply_before_request(&self, request: &mut GenerateRequest) -> Result<()> {
+    async fn apply_before_request(&self, request: &mut GenerateRequest) -> Result<()> {
         for hook in &self.hooks {
-            hook.before_request(request)?;
+            hook.before_request(request).await?;
         }
         Ok(())
     }
 
-    fn apply_before_tool_execute(&self, tool: &mut ToolExecuteContext) -> Result<ToolDecision> {
+    async fn apply_before_tool_execute(
+        &self,
+        tool: &mut ToolExecuteContext,
+    ) -> Result<ToolDecision> {
         for hook in &self.hooks {
-            match hook.before_tool_execute(tool)? {
+            match hook.before_tool_execute(tool).await? {
                 ToolDecision::Allow => {}
                 decision => return Ok(decision),
             }
@@ -185,21 +188,25 @@ impl Agent {
         Ok(ToolDecision::Allow)
     }
 
-    fn apply_after_tool_result(&self, result: &mut ToolResultContext) -> Result<()> {
+    async fn apply_after_tool_result(&self, result: &mut ToolResultContext) -> Result<()> {
         for hook in &self.hooks {
-            hook.after_tool_result(result)?;
+            hook.after_tool_result(result).await?;
         }
         Ok(())
     }
 
-    fn apply_on_output_finished(&self, message: &mut Message) -> Result<()> {
+    async fn apply_on_output_finished(&self, message: &mut Message) -> Result<()> {
         for hook in &self.hooks {
-            hook.on_output_finished(message)?;
+            hook.on_output_finished(message).await?;
         }
         Ok(())
     }
 
-    fn execute_tool(&self, name: &str, arguments: &Map<String, Value>) -> ToolExecutionResult {
+    async fn execute_tool(
+        &self,
+        name: &str,
+        arguments: &Map<String, Value>,
+    ) -> ToolExecutionResult {
         let Some(tool) = self.tools.iter().find(|t| t.name() == name) else {
             return ToolExecutionResult {
                 status: ToolResultStatus::Error,
@@ -209,7 +216,7 @@ impl Agent {
             };
         };
 
-        match tool.call_json(Value::Object(arguments.clone())) {
+        match tool.call_json(Value::Object(arguments.clone())).await {
             Ok(output) => {
                 let text = serde_json::to_string(&output).unwrap_or_else(|_| format!("{output:?}"));
                 ToolExecutionResult {

@@ -1,3 +1,5 @@
+pub use async_trait::async_trait;
+
 pub mod error;
 pub mod message;
 pub mod model;

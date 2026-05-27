@@ -1,4 +1,4 @@
-use copro_core::tool::Tool;
+use copro_core::{async_trait, tool::Tool};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -13,6 +13,7 @@ pub struct CalculatorInput {
 #[derive(Debug)]
 pub struct Calculator;
 
+#[async_trait]
 impl Tool for Calculator {
     type Input = CalculatorInput;
     type Output = f64;
@@ -25,7 +26,7 @@ impl Tool for Calculator {
         "Evaluate a simple arithmetic expression. Supports +, -, *, /, and parentheses."
     }
 
-    fn call(&self, input: Self::Input) -> Result<Self::Output, String> {
+    async fn call(&self, input: Self::Input) -> Result<Self::Output, String> {
         evaluate_expression(&input.expression).map_err(|e| e.to_string())
     }
 }
@@ -173,6 +174,7 @@ pub struct DateTimeInput {
 #[derive(Debug)]
 pub struct DateTimeTool;
 
+#[async_trait]
 impl Tool for DateTimeTool {
     type Input = DateTimeInput;
     type Output = String;
@@ -185,7 +187,7 @@ impl Tool for DateTimeTool {
         "Get the current date and time, optionally adjusted by a timezone offset."
     }
 
-    fn call(&self, input: Self::Input) -> Result<Self::Output, String> {
+    async fn call(&self, input: Self::Input) -> Result<Self::Output, String> {
         let now = std::time::SystemTime::now();
         let total_secs = now
             .duration_since(std::time::UNIX_EPOCH)

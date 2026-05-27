@@ -1,3 +1,4 @@
+use crate::async_trait;
 use crate::error::{Error, Result};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -82,22 +83,25 @@ pub enum ToolChoice {
     Specific { name: String },
 }
 
-pub trait Tool {
-    type Input: DeserializeOwned + JsonSchema;
-    type Output: Serialize;
+#[async_trait]
+pub trait Tool: Send + Sync {
+    type Input: DeserializeOwned + JsonSchema + Send;
+    type Output: Serialize + Send;
     fn name(&self) -> &str;
     fn description(&self) -> &str;
-    fn call(&self, input: Self::Input) -> std::result::Result<Self::Output, String>;
+    async fn call(&self, input: Self::Input) -> std::result::Result<Self::Output, String>;
 }
 
+#[async_trait]
 pub trait ErasedTool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameters(&self) -> Value;
-    fn call_json(&self, args: Value) -> std::result::Result<Value, String>;
+    async fn call_json(&self, args: Value) -> std::result::Result<Value, String>;
 }
 
-impl<T: Tool + Send + Sync> ErasedTool for T {
+#[async_trait]
+impl<T: Tool> ErasedTool for T {
     fn name(&self) -> &str {
         Tool::name(self)
     }
@@ -108,9 +112,9 @@ impl<T: Tool + Send + Sync> ErasedTool for T {
         let schema = schemars::schema_for!(T::Input);
         serde_json::to_value(schema).unwrap_or_default()
     }
-    fn call_json(&self, args: Value) -> std::result::Result<Value, String> {
+    async fn call_json(&self, args: Value) -> std::result::Result<Value, String> {
         let input = serde_json::from_value::<T::Input>(args).map_err(|e| e.to_string())?;
-        let output = self.call(input)?;
+        let output = self.call(input).await?;
         serde_json::to_value(output).map_err(|e| e.to_string())
     }
 }
@@ -127,6 +131,7 @@ impl From<&dyn ErasedTool> for ToolDefinition {
 
 #[cfg(test)]
 mod tests {
+    use crate::async_trait;
     use crate::error::Error;
     use crate::tool::{ErasedTool, HostedToolSpec, Tool};
     use schemars::JsonSchema;
@@ -137,6 +142,7 @@ mod tests {
         text: String,
     }
     struct Hello;
+    #[async_trait]
     impl Tool for Hello {
         type Input = HelloArgs;
         type Output = String;
@@ -146,7 +152,7 @@ mod tests {
         fn description(&self) -> &str {
             "Hello"
         }
-        fn call(&self, input: Self::Input) -> Result<Self::Output, String> {
+        async fn call(&self, input: Self::Input) -> Result<Self::Output, String> {
             Ok(format!("Hello {}!", input.text))
         }
     }
@@ -183,11 +189,12 @@ mod tests {
         assert!(matches!(error, Error::Client { .. }));
     }
 
-    #[test]
-    fn test_erased_tool() {
+    #[tokio::test]
+    async fn test_erased_tool() {
         let tools: Box<dyn ErasedTool> = Box::new(Hello);
         let res = tools
             .call_json(serde_json::json!({"text":"World"}))
+            .await
             .unwrap();
         assert_eq!(res, "Hello World!");
     }
