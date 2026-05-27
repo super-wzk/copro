@@ -1,6 +1,6 @@
 use copro_core::async_trait;
 use copro_core::error::Result;
-use copro_core::message::{Message, ToolCall, ToolResult};
+use copro_core::message::{OutputContent, ToolCall, ToolResult};
 use copro_core::request::GenerateRequest;
 
 /// Hook points that can inspect or modify agent execution.
@@ -18,7 +18,7 @@ pub trait AgentHook: Send + Sync {
         Ok(())
     }
 
-    async fn on_output_finished(&self, _message: &mut Message) -> Result<()> {
+    async fn on_output_finished(&self, _content: &mut Vec<OutputContent>) -> Result<()> {
         Ok(())
     }
 }

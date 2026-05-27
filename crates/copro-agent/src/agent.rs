@@ -90,10 +90,11 @@ impl Agent {
                                     })?;
 
                                 let usage = response.usage.clone();
-                                let mut assistant_message = response.message;
-                                self.apply_on_output_finished(&mut assistant_message).await?;
-                                let output_content = assistant_content(&assistant_message)?;
-                                self.messages.push(normalize_for_history(assistant_message));
+                                let mut output_content = into_assistant_content(response.message)?;
+                                self.apply_on_output_finished(&mut output_content).await?;
+                                self.messages.push(normalize_for_history(Message::Assistant(
+                                    output_content.clone(),
+                                )));
                                 yield AgentEvent::OutputFinished {
                                     content: output_content.clone(),
                                     reason,
@@ -177,9 +178,9 @@ impl Agent {
         Ok(())
     }
 
-    async fn apply_on_output_finished(&self, message: &mut Message) -> Result<()> {
+    async fn apply_on_output_finished(&self, content: &mut Vec<OutputContent>) -> Result<()> {
         for hook in &self.hooks {
-            hook.on_output_finished(message).await?;
+            hook.on_output_finished(content).await?;
         }
         Ok(())
     }
@@ -214,9 +215,9 @@ impl Agent {
     }
 }
 
-fn assistant_content(message: &Message) -> Result<Vec<OutputContent>> {
+fn into_assistant_content(message: Message) -> Result<Vec<OutputContent>> {
     match message {
-        Message::Assistant(content) => Ok(content.clone()),
+        Message::Assistant(content) => Ok(content),
         other => Err(Error::protocol(format!(
             "expected assistant message, got {other:?}"
         ))),

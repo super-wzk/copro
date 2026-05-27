@@ -133,10 +133,8 @@ struct RedactHook;
 
 #[async_trait]
 impl AgentHook for RedactHook {
-    async fn on_output_finished(&self, message: &mut Message) -> Result<()> {
-        if let Message::Assistant(content) = message {
-            *content = vec![OutputContent::Text("redacted".to_string())];
-        }
+    async fn on_output_finished(&self, content: &mut Vec<OutputContent>) -> Result<()> {
+        *content = vec![OutputContent::Text("redacted".to_string())];
         Ok(())
     }
 }
