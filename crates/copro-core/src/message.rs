@@ -4,6 +4,7 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Role {
     System,
+    Developer,
     User,
     Assistant,
     Tool,
@@ -48,6 +49,9 @@ pub enum OutputContent {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Message {
     System {
+        content: Vec<InputContent>,
+    },
+    Developer {
         content: Vec<InputContent>,
     },
     User {

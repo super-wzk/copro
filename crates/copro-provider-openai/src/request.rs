@@ -90,6 +90,9 @@ fn build_input_items(messages: Vec<Message>) -> Result<Vec<Value>> {
 fn build_message_items(message: Message) -> Result<Vec<Value>> {
     match message {
         Message::System { content } => Ok(vec![message_item("system", input_content(content)?)]),
+        Message::Developer { content } => {
+            Ok(vec![message_item("developer", input_content(content)?)])
+        }
         Message::User { content } => Ok(vec![message_item("user", input_content(content)?)]),
         Message::Assistant { content } => build_output_items(content),
         Message::Tool {
@@ -307,6 +310,35 @@ mod tests {
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(body["input"][0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn builds_developer_message_request() {
+        let request = copro_core::request::GenerateRequest {
+            messages: vec![Message::Developer {
+                content: vec![InputContent::Text {
+                    text: "follow these instructions".to_string(),
+                }],
+            }],
+            tools: Vec::new(),
+            hosted_tools: Vec::new(),
+            tool_choice: None,
+            options: empty_options(),
+        };
+
+        let body = build_response_body(
+            "gpt-4.1-mini",
+            &OpenAiResponsesModelConfig::default(),
+            request,
+        )
+        .unwrap();
+
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(
+            body["input"][0]["content"][0]["text"],
+            "follow these instructions"
+        );
     }
 
     #[test]
