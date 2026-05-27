@@ -1,6 +1,7 @@
 use copro_agent::{Agent, AgentEvent};
-use copro_core::message::{InputContent, Message};
+use copro_core::message::{InputContent, Message, OutputContent, ToolResultStatus};
 use copro_core::provider::ProviderRegistry;
+use copro_core::stream::OutputContentDelta;
 use copro_provider_openai::{
     OpenAiResponsesModelConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
 };
@@ -38,11 +39,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     registry.register_model(model);
 
     let tools: Vec<Arc<dyn ErasedTool>> = vec![Arc::new(Calculator), Arc::new(DateTimeTool)];
-    let agent = Agent::new(registry).with_tools(tools);
+    let mut agent = Agent::new(registry);
+    agent.tools = tools;
 
-    let mut messages: Vec<Message> = vec![Message::System {
+    agent.messages.push(Message::System {
         content: vec![text(SYSTEM_PROMPT)],
-    }];
+    });
 
     println!("copro CLI — type /quit to exit, /clear to reset\n");
 
@@ -61,64 +63,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
         if input == "/clear" {
-            messages.truncate(1); // keep system prompt
+            agent.messages.clear();
+            agent.messages.push(Message::System {
+                content: vec![text(SYSTEM_PROMPT)],
+            });
             println!("[conversation cleared]\n");
             continue;
         }
 
-        messages.push(Message::User {
+        agent.messages.push(Message::User {
             content: vec![text(&input)],
         });
 
-        let mut stream = agent.run_stream("gpt-5.5", messages.clone());
-        let mut assistant_text = String::new();
-        let mut has_error = false;
+        let mut stream = agent.run_stream("gpt-5.5");
         let mut started_assistant = false;
         let mut streaming_thinking = false;
 
         while let Some(result) = stream.next().await {
             match result {
                 Ok(event) => match event {
-                    // Text / thinking are already deltas from Agent::run_stream,
-                    // so print and flush each chunk immediately.
-                    AgentEvent::Text(delta) => {
+                    AgentEvent::OutputDelta { delta } => match delta {
+                        OutputContentDelta::Text { text } => {
+                            if streaming_thinking {
+                                eprintln!();
+                                streaming_thinking = false;
+                            }
+                            if !started_assistant {
+                                print!("assistant: ");
+                                started_assistant = true;
+                            }
+                            print!("{text}");
+                            io::stdout().flush()?;
+                        }
+                        OutputContentDelta::Thinking { text } => {
+                            if !streaming_thinking {
+                                eprint!("[thinking] ");
+                                streaming_thinking = true;
+                            }
+                            eprint!("{text}");
+                            io::stderr().flush()?;
+                        }
+                        OutputContentDelta::Image { .. } => {}
+                        OutputContentDelta::ToolCall { .. } => {}
+                    },
+                    AgentEvent::Output { content, .. } => {
                         if streaming_thinking {
                             eprintln!();
                             streaming_thinking = false;
                         }
-                        if !started_assistant {
-                            print!("assistant: ");
-                            started_assistant = true;
+                        for item in content {
+                            match item {
+                                OutputContent::ToolCall {
+                                    name, arguments, ..
+                                } => eprintln!("[tool call] {name}({arguments:?})"),
+                                OutputContent::Image { image } => {
+                                    eprintln!("[image output] {image:?}")
+                                }
+                                _ => {}
+                            }
                         }
-                        print!("{delta}");
-                        io::stdout().flush()?;
-                        assistant_text.push_str(&delta);
                     }
-                    AgentEvent::Thinking(delta) => {
-                        if !streaming_thinking {
-                            eprint!("[thinking] ");
-                            streaming_thinking = true;
-                        }
-                        eprint!("{delta}");
-                        io::stderr().flush()?;
-                    }
-                    AgentEvent::ToolCall {
-                        name, arguments, ..
+                    AgentEvent::ToolResult {
+                        name,
+                        status,
+                        content,
+                        ..
                     } => {
                         if streaming_thinking {
                             eprintln!();
                             streaming_thinking = false;
                         }
-                        eprintln!("[tool call] {name}({arguments:?})");
+                        let label = match status {
+                            ToolResultStatus::Success => "output",
+                            ToolResultStatus::Error => "error",
+                        };
+                        eprintln!("[tool {label}] {name}: {}", input_content_text(&content));
                     }
-                    AgentEvent::ToolOutput { name, result, .. } => {
-                        if streaming_thinking {
-                            eprintln!();
-                            streaming_thinking = false;
-                        }
-                        eprintln!("[tool output] {name}: {result}");
-                    }
-                    AgentEvent::Finished { reason } => {
+                    AgentEvent::TurnFinish => {
                         if streaming_thinking {
                             eprintln!();
                             streaming_thinking = false;
@@ -126,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if started_assistant {
                             println!();
                         }
-                        eprintln!("[finish: {reason:?}]");
+                        eprintln!("[turn finish]");
                     }
                 },
                 Err(e) => {
@@ -134,19 +155,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!();
                     }
                     eprintln!("[error] {e}");
-                    has_error = true;
                     break;
                 }
             }
         }
 
-        if !has_error && !assistant_text.is_empty() {
-            messages.push(Message::Assistant {
-                content: vec![copro_core::message::OutputContent::Text {
-                    text: assistant_text,
-                }],
-            });
-        }
         println!();
     }
 
@@ -155,6 +168,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn text(t: impl Into<String>) -> InputContent {
     InputContent::Text { text: t.into() }
+}
+
+fn input_content_text(content: &[InputContent]) -> String {
+    content
+        .iter()
+        .filter_map(|content| match content {
+            InputContent::Text { text } => Some(text.as_str()),
+            InputContent::Image { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn env_var(name: &str) -> Option<String> {

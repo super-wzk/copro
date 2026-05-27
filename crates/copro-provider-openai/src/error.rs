@@ -1,18 +1,6 @@
 use async_openai::error::OpenAIError;
 use copro_core::error::Error;
 
-pub(crate) fn response_error(response: async_openai::types::responses::Response) -> Error {
-    if let Some(error) = response.error {
-        return Error::Server {
-            message: error.message,
-        };
-    }
-
-    Error::Server {
-        message: format!("OpenAI response failed with status {:?}", response.status),
-    }
-}
-
 pub(crate) fn map_openai_error(error: OpenAIError) -> Error {
     match error {
         OpenAIError::Reqwest(error) if error.is_timeout() => Error::Timeout,

@@ -4,44 +4,46 @@ use copro_core::error::{Error, Result};
 use copro_core::message::{InputContent, Message, OutputContent, ToolResultStatus};
 use copro_core::provider::ProviderRegistry;
 use copro_core::request::{GenerateRequest, GenerateRequestOptions};
-use copro_core::response::FinishReason;
+use copro_core::response::{FinishReason, Usage};
 use copro_core::stream::{OutputContentDelta, OutputStreamEvent, OutputStreamState};
 use copro_core::tool::{ErasedTool, ToolDefinition};
 use futures_util::StreamExt;
-pub use runtime::{RequestDeadline, RuntimeOptions};
 use serde_json::{Map, Value};
 use std::pin::Pin;
 use std::sync::Arc;
 
 /// Events emitted during one agent turn.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentEvent {
-    Text(String),
-    Thinking(String),
-    ToolCall {
-        id: String,
+    /// A streaming model output delta before the output is committed.
+    OutputDelta { delta: OutputContentDelta },
+    /// A complete model output committed as an assistant message.
+    Output {
+        content: Vec<OutputContent>,
+        finish_reason: FinishReason,
+        usage: Option<Usage>,
+    },
+    /// A tool execution result committed as a tool message.
+    ToolResult {
+        call_id: String,
         name: String,
-        arguments: Map<String, Value>,
+        status: ToolResultStatus,
+        content: Vec<InputContent>,
     },
-    ToolOutput {
-        name: String,
-        result: String,
-    },
-    Finished {
-        reason: FinishReason,
-    },
+    /// The whole agent turn has completed after all tool rounds.
+    TurnFinish,
 }
 
 /// A stream of [`AgentEvent`]s produced by an agent turn.
 pub type AgentStream<'a> =
     Pin<Box<dyn futures_util::Stream<Item = Result<AgentEvent>> + Send + 'a>>;
 
-/// Conversational agent that holds providers, tools, and runtime config.
+/// Conversational agent that holds providers, tools, and conversation state.
 pub struct Agent {
-    registry: ProviderRegistry,
-    tools: Vec<Arc<dyn ErasedTool>>,
-    runtime: RuntimeOptions,
-    max_tool_rounds: usize,
+    pub registry: ProviderRegistry,
+    pub tools: Vec<Arc<dyn ErasedTool>>,
+    pub max_tool_rounds: usize,
+    pub messages: Vec<Message>,
 }
 
 impl Agent {
@@ -49,111 +51,51 @@ impl Agent {
         Self {
             registry,
             tools: Vec::new(),
-            runtime: RuntimeOptions::default(),
             max_tool_rounds: 10,
+            messages: Vec::new(),
         }
     }
 
-    pub fn with_tools(mut self, tools: impl IntoIterator<Item = Arc<dyn ErasedTool>>) -> Self {
-        self.tools.extend(tools);
-        self
-    }
-
-    pub fn with_runtime(mut self, options: RuntimeOptions) -> Self {
-        self.runtime = options;
-        self
-    }
-
-    pub fn with_max_tool_rounds(mut self, max: usize) -> Self {
-        self.max_tool_rounds = max;
-        self
-    }
-
-    /// Run one turn against `model_id` with the given `messages`.
+    /// Run one streaming turn against `model_id` using this agent's conversation state.
     ///
-    /// Returns all events emitted during the turn, collected into a vector.
-    /// For streaming consumption, use [`Agent::run_stream`].
-    pub async fn run(&self, model_id: &str, messages: Vec<Message>) -> Result<Vec<AgentEvent>> {
-        let mut stream = self.run_stream(model_id, messages);
-        let mut events = Vec::new();
-        while let Some(event) = stream.next().await {
-            events.push(event?);
-        }
-        Ok(events)
-    }
-
-    /// Run one turn against `model_id` with the given `messages`, yielding
-    /// events as they arrive.
-    ///
-    /// Text and thinking content is streamed token-by-token. Tool calls are
-    /// yielded as complete events once the model finishes generating them.
-    /// Tool outputs are yielded after each tool executes. The final event is
-    /// always [`AgentEvent::Finished`].
-    ///
-    /// Tool calls are executed automatically and their results fed back to the
-    /// model; this repeats until the model produces a non-tool response or
-    /// `max_tool_rounds` is reached.
-    pub fn run_stream<'a>(&'a self, model_id: &'a str, messages: Vec<Message>) -> AgentStream<'a> {
+    /// Model content is streamed as [`AgentEvent::OutputDelta`] events.
+    /// Completed model outputs and tool results are yielded when they are
+    /// committed to state. The final event is always [`AgentEvent::TurnFinish`].
+    pub fn run_stream<'a>(&'a mut self, model_id: &'a str) -> AgentStream<'a> {
         Box::pin(async_stream::try_stream! {
-            let mut messages = messages;
             let chat = self.registry.chat(model_id)?;
-            let deadline = RequestDeadline::from_options(&self.runtime);
             let mut done = false;
 
             for _round in 0..self.max_tool_rounds {
-                let request = self.build_request(messages.clone());
+                let request = self.build_request(self.messages.clone());
                 let mut stream = chat.stream(request);
-                let mut state = OutputStreamState::new();
+                let mut output_state = OutputStreamState::new();
 
                 loop {
-                    let event = deadline
-                        .next_model_event(&mut stream)
-                        .await?
-                        .ok_or_else(|| {
-                            Error::protocol("stream ended before finished event")
-                        })?;
+                    let event = stream
+                        .next()
+                        .await
+                        .transpose()?
+                        .ok_or_else(|| Error::protocol("stream ended before finished event"))?;
 
-                    // Yield text / thinking deltas immediately so consumers
-                    // see output word-by-word.  We extract the event payload
-                    // before the yield so no borrows cross the suspend point.
-                    let maybe_yield = match &event {
-                        OutputStreamEvent::Delta { delta, .. } => match delta {
-                            OutputContentDelta::Text { text } => {
-                                Some(AgentEvent::Text(text.clone()))
-                            }
-                            OutputContentDelta::Thinking { text } => {
-                                Some(AgentEvent::Thinking(text.clone()))
-                            }
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-                    if let Some(e) = maybe_yield {
-                        yield e;
-                    }
-
-                    // Feed every event into the accumulator so we can
-                    // reconstruct tool calls and the final message.
                     match event {
                         OutputStreamEvent::Delta {
                             content_index,
                             delta,
                         } => {
-                            state.apply(OutputStreamEvent::Delta {
+                            yield AgentEvent::OutputDelta {
+                                delta: delta.clone(),
+                            };
+                            output_state.apply(OutputStreamEvent::Delta {
                                 content_index,
                                 delta,
                             })?;
                         }
                         OutputStreamEvent::Finished { reason, usage } => {
-                            let response = state
-                                .apply(OutputStreamEvent::Finished {
-                                    reason,
-                                    usage,
-                                })?
+                            let response = output_state
+                                .apply(OutputStreamEvent::Finished { reason, usage })?
                                 .ok_or_else(|| {
-                                    Error::protocol(
-                                        "stream ended before finished event",
-                                    )
+                                    Error::protocol("stream ended before finished event")
                                 })?;
 
                             let content = match &response.message {
@@ -169,36 +111,31 @@ impl Agent {
                             let has_tool_calls = content
                                 .iter()
                                 .any(|c| matches!(c, OutputContent::ToolCall { .. }));
-
-                            // Emit complete tool calls (accumulated during
-                            // streaming).  Tool call arguments are reassembled
-                            // from deltas by OutputStreamState.
-                            for item in &content {
-                                if let OutputContent::ToolCall {
-                                    id,
-                                    name,
-                                    arguments,
-                                } = item
-                                {
-                                    yield AgentEvent::ToolCall {
-                                        id: id.clone(),
-                                        name: name.clone(),
-                                        arguments: arguments.clone(),
-                                    };
+                            let finish_reason = response.finish_reason;
+                            let usage = response.usage.clone();
+                            let assistant_message = strip_thinking(response.message);
+                            let output_content = match &assistant_message {
+                                Message::Assistant { content } => content.clone(),
+                                other => {
+                                    Err(Error::protocol(format!(
+                                        "expected assistant message, got {other:?}"
+                                    )))?;
+                                    unreachable!()
                                 }
-                            }
+                            };
+                            self.messages.push(assistant_message);
+                            yield AgentEvent::Output {
+                                content: output_content,
+                                finish_reason,
+                                usage,
+                            };
 
                             if !has_tool_calls {
-                                yield AgentEvent::Finished {
-                                    reason: response.finish_reason,
-                                };
                                 done = true;
+                                yield AgentEvent::TurnFinish;
                                 break;
                             }
 
-                            // Execute tools and feed results back into the
-                            // conversation.
-                            messages.push(strip_thinking(response.message));
                             for item in &content {
                                 if let OutputContent::ToolCall {
                                     id,
@@ -206,39 +143,24 @@ impl Agent {
                                     arguments,
                                 } = item
                                 {
-                                    let result =
-                                        self.execute_tool(name, arguments);
-                                    let result_text = result
-                                        .content
-                                        .iter()
-                                        .filter_map(|c| {
-                                            if let InputContent::Text {
-                                                text,
-                                            } = c
-                                            {
-                                                Some(text.clone())
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join("\n");
-
-                                    yield AgentEvent::ToolOutput {
+                                    let result = self.execute_tool(name, arguments);
+                                    let tool_message = Message::Tool {
+                                        call_id: id.clone(),
                                         name: name.clone(),
-                                        result: result_text.clone(),
+                                        status: result.status.clone(),
+                                        content: result.content.clone(),
                                     };
-
-                                    messages.push(Message::Tool {
+                                    self.messages.push(tool_message);
+                                    yield AgentEvent::ToolResult {
                                         call_id: id.clone(),
                                         name: name.clone(),
                                         status: result.status,
                                         content: result.content,
-                                    });
+                                    };
                                 }
                             }
 
-                            break; // continue to next tool round
+                            break;
                         }
                     }
                 }
@@ -308,4 +230,110 @@ fn strip_thinking(message: Message) -> Message {
 struct ToolExecutionResult {
     status: ToolResultStatus,
     content: Vec<InputContent>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use copro_core::model::ModelDefinition;
+    use copro_core::provider::{Chat, Provider};
+    use copro_core::stream::ModelStream;
+    use futures_util::StreamExt;
+
+    #[tokio::test]
+    async fn run_stream_commits_assistant_message() {
+        let mut registry = ProviderRegistry::new();
+        registry.register_provider(TestProvider {
+            events: vec![
+                OutputStreamEvent::Delta {
+                    content_index: 0,
+                    delta: OutputContentDelta::Text {
+                        text: "Hello".to_string(),
+                    },
+                },
+                OutputStreamEvent::Finished {
+                    reason: FinishReason::Stop,
+                    usage: None,
+                },
+            ],
+        });
+        registry.register_model(ModelDefinition::new("test", "test-model"));
+        let mut agent = Agent::new(registry);
+        agent.messages = vec![Message::User {
+            content: vec![InputContent::Text {
+                text: "hi".to_string(),
+            }],
+        }];
+
+        let events = agent
+            .run_stream("test-model")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        let assistant = Message::Assistant {
+            content: vec![OutputContent::Text {
+                text: "Hello".to_string(),
+            }],
+        };
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::OutputDelta {
+                    delta: OutputContentDelta::Text {
+                        text: "Hello".to_string(),
+                    },
+                },
+                AgentEvent::Output {
+                    content: vec![OutputContent::Text {
+                        text: "Hello".to_string(),
+                    }],
+                    finish_reason: FinishReason::Stop,
+                    usage: None,
+                },
+                AgentEvent::TurnFinish,
+            ]
+        );
+        assert_eq!(
+            agent.messages,
+            vec![
+                Message::User {
+                    content: vec![InputContent::Text {
+                        text: "hi".to_string(),
+                    }],
+                },
+                assistant,
+            ]
+        );
+    }
+
+    struct TestProvider {
+        events: Vec<OutputStreamEvent>,
+    }
+
+    impl Provider for TestProvider {
+        fn id(&self) -> &str {
+            "test"
+        }
+
+        fn chat(&self, _id: &str, _config: Value) -> Result<Arc<dyn Chat>> {
+            Ok(Arc::new(TestChat {
+                events: self.events.clone(),
+            }))
+        }
+    }
+
+    struct TestChat {
+        events: Vec<OutputStreamEvent>,
+    }
+
+    impl Chat for TestChat {
+        fn stream(&self, _request: GenerateRequest) -> ModelStream<'_> {
+            Box::pin(futures_util::stream::iter(
+                self.events.clone().into_iter().map(Ok),
+            ))
+        }
+    }
 }

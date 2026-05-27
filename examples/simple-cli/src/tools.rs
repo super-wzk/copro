@@ -25,7 +25,7 @@ impl Tool for Calculator {
         "Evaluate a simple arithmetic expression. Supports +, -, *, /, and parentheses."
     }
 
-    fn call(&self, input: Self::Input) -> std::result::Result<Self::Output, String> {
+    fn call(&self, input: Self::Input) -> Result<Self::Output, String> {
         evaluate_expression(&input.expression).map_err(|e| e.to_string())
     }
 }
