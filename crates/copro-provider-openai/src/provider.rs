@@ -46,7 +46,8 @@ pub fn gpt_5_5() -> Result<ModelDefinition> {
                 .with_feature(ModelFeature::NativeStreaming)
                 .with_feature(ModelFeature::Tools)
                 .with_feature(ModelFeature::ToolChoice)
-                .with_feature(ModelFeature::Thinking),
+                .with_feature(ModelFeature::Thinking)
+                .with_feature(ModelFeature::DeveloperRole),
         )
         .with_config(OpenAiResponsesModelConfig::default())
 }
@@ -61,7 +62,8 @@ pub fn gpt_5_4() -> Result<ModelDefinition> {
                 .with_feature(ModelFeature::NativeStreaming)
                 .with_feature(ModelFeature::Tools)
                 .with_feature(ModelFeature::ToolChoice)
-                .with_feature(ModelFeature::Thinking),
+                .with_feature(ModelFeature::Thinking)
+                .with_feature(ModelFeature::DeveloperRole),
         )
         .with_config(OpenAiResponsesModelConfig::default())
 }

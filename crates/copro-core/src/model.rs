@@ -16,6 +16,7 @@ pub enum ModelFeature {
     ToolChoice,
     Thinking,
     JsonSchema,
+    DeveloperRole,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
