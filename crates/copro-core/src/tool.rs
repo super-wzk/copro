@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
+    /// tool parameters schema
     pub parameters: Value,
 }
 

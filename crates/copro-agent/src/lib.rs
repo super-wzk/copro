@@ -44,7 +44,7 @@ pub trait AgentHook: Send + Sync {
         Ok(())
     }
 
-    fn before_tool_call(&self, _call: &mut ToolCallContext) -> Result<ToolDecision> {
+    fn before_tool_execute(&self, _tool: &mut ToolExecuteContext) -> Result<ToolDecision> {
         Ok(ToolDecision::Allow)
     }
 
@@ -52,21 +52,21 @@ pub trait AgentHook: Send + Sync {
         Ok(())
     }
 
-    fn before_commit(&self, _message: &mut Message) -> Result<()> {
+    fn on_output_finished(&self, _message: &mut Message) -> Result<()> {
         Ok(())
     }
 }
 
-/// Decision returned by [`AgentHook::before_tool_call`].
+/// Decision returned by [`AgentHook::before_tool_execute`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolDecision {
     Allow,
     Reject { reason: String },
 }
 
-/// Tool call context passed to [`AgentHook::before_tool_call`].
+/// Tool execution context passed to [`AgentHook::before_tool_execute`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolCallContext {
+pub struct ToolExecuteContext {
     pub call_id: String,
     pub name: String,
     pub arguments: Map<String, Value>,
@@ -146,13 +146,13 @@ impl Agent {
 
                             let finish_reason = response.finish_reason;
                             let usage = response.usage.clone();
-                            let mut assistant_message = strip_thinking(response.message);
-                            self.apply_before_commit(&mut assistant_message)?;
+                            let mut assistant_message = response.message;
+                            self.apply_on_output_finished(&mut assistant_message)?;
                             let output_content = assistant_content(&assistant_message)?;
                             let has_tool_calls = output_content
                                 .iter()
                                 .any(|c| matches!(c, OutputContent::ToolCall { .. }));
-                            self.messages.push(assistant_message);
+                            self.messages.push(normalize_for_history(assistant_message));
                             yield AgentEvent::Output {
                                 content: output_content.clone(),
                                 finish_reason,
@@ -172,14 +172,14 @@ impl Agent {
                                     arguments,
                                 } = item
                                 {
-                                    let mut call = ToolCallContext {
+                                    let mut tool = ToolExecuteContext {
                                         call_id: id.clone(),
                                         name: name.clone(),
                                         arguments: arguments.clone(),
                                     };
-                                    let result = match self.apply_before_tool_call(&mut call)? {
+                                    let result = match self.apply_before_tool_execute(&mut tool)? {
                                         ToolDecision::Allow => {
-                                            self.execute_tool(&call.name, &call.arguments)
+                                            self.execute_tool(&tool.name, &tool.arguments)
                                         }
                                         ToolDecision::Reject { reason } => ToolExecutionResult {
                                             status: ToolResultStatus::Error,
@@ -187,19 +187,18 @@ impl Agent {
                                         },
                                     };
                                     let mut result = ToolResultContext {
-                                        call_id: call.call_id,
-                                        name: call.name,
+                                        call_id: tool.call_id,
+                                        name: tool.name,
                                         status: result.status,
                                         content: result.content,
                                     };
                                     self.apply_after_tool_result(&mut result)?;
-                                    let mut tool_message = Message::Tool {
+                                    let tool_message = Message::Tool {
                                         call_id: result.call_id.clone(),
                                         name: result.name.clone(),
                                         status: result.status.clone(),
                                         content: result.content.clone(),
                                     };
-                                    self.apply_before_commit(&mut tool_message)?;
                                     let event = tool_result_event(&tool_message)?;
                                     self.messages.push(tool_message);
                                     yield event;
@@ -242,9 +241,9 @@ impl Agent {
         Ok(())
     }
 
-    fn apply_before_tool_call(&self, call: &mut ToolCallContext) -> Result<ToolDecision> {
+    fn apply_before_tool_execute(&self, tool: &mut ToolExecuteContext) -> Result<ToolDecision> {
         for hook in &self.hooks {
-            match hook.before_tool_call(call)? {
+            match hook.before_tool_execute(tool)? {
                 ToolDecision::Allow => {}
                 decision => return Ok(decision),
             }
@@ -259,9 +258,9 @@ impl Agent {
         Ok(())
     }
 
-    fn apply_before_commit(&self, message: &mut Message) -> Result<()> {
+    fn apply_on_output_finished(&self, message: &mut Message) -> Result<()> {
         for hook in &self.hooks {
-            hook.before_commit(message)?;
+            hook.on_output_finished(message)?;
         }
         Ok(())
     }
@@ -320,12 +319,17 @@ fn tool_result_event(message: &Message) -> Result<AgentEvent> {
     }
 }
 
-fn strip_thinking(message: Message) -> Message {
+fn normalize_for_history(message: Message) -> Message {
     match message {
         Message::Assistant { content } => Message::Assistant {
             content: content
                 .into_iter()
-                .filter(|c| !matches!(c, OutputContent::Thinking { .. }))
+                .filter(|c| {
+                    !matches!(
+                        c,
+                        OutputContent::Thinking { .. } | OutputContent::Image { .. }
+                    )
+                })
                 .collect(),
         },
         other => other,
@@ -340,6 +344,7 @@ struct ToolExecutionResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use copro_core::message::ImageContent;
     use copro_core::model::ModelDefinition;
     use copro_core::provider::{Chat, Provider};
     use copro_core::stream::ModelStream;
@@ -415,7 +420,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn before_commit_hook_can_modify_output() {
+    async fn image_output_is_excluded_from_history() {
+        let mut registry = ProviderRegistry::new();
+        let image = ImageContent::Url {
+            url: "data:image/png;base64,abc".to_string(),
+        };
+        registry.register_provider(TestProvider {
+            events: vec![
+                OutputStreamEvent::Delta {
+                    content_index: 0,
+                    delta: OutputContentDelta::Image {
+                        image: image.clone(),
+                    },
+                },
+                OutputStreamEvent::Finished {
+                    reason: FinishReason::Stop,
+                    usage: None,
+                },
+            ],
+        });
+        registry.register_model(ModelDefinition::new("test", "test-model"));
+        let mut agent = Agent::new(registry);
+
+        let events = agent
+            .run_stream("test-model")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::OutputDelta {
+                    delta: OutputContentDelta::Image {
+                        image: image.clone(),
+                    },
+                },
+                AgentEvent::Output {
+                    content: vec![OutputContent::Image { image }],
+                    finish_reason: FinishReason::Stop,
+                    usage: None,
+                },
+                AgentEvent::TurnFinish,
+            ]
+        );
+        assert_eq!(agent.messages, vec![Message::Assistant { content: vec![] }]);
+    }
+
+    #[tokio::test]
+    async fn on_output_finished_hook_can_modify_output() {
         let mut registry = ProviderRegistry::new();
         registry.register_provider(TestProvider {
             events: vec![
@@ -471,7 +526,7 @@ mod tests {
     struct RedactHook;
 
     impl AgentHook for RedactHook {
-        fn before_commit(&self, message: &mut Message) -> Result<()> {
+        fn on_output_finished(&self, message: &mut Message) -> Result<()> {
             if let Message::Assistant { content } = message {
                 *content = vec![OutputContent::Text {
                     text: "redacted".to_string(),
