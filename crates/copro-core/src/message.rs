@@ -1,14 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Role {
-    System,
-    Developer,
-    User,
-    Assistant,
-    Tool,
-}
+use serde_json::{Map, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ToolResultStatus {
@@ -18,8 +9,16 @@ pub enum ToolResultStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum InputContent {
-    Text { text: String },
-    Image { mime_type: String, data: Vec<u8> },
+    Text(String),
+    Image(ImageContent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub call_id: String,
+    pub name: String,
+    pub status: ToolResultStatus,
+    pub content: Vec<InputContent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -29,41 +28,25 @@ pub enum ImageContent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OutputContent {
-    Text {
-        text: String,
-    },
-    Thinking {
-        text: String,
-    },
-    Image {
-        image: ImageContent,
-    },
-    ToolCall {
-        id: String,
-        name: String,
-        arguments: serde_json::Map<String, Value>,
-    },
+    Text(String),
+    Thinking(String),
+    Image(ImageContent),
+    ToolCall(ToolCall),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Message {
-    System {
-        content: Vec<InputContent>,
-    },
-    Developer {
-        content: Vec<InputContent>,
-    },
-    User {
-        content: Vec<InputContent>,
-    },
-    Assistant {
-        content: Vec<OutputContent>,
-    },
-    Tool {
-        call_id: String,
-        name: String,
-        status: ToolResultStatus,
-        content: Vec<InputContent>,
-    },
+    System(Vec<InputContent>),
+    Developer(Vec<InputContent>),
+    User(Vec<InputContent>),
+    Assistant(Vec<OutputContent>),
+    Tool(ToolResult),
 }

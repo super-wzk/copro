@@ -8,4 +8,4 @@ pub use config::{
     OpenAiImageGenerationTool, OpenAiResponsesModelConfig, OpenAiResponsesProviderConfig,
     OpenAiResponsesRequestOptions,
 };
-pub use provider::{OpenAiResponsesChat, OpenAiResponsesProvider, gpt_5_4, gpt_5_5};
+pub use provider::{OpenAiResponsesModel, OpenAiResponsesProvider};

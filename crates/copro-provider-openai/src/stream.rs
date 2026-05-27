@@ -115,7 +115,7 @@ impl OpenAiEventMapper {
 
         Ok(vec![self.delta(
             StreamKey::text(output_index, content_index),
-            OutputContentDelta::Text { text },
+            OutputContentDelta::Text(text),
         )])
     }
 
@@ -131,7 +131,7 @@ impl OpenAiEventMapper {
 
         Ok(vec![self.delta(
             StreamKey::thinking(output_index, summary_index),
-            OutputContentDelta::Thinking { text },
+            OutputContentDelta::Thinking(text),
         )])
     }
 
@@ -144,7 +144,7 @@ impl OpenAiEventMapper {
 
         Ok(vec![self.delta(
             StreamKey::thinking(output_index, content_index),
-            OutputContentDelta::Thinking { text },
+            OutputContentDelta::Thinking(text),
         )])
     }
 
@@ -222,9 +222,7 @@ impl OpenAiEventMapper {
 
         Ok(vec![self.delta(
             StreamKey::image(output_index),
-            OutputContentDelta::Image {
-                image: decode_openai_image_base64(&image_base64)?,
-            },
+            OutputContentDelta::Image(decode_openai_image_base64(&image_base64)?),
         )])
     }
 
@@ -237,7 +235,7 @@ impl OpenAiEventMapper {
         if done && let Some(image) = image_from_item(item)? {
             return Ok(vec![self.delta(
                 StreamKey::image(output_index),
-                OutputContentDelta::Image { image },
+                OutputContentDelta::Image(image),
             )]);
         }
 
@@ -463,7 +461,6 @@ fn tool_call_from_item(item: &Value) -> Option<ToolCallDelta> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
     use copro_core::stream::OutputStreamEvent;
     use serde_json::json;
 
@@ -486,12 +483,10 @@ mod tests {
             events,
             vec![OutputStreamEvent::Delta {
                 content_index: 0,
-                delta: OutputContentDelta::Image {
-                    image: ImageContent::Data {
-                        mime_type: "image/png".to_string(),
-                        data: vec![1, 2, 3],
-                    },
-                },
+                delta: OutputContentDelta::Image(ImageContent::Data {
+                    mime_type: "image/png".to_string(),
+                    data: vec![1, 2, 3],
+                }),
             }]
         );
     }

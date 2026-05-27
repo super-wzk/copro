@@ -1,12 +1,23 @@
-use crate::error::{Error, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
-use std::future::Future;
-use std::pin::Pin;
 
-pub type ModelFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum ConfigError {
+    #[error("config error: {message}")]
+    Client { message: String },
+}
+
+impl ConfigError {
+    pub fn client(message: impl Into<String>) -> Self {
+        Self::Client {
+            message: message.into(),
+        }
+    }
+}
+
+pub type Result<T> = std::result::Result<T, ConfigError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -60,8 +71,9 @@ impl ModelCapabilities {
     where
         T: DeserializeOwned,
     {
-        serde_json::from_value(Value::Object(self.extra.clone()))
-            .map_err(|error| Error::client(format!("invalid model capabilities extra: {error}")))
+        serde_json::from_value(Value::Object(self.extra.clone())).map_err(|error| {
+            ConfigError::client(format!("invalid model capabilities extra: {error}"))
+        })
     }
 
     pub fn insert_extra<T>(&mut self, extra: T) -> Result<()>
@@ -69,12 +81,12 @@ impl ModelCapabilities {
         T: Serialize,
     {
         let value = serde_json::to_value(extra).map_err(|error| {
-            Error::client(format!(
+            ConfigError::client(format!(
                 "failed to serialize model capabilities extra: {error}"
             ))
         })?;
         let Value::Object(extra) = value else {
-            return Err(Error::client(
+            return Err(ConfigError::client(
                 "model capabilities extra must serialize to a JSON object",
             ));
         };
@@ -103,13 +115,10 @@ pub struct ModelInfo {
     pub capabilities: ModelCapabilities,
 }
 
-/// A locally configured model entry bound to a provider instance.
+/// A locally configured model entry.
 ///
-/// `provider_id` points at a registered provider in `ProviderRegistry`., while
-/// `id` is the model identifier used both by the registry and by that provider
-/// (for example `gpt-5.5` for OpenAI). This keeps model discovery and model
-/// configuration out of provider implementations: providers only know how to
-/// construct a chat model for an explicit id and provider-specific config.
+/// This crate is currently only configuration metadata; runtime construction of
+/// models is handled directly by provider-specific crates.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelDefinition {
@@ -146,7 +155,7 @@ impl ModelDefinition {
         T: DeserializeOwned,
     {
         serde_json::from_value(self.config.clone())
-            .map_err(|error| Error::client(format!("invalid model config: {error}")))
+            .map_err(|error| ConfigError::client(format!("invalid model config: {error}")))
     }
 
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
@@ -163,8 +172,9 @@ impl ModelDefinition {
     where
         T: Serialize,
     {
-        self.config = serde_json::to_value(config)
-            .map_err(|error| Error::client(format!("failed to serialize model config: {error}")))?;
+        self.config = serde_json::to_value(config).map_err(|error| {
+            ConfigError::client(format!("failed to serialize model config: {error}"))
+        })?;
         Ok(self)
     }
 }
@@ -220,7 +230,7 @@ mod tests {
 
         let error = capabilities.extra::<TestExtra>().unwrap_err();
 
-        assert!(matches!(error, Error::Client { .. }));
+        assert!(matches!(error, ConfigError::Client { .. }));
     }
 
     #[test]
@@ -229,6 +239,29 @@ mod tests {
 
         let error = capabilities.insert_extra(42).unwrap_err();
 
-        assert!(matches!(error, Error::Client { .. }));
+        assert!(matches!(error, ConfigError::Client { .. }));
+    }
+
+    #[test]
+    fn model_definition_config_round_trips() {
+        let model = ModelDefinition::new("openai", "gpt")
+            .with_name("GPT")
+            .with_capabilities(
+                ModelCapabilities::default()
+                    .with_input_modality(InputModality::Text)
+                    .with_feature(ModelFeature::NativeStreaming),
+            )
+            .with_config(TestExtra {
+                value: Some("configured".to_string()),
+            })
+            .unwrap();
+
+        assert_eq!(model.info().name.as_deref(), Some("GPT"));
+        assert_eq!(
+            model.config::<TestExtra>().unwrap(),
+            TestExtra {
+                value: Some("configured".to_string()),
+            }
+        );
     }
 }

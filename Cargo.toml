@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/copro-agent",
+  "crates/copro-config",
   "crates/copro-core",
   "crates/copro-derive",
   "crates/copro-provider-openai",
@@ -14,6 +15,7 @@ edition = "2024"
 
 [workspace.dependencies]
 copro-agent = { path = "crates/copro-agent" }
+copro-config = { path = "crates/copro-config" }
 copro-core = { path = "crates/copro-core" }
 copro-derive = { path = "crates/copro-derive" }
 copro-provider-openai = { path = "crates/copro-provider-openai" }

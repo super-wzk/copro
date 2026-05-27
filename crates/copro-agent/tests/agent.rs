@@ -1,10 +1,9 @@
 use copro_agent::{Agent, AgentEvent, AgentHook, async_trait};
 use copro_core::error::Result;
-use copro_core::message::{InputContent, Message, OutputContent, ToolResultStatus};
-use copro_core::provider::Chat;
+use copro_core::message::{InputContent, Message, OutputContent, ToolResult, ToolResultStatus};
 use copro_core::request::GenerateRequest;
 use copro_core::response::FinishReason;
-use copro_core::stream::{ModelStream, OutputContentDelta, OutputStreamEvent};
+use copro_core::stream::{Model, ModelStream, OutputContentDelta, OutputStreamEvent};
 use copro_core::tool::ErasedTool;
 use futures_util::StreamExt;
 use serde_json::Value;
@@ -25,11 +24,7 @@ async fn run_stream_commits_assistant_message() {
             usage: None,
         },
     ]);
-    agent.messages = vec![Message::User {
-        content: vec![InputContent::Text {
-            text: "hi".to_string(),
-        }],
-    }];
+    agent.messages = vec![Message::User(vec![InputContent::Text("hi".to_string())])];
 
     let events = agent
         .run_stream()
@@ -39,37 +34,24 @@ async fn run_stream_commits_assistant_message() {
         .collect::<Result<Vec<_>>>()
         .unwrap();
 
-    let assistant = Message::Assistant {
-        content: vec![OutputContent::Text {
-            text: "Hello".to_string(),
-        }],
-    };
+    let assistant = Message::Assistant(vec![OutputContent::Text("Hello".to_string())]);
     assert_eq!(
         events,
         vec![
-            AgentEvent::OutputDelta {
-                delta: OutputContentDelta::Text {
-                    text: "Hello".to_string(),
-                },
-            },
-            AgentEvent::Output {
-                content: vec![OutputContent::Text {
-                    text: "Hello".to_string(),
-                }],
-                finish_reason: FinishReason::Stop,
+            AgentEvent::OutputDelta(OutputContentDelta::Text {
+                text: "Hello".to_string(),
+            }),
+            AgentEvent::OutputFinished {
+                content: vec![OutputContent::Text("Hello".to_string())],
+                reason: FinishReason::Stop,
                 usage: None,
             },
-            AgentEvent::TurnFinish,
         ]
     );
     assert_eq!(
         agent.messages,
         vec![
-            Message::User {
-                content: vec![InputContent::Text {
-                    text: "hi".to_string(),
-                }],
-            },
+            Message::User(vec![InputContent::Text("hi".to_string())]),
             assistant,
         ]
     );
@@ -99,34 +81,26 @@ async fn on_output_finished_hook_can_modify_output() {
         .collect::<Result<Vec<_>>>()
         .unwrap();
 
-    let redacted = vec![OutputContent::Text {
-        text: "redacted".to_string(),
-    }];
+    let redacted = vec![OutputContent::Text("redacted".to_string())];
     assert_eq!(
         events,
         vec![
-            AgentEvent::OutputDelta {
-                delta: OutputContentDelta::Text {
-                    text: "secret".to_string(),
-                },
-            },
-            AgentEvent::Output {
+            AgentEvent::OutputDelta(OutputContentDelta::Text {
+                text: "secret".to_string(),
+            }),
+            AgentEvent::OutputFinished {
                 content: redacted.clone(),
-                finish_reason: FinishReason::Stop,
+                reason: FinishReason::Stop,
                 usage: None,
             },
-            AgentEvent::TurnFinish,
         ]
     );
-    assert_eq!(
-        agent.messages,
-        vec![Message::Assistant { content: redacted }]
-    );
+    assert_eq!(agent.messages, vec![Message::Assistant(redacted)]);
 }
 
 #[tokio::test]
 async fn run_stream_awaits_async_erased_tool() {
-    let mut agent = Agent::new(Arc::new(ToolThenDoneChat {
+    let mut agent = Agent::new(Arc::new(ToolThenDoneModel {
         calls: AtomicUsize::new(0),
     }));
     agent.tools.push(Arc::new(AsyncDoubleTool));
@@ -141,19 +115,26 @@ async fn run_stream_awaits_async_erased_tool() {
 
     assert!(events.iter().any(|event| matches!(
         event,
-        AgentEvent::ToolResult {
+        AgentEvent::ToolResult(ToolResult {
             name,
             status: ToolResultStatus::Success,
             content,
             ..
-        } if name == "double"
-            && content == &vec![InputContent::Text { text: "42".to_string() }]
+        }) if name == "double"
+            && content == &vec![InputContent::Text("42".to_string())]
     )));
-    assert!(matches!(events.last(), Some(AgentEvent::TurnFinish)));
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::OutputFinished {
+            content,
+            reason: FinishReason::Stop,
+            usage: None,
+        }) if content == &vec![OutputContent::Text("done".to_string())]
+    ));
 }
 
 fn test_agent(events: Vec<OutputStreamEvent>) -> Agent {
-    Agent::new(Arc::new(TestChat { events }))
+    Agent::new(Arc::new(TestModel { events }))
 }
 
 struct RedactHook;
@@ -161,10 +142,8 @@ struct RedactHook;
 #[async_trait]
 impl AgentHook for RedactHook {
     async fn on_output_finished(&self, message: &mut Message) -> Result<()> {
-        if let Message::Assistant { content } = message {
-            *content = vec![OutputContent::Text {
-                text: "redacted".to_string(),
-            }];
+        if let Message::Assistant(content) = message {
+            *content = vec![OutputContent::Text("redacted".to_string())];
         }
         Ok(())
     }
@@ -196,11 +175,11 @@ impl ErasedTool for AsyncDoubleTool {
     }
 }
 
-struct ToolThenDoneChat {
+struct ToolThenDoneModel {
     calls: AtomicUsize,
 }
 
-impl Chat for ToolThenDoneChat {
+impl Model for ToolThenDoneModel {
     fn stream(&self, _request: GenerateRequest) -> ModelStream<'_> {
         let events = match self.calls.fetch_add(1, Ordering::SeqCst) {
             0 => vec![
@@ -234,11 +213,11 @@ impl Chat for ToolThenDoneChat {
     }
 }
 
-struct TestChat {
+struct TestModel {
     events: Vec<OutputStreamEvent>,
 }
 
-impl Chat for TestChat {
+impl Model for TestModel {
     fn stream(&self, _request: GenerateRequest) -> ModelStream<'_> {
         Box::pin(futures_util::stream::iter(
             self.events.clone().into_iter().map(Ok),

@@ -1,18 +1,19 @@
 use crate::event::{AgentEvent, AgentStream};
-use crate::hook::{AgentHook, ToolDecision, ToolExecuteContext, ToolResultContext};
+use crate::hook::{AgentHook, ToolDecision};
 use copro_core::error::{Error, Result};
-use copro_core::message::{InputContent, Message, OutputContent, ToolResultStatus};
-use copro_core::provider::{Chat, ProviderRegistry};
+use copro_core::message::{
+    InputContent, Message, OutputContent, ToolCall, ToolResult, ToolResultStatus,
+};
 use copro_core::request::{GenerateRequest, GenerateRequestOptions};
-use copro_core::stream::{OutputStreamEvent, OutputStreamState};
+use copro_core::stream::{Model, ModelStream, OutputStreamEvent, OutputStreamState};
 use copro_core::tool::{ErasedTool, ToolDefinition};
 use futures_util::StreamExt;
 use serde_json::{Map, Value};
 use std::sync::Arc;
 
-/// Conversational agent bound to one chat model with tools, hooks, and conversation state.
+/// Conversational agent bound to one model with tools, hooks, and conversation state.
 pub struct Agent {
-    pub chat: Arc<dyn Chat>,
+    pub model: Arc<dyn Model>,
     pub tools: Vec<Arc<dyn ErasedTool>>,
     pub hooks: Vec<Arc<dyn AgentHook>>,
     pub max_tool_rounds: usize,
@@ -20,9 +21,9 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(chat: Arc<dyn Chat>) -> Self {
+    pub fn new(model: Arc<dyn Model>) -> Self {
         Self {
-            chat,
+            model,
             tools: Vec::new(),
             hooks: Vec::new(),
             max_tool_rounds: 10,
@@ -30,127 +31,116 @@ impl Agent {
         }
     }
 
-    /// Convenience constructor that resolves a chat model from a registry.
-    pub fn from_registry(registry: &ProviderRegistry, model_id: &str) -> Result<Self> {
-        Ok(Self::new(registry.chat(model_id)?))
-    }
-
-    /// Run one streaming turn using this agent's bound chat model and conversation state.
+    /// Run one streaming turn using this agent's bound model and conversation state.
     ///
     /// Model content is streamed as [`AgentEvent::OutputDelta`] events.
     /// Completed model outputs and tool results are yielded when they are
-    /// committed to state. The final event is always [`AgentEvent::TurnFinish`].
+    /// committed to state. Stream completion marks the end of the turn.
     pub fn run_stream(&mut self) -> AgentStream<'_> {
         Box::pin(async_stream::try_stream! {
-            let chat = Arc::clone(&self.chat);
-            let mut done = false;
+            let model = Arc::clone(&self.model);
+            let mut state = TurnState::ModelRequest;
+            let mut model_rounds = 0usize;
 
-            for _round in 0..self.max_tool_rounds {
-                let mut request = self.build_request(self.messages.clone());
-                self.apply_before_request(&mut request).await?;
-                let mut stream = chat.stream(request);
-                let mut output_state = OutputStreamState::new();
-
-                loop {
-                    let event = stream
-                        .next()
-                        .await
-                        .transpose()?
-                        .ok_or_else(|| Error::protocol("stream ended before finished event"))?;
-
-                    match event {
-                        OutputStreamEvent::Delta {
-                            content_index,
-                            delta,
-                        } => {
-                            yield AgentEvent::OutputDelta {
-                                delta: delta.clone(),
-                            };
-                            output_state.apply(OutputStreamEvent::Delta {
-                                content_index,
-                                delta,
-                            })?;
+            loop {
+                state = match state {
+                    TurnState::ModelRequest => {
+                        if model_rounds >= self.max_tool_rounds {
+                            Err(Error::client("max tool rounds exceeded"))?;
                         }
-                        OutputStreamEvent::Finished { reason, usage } => {
-                            let response = output_state
-                                .apply(OutputStreamEvent::Finished { reason, usage })?
-                                .ok_or_else(|| {
-                                    Error::protocol("stream ended before finished event")
-                                })?;
+                        model_rounds += 1;
 
-                            let finish_reason = response.finish_reason;
-                            let usage = response.usage.clone();
-                            let mut assistant_message = response.message;
-                            self.apply_on_output_finished(&mut assistant_message).await?;
-                            let output_content = assistant_content(&assistant_message)?;
-                            let has_tool_calls = output_content
-                                .iter()
-                                .any(|c| matches!(c, OutputContent::ToolCall { .. }));
-                            self.messages.push(normalize_for_history(assistant_message));
-                            yield AgentEvent::Output {
-                                content: output_content.clone(),
-                                finish_reason,
-                                usage,
-                            };
-
-                            if !has_tool_calls {
-                                done = true;
-                                yield AgentEvent::TurnFinish;
-                                break;
-                            }
-
-                            for item in &output_content {
-                                if let OutputContent::ToolCall {
-                                    id,
-                                    name,
-                                    arguments,
-                                } = item
-                                {
-                                    let mut tool = ToolExecuteContext {
-                                        call_id: id.clone(),
-                                        name: name.clone(),
-                                        arguments: arguments.clone(),
-                                    };
-                                    let result = match self.apply_before_tool_execute(&mut tool).await? {
-                                        ToolDecision::Allow => {
-                                            self.execute_tool(&tool.name, &tool.arguments).await
-                                        }
-                                        ToolDecision::Reject { reason } => ToolExecutionResult {
-                                            status: ToolResultStatus::Error,
-                                            content: vec![InputContent::Text { text: reason }],
-                                        },
-                                    };
-                                    let mut result = ToolResultContext {
-                                        call_id: tool.call_id,
-                                        name: tool.name,
-                                        status: result.status,
-                                        content: result.content,
-                                    };
-                                    self.apply_after_tool_result(&mut result).await?;
-                                    let tool_message = Message::Tool {
-                                        call_id: result.call_id.clone(),
-                                        name: result.name.clone(),
-                                        status: result.status.clone(),
-                                        content: result.content.clone(),
-                                    };
-                                    let event = tool_result_event(&tool_message)?;
-                                    self.messages.push(tool_message);
-                                    yield event;
-                                }
-                            }
-
-                            break;
+                        let mut request = self.build_request(self.messages.clone());
+                        self.apply_before_request(&mut request).await?;
+                        TurnState::ModelStreaming {
+                            stream: model.stream(request),
+                            output_state: OutputStreamState::new(),
                         }
                     }
-                }
+                    TurnState::ModelStreaming {
+                        mut stream,
+                        mut output_state,
+                    } => {
+                        let event = stream
+                            .next()
+                            .await
+                            .transpose()?
+                            .ok_or_else(|| Error::protocol("stream ended before finished event"))?;
 
-                if done {
-                    break;
-                }
-            }
+                        match event {
+                            OutputStreamEvent::Delta {
+                                content_index,
+                                delta,
+                            } => {
+                                yield AgentEvent::OutputDelta(delta.clone());
+                                output_state.apply(OutputStreamEvent::Delta {
+                                    content_index,
+                                    delta,
+                                })?;
+                                TurnState::ModelStreaming {
+                                    stream,
+                                    output_state,
+                                }
+                            }
+                            OutputStreamEvent::Finished { reason, usage } => {
+                                let response = output_state
+                                    .apply(OutputStreamEvent::Finished { reason, usage })?
+                                    .ok_or_else(|| {
+                                        Error::protocol("stream ended before finished event")
+                                    })?;
 
-            if !done {
-                Err(Error::client("max tool rounds exceeded"))?;
+                                let _finish_reason = response.finish_reason;
+                                let usage = response.usage.clone();
+                                let mut assistant_message = response.message;
+                                self.apply_on_output_finished(&mut assistant_message).await?;
+                                let output_content = assistant_content(&assistant_message)?;
+                                self.messages.push(normalize_for_history(assistant_message));
+                                yield AgentEvent::OutputFinished {
+                                    content: output_content.clone(),
+                                    reason,
+                                    usage,
+                                };
+
+                                if output_content
+                                    .iter()
+                                    .any(|content| matches!(content, OutputContent::ToolCall(_)))
+                                {
+                                    TurnState::ToolExecution { output_content }
+                                } else {
+                                    TurnState::Finished
+                                }
+                            }
+                        }
+                    }
+                    TurnState::ToolExecution { output_content } => {
+                        for item in output_content {
+                            let OutputContent::ToolCall(mut tool) = item else {
+                                continue;
+                            };
+                            let result = match self.apply_before_tool_execute(&mut tool).await? {
+                                ToolDecision::Allow => {
+                                    self.execute_tool(&tool.name, &tool.arguments).await
+                                }
+                                ToolDecision::Reject { reason } => ToolExecutionResult {
+                                    status: ToolResultStatus::Error,
+                                    content: vec![InputContent::Text(reason)],
+                                },
+                            };
+                            let mut result = ToolResult {
+                                call_id: tool.id,
+                                name: tool.name,
+                                status: result.status,
+                                content: result.content,
+                            };
+                            self.apply_after_tool_result(&mut result).await?;
+                            self.messages.push(Message::Tool(result.clone()));
+                            yield AgentEvent::ToolResult(result);
+                        }
+
+                        TurnState::ModelRequest
+                    }
+                    TurnState::Finished => break,
+                };
             }
         })
     }
@@ -175,10 +165,7 @@ impl Agent {
         Ok(())
     }
 
-    async fn apply_before_tool_execute(
-        &self,
-        tool: &mut ToolExecuteContext,
-    ) -> Result<ToolDecision> {
+    async fn apply_before_tool_execute(&self, tool: &mut ToolCall) -> Result<ToolDecision> {
         for hook in &self.hooks {
             match hook.before_tool_execute(tool).await? {
                 ToolDecision::Allow => {}
@@ -188,7 +175,7 @@ impl Agent {
         Ok(ToolDecision::Allow)
     }
 
-    async fn apply_after_tool_result(&self, result: &mut ToolResultContext) -> Result<()> {
+    async fn apply_after_tool_result(&self, result: &mut ToolResult) -> Result<()> {
         for hook in &self.hooks {
             hook.after_tool_result(result).await?;
         }
@@ -210,9 +197,7 @@ impl Agent {
         let Some(tool) = self.tools.iter().find(|t| t.name() == name) else {
             return ToolExecutionResult {
                 status: ToolResultStatus::Error,
-                content: vec![InputContent::Text {
-                    text: format!("unknown tool: {name}"),
-                }],
+                content: vec![InputContent::Text(format!("unknown tool: {name}"))],
             };
         };
 
@@ -221,12 +206,12 @@ impl Agent {
                 let text = serde_json::to_string(&output).unwrap_or_else(|_| format!("{output:?}"));
                 ToolExecutionResult {
                     status: ToolResultStatus::Success,
-                    content: vec![InputContent::Text { text }],
+                    content: vec![InputContent::Text(text)],
                 }
             }
             Err(error) => ToolExecutionResult {
                 status: ToolResultStatus::Error,
-                content: vec![InputContent::Text { text: error }],
+                content: vec![InputContent::Text(error)],
             },
         }
     }
@@ -234,47 +219,35 @@ impl Agent {
 
 fn assistant_content(message: &Message) -> Result<Vec<OutputContent>> {
     match message {
-        Message::Assistant { content } => Ok(content.clone()),
+        Message::Assistant(content) => Ok(content.clone()),
         other => Err(Error::protocol(format!(
             "expected assistant message, got {other:?}"
         ))),
     }
 }
 
-fn tool_result_event(message: &Message) -> Result<AgentEvent> {
+fn normalize_for_history(message: Message) -> Message {
     match message {
-        Message::Tool {
-            call_id,
-            name,
-            status,
-            content,
-        } => Ok(AgentEvent::ToolResult {
-            call_id: call_id.clone(),
-            name: name.clone(),
-            status: status.clone(),
-            content: content.clone(),
-        }),
-        other => Err(Error::protocol(format!(
-            "expected tool message, got {other:?}"
-        ))),
+        Message::Assistant(content) => Message::Assistant(
+            content
+                .into_iter()
+                .filter(|c| !matches!(c, OutputContent::Thinking(_) | OutputContent::Image(_)))
+                .collect(),
+        ),
+        other => other,
     }
 }
 
-fn normalize_for_history(message: Message) -> Message {
-    match message {
-        Message::Assistant { content } => Message::Assistant {
-            content: content
-                .into_iter()
-                .filter(|c| {
-                    !matches!(
-                        c,
-                        OutputContent::Thinking { .. } | OutputContent::Image { .. }
-                    )
-                })
-                .collect(),
-        },
-        other => other,
-    }
+enum TurnState<'a> {
+    ModelRequest,
+    ModelStreaming {
+        stream: ModelStream<'a>,
+        output_state: OutputStreamState,
+    },
+    ToolExecution {
+        output_content: Vec<OutputContent>,
+    },
+    Finished,
 }
 
 struct ToolExecutionResult {

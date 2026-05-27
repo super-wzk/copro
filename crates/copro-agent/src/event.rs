@@ -1,5 +1,5 @@
 use copro_core::error::Result;
-use copro_core::message::{InputContent, OutputContent, ToolResultStatus};
+use copro_core::message::{OutputContent, ToolResult};
 use copro_core::response::{FinishReason, Usage};
 use copro_core::stream::OutputContentDelta;
 use std::pin::Pin;
@@ -8,22 +8,15 @@ use std::pin::Pin;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentEvent {
     /// A streaming model output delta before the output is committed.
-    OutputDelta { delta: OutputContentDelta },
+    OutputDelta(OutputContentDelta),
     /// A complete model output committed as an assistant message.
-    Output {
+    OutputFinished {
         content: Vec<OutputContent>,
-        finish_reason: FinishReason,
+        reason: FinishReason,
         usage: Option<Usage>,
     },
     /// A tool execution result committed as a tool message.
-    ToolResult {
-        call_id: String,
-        name: String,
-        status: ToolResultStatus,
-        content: Vec<InputContent>,
-    },
-    /// The whole agent turn has completed after all tool rounds.
-    TurnFinish,
+    ToolResult(ToolResult),
 }
 
 /// A stream of [`AgentEvent`]s produced by an agent turn.

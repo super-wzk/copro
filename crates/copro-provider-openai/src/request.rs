@@ -1,9 +1,9 @@
 use base64::Engine;
 use copro_core::error::{Error, Result};
-use copro_core::message::{InputContent, Message, OutputContent, ToolResultStatus};
+use copro_core::message::{ImageContent, InputContent, Message, OutputContent, ToolResultStatus};
 use copro_core::tool::{HostedToolSpec, ToolChoice, ToolDefinition};
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use crate::config::{OpenAiResponsesModelConfig, OpenAiResponsesRequestOptions};
 
@@ -89,25 +89,18 @@ fn build_input_items(messages: Vec<Message>) -> Result<Vec<Value>> {
 
 fn build_message_items(message: Message) -> Result<Vec<Value>> {
     match message {
-        Message::System { content } => Ok(vec![message_item("system", input_content(content)?)]),
-        Message::Developer { content } => {
-            Ok(vec![message_item("developer", input_content(content)?)])
-        }
-        Message::User { content } => Ok(vec![message_item("user", input_content(content)?)]),
-        Message::Assistant { content } => build_output_items(content),
-        Message::Tool {
-            call_id,
-            name: _,
-            status,
-            content,
-        } => {
-            let mut output = tool_output_content(content)?;
-            if status == ToolResultStatus::Error {
+        Message::System(content) => Ok(vec![message_item("system", input_content(content)?)]),
+        Message::Developer(content) => Ok(vec![message_item("developer", input_content(content)?)]),
+        Message::User(content) => Ok(vec![message_item("user", input_content(content)?)]),
+        Message::Assistant(content) => build_output_items(content),
+        Message::Tool(result) => {
+            let mut output = tool_output_content(result.content)?;
+            if result.status == ToolResultStatus::Error {
                 output = format!("Error: {output}");
             }
             Ok(vec![json!({
                 "type": "function_call_output",
-                "call_id": call_id,
+                "call_id": result.call_id,
                 "output": output,
             })])
         }
@@ -128,11 +121,15 @@ fn input_content(content: Vec<InputContent>) -> Result<Vec<Value>> {
 
 fn input_content_part(content: InputContent) -> Result<Value> {
     match content {
-        InputContent::Text { text } => Ok(json!({
+        InputContent::Text(text) => Ok(json!({
             "type": "input_text",
             "text": text,
         })),
-        InputContent::Image { mime_type, data } => {
+        InputContent::Image(ImageContent::Url { url }) => Ok(json!({
+            "type": "input_image",
+            "image_url": url,
+        })),
+        InputContent::Image(ImageContent::Data { mime_type, data }) => {
             let image = base64::engine::general_purpose::STANDARD.encode(data);
             Ok(json!({
                 "type": "input_image",
@@ -148,29 +145,25 @@ fn build_output_items(content: Vec<OutputContent>) -> Result<Vec<Value>> {
 
     for content in content {
         match content {
-            OutputContent::Text { text } => message_content.push(json!({
+            OutputContent::Text(text) => message_content.push(json!({
                 "type": "output_text",
                 "text": text,
             })),
-            OutputContent::Thinking { .. } => {
+            OutputContent::Thinking(_) => {
                 return Err(Error::client(
                     "OpenAI Responses provider cannot replay generic thinking content",
                 ));
             }
-            OutputContent::Image { .. } => {
+            OutputContent::Image(_) => {
                 return Err(Error::client(
                     "OpenAI Responses provider cannot replay generic image output",
                 ));
             }
-            OutputContent::ToolCall {
-                id,
-                name,
-                arguments,
-            } => items.push(json!({
+            OutputContent::ToolCall(tool_call) => items.push(json!({
                 "type": "function_call",
-                "call_id": id,
-                "name": name,
-                "arguments": Value::Object(arguments).to_string(),
+                "call_id": tool_call.id,
+                "name": tool_call.name,
+                "arguments": Value::Object(tool_call.arguments).to_string(),
                 "status": "completed",
             })),
         }
@@ -187,8 +180,8 @@ fn tool_output_content(content: Vec<InputContent>) -> Result<String> {
     let mut text = Vec::new();
     for content in content {
         match content {
-            InputContent::Text { text: part } => text.push(part),
-            InputContent::Image { .. } => {
+            InputContent::Text(part) => text.push(part),
+            InputContent::Image(_) => {
                 return Err(Error::client(
                     "OpenAI function call outputs only support text content",
                 ));
@@ -268,11 +261,11 @@ mod tests {
         OpenAiImageGenerationTool, OpenAiResponsesModelConfig, OpenAiResponsesRequestOptions,
     };
     use copro_core::{
-        message::{InputContent, Message},
+        message::{InputContent, Message, ToolResult},
         request::GenerateRequestOptions,
         tool::{ToolChoice, ToolDefinition},
     };
-    use serde_json::{Map, json};
+    use serde_json::{json, Map};
 
     fn empty_options() -> GenerateRequestOptions {
         GenerateRequestOptions::default()
@@ -281,11 +274,7 @@ mod tests {
     #[test]
     fn builds_basic_text_request() {
         let request = copro_core::request::GenerateRequest {
-            messages: vec![Message::User {
-                content: vec![InputContent::Text {
-                    text: "hello".to_string(),
-                }],
-            }],
+            messages: vec![Message::User(vec![InputContent::Text("hello".to_string())])],
             tools: Vec::new(),
             hosted_tools: Vec::new(),
             tool_choice: None,
@@ -315,11 +304,9 @@ mod tests {
     #[test]
     fn builds_developer_message_request() {
         let request = copro_core::request::GenerateRequest {
-            messages: vec![Message::Developer {
-                content: vec![InputContent::Text {
-                    text: "follow these instructions".to_string(),
-                }],
-            }],
+            messages: vec![Message::Developer(vec![InputContent::Text(
+                "follow these instructions".to_string(),
+            )])],
             tools: Vec::new(),
             hosted_tools: Vec::new(),
             tool_choice: None,
@@ -344,11 +331,9 @@ mod tests {
     #[test]
     fn builds_function_tools_and_choice() {
         let request = copro_core::request::GenerateRequest {
-            messages: vec![Message::User {
-                content: vec![InputContent::Text {
-                    text: "weather".to_string(),
-                }],
-            }],
+            messages: vec![Message::User(vec![InputContent::Text(
+                "weather".to_string(),
+            )])],
             tools: vec![ToolDefinition {
                 name: "weather".to_string(),
                 description: "Get weather".to_string(),
@@ -384,11 +369,7 @@ mod tests {
             extra_body: Map::from_iter([("metadata".to_string(), json!({"trace_id": "req_123"}))]),
         };
         let request = copro_core::request::GenerateRequest {
-            messages: vec![Message::User {
-                content: vec![InputContent::Text {
-                    text: "hello".to_string(),
-                }],
-            }],
+            messages: vec![Message::User(vec![InputContent::Text("hello".to_string())])],
             tools: Vec::new(),
             hosted_tools: Vec::new(),
             tool_choice: None,
@@ -416,11 +397,7 @@ mod tests {
             ..OpenAiResponsesModelConfig::default()
         };
         let request = copro_core::request::GenerateRequest {
-            messages: vec![Message::User {
-                content: vec![InputContent::Text {
-                    text: "hello".to_string(),
-                }],
-            }],
+            messages: vec![Message::User(vec![InputContent::Text("hello".to_string())])],
             tools: Vec::new(),
             hosted_tools: Vec::new(),
             tool_choice: None,
@@ -454,11 +431,7 @@ mod tests {
             })
             .unwrap();
         let request = copro_core::request::GenerateRequest {
-            messages: vec![Message::User {
-                content: vec![InputContent::Text {
-                    text: "hello".to_string(),
-                }],
-            }],
+            messages: vec![Message::User(vec![InputContent::Text("hello".to_string())])],
             tools: Vec::new(),
             hosted_tools: Vec::new(),
             tool_choice: None,
@@ -474,11 +447,9 @@ mod tests {
     #[test]
     fn maps_hosted_response_tools() {
         let request = copro_core::request::GenerateRequest {
-            messages: vec![Message::User {
-                content: vec![InputContent::Text {
-                    text: "draw a cat".to_string(),
-                }],
-            }],
+            messages: vec![Message::User(vec![InputContent::Text(
+                "draw a cat".to_string(),
+            )])],
             tools: Vec::new(),
             hosted_tools: vec![
                 OpenAiImageGenerationTool {
@@ -501,14 +472,12 @@ mod tests {
 
     #[test]
     fn maps_tool_output_messages() {
-        let items = build_message_items(Message::Tool {
+        let items = build_message_items(Message::Tool(ToolResult {
             call_id: "call_123".to_string(),
             name: "weather".to_string(),
             status: ToolResultStatus::Success,
-            content: vec![InputContent::Text {
-                text: "sunny".to_string(),
-            }],
-        })
+            content: vec![InputContent::Text("sunny".to_string())],
+        }))
         .unwrap();
 
         assert_eq!(items[0]["type"], "function_call_output");

@@ -2,10 +2,6 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum Error {
-    #[error("model not found: {model_id}")]
-    ModelNotFound { model_id: String },
-    #[error("provider not found: {provider_id}")]
-    ProviderNotFound { provider_id: String },
     #[error("request timed out")]
     Timeout,
     #[error("client error: {message}")]
