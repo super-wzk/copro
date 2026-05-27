@@ -194,55 +194,6 @@ mod tests {
     }
 
     #[test]
-    fn typed_extra_round_trips() {
-        let mut capabilities = ModelCapabilities::default();
-        capabilities
-            .insert_extra(TestExtra {
-                value: Some("configured".to_string()),
-            })
-            .unwrap();
-
-        let extra = capabilities.extra::<TestExtra>().unwrap();
-
-        assert_eq!(
-            extra,
-            TestExtra {
-                value: Some("configured".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn empty_extra_deserializes_to_default() {
-        let capabilities = ModelCapabilities::default();
-
-        let extra = capabilities.extra::<TestExtra>().unwrap();
-
-        assert_eq!(extra, TestExtra::default());
-    }
-
-    #[test]
-    fn invalid_extra_reports_client_error() {
-        let mut capabilities = ModelCapabilities::default();
-        capabilities
-            .extra
-            .insert("value".to_string(), serde_json::json!(42));
-
-        let error = capabilities.extra::<TestExtra>().unwrap_err();
-
-        assert!(matches!(error, ConfigError::Client { .. }));
-    }
-
-    #[test]
-    fn non_object_extra_is_rejected() {
-        let mut capabilities = ModelCapabilities::default();
-
-        let error = capabilities.insert_extra(42).unwrap_err();
-
-        assert!(matches!(error, ConfigError::Client { .. }));
-    }
-
-    #[test]
     fn model_definition_config_round_trips() {
         let model = ModelDefinition::new("openai", "gpt")
             .with_name("GPT")

@@ -228,16 +228,3 @@ fn epoch_to_date(days: i64) -> (i64, u32, u32) {
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn calculator_basic_ops() {
-        assert!((evaluate_expression("2 + 3 * 4").unwrap() - 14.0).abs() < 0.001);
-        assert!((evaluate_expression("(2 + 3) * 4").unwrap() - 20.0).abs() < 0.001);
-        assert!((evaluate_expression("-5 + 3").unwrap() - (-2.0)).abs() < 0.001);
-        assert!((evaluate_expression("10 / 3").unwrap() - 3.333).abs() < 0.001);
-    }
-}

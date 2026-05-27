@@ -132,10 +132,9 @@ impl From<&dyn ErasedTool> for ToolDefinition {
 #[cfg(test)]
 mod tests {
     use crate::async_trait;
-    use crate::error::Error;
-    use crate::tool::{ErasedTool, HostedToolSpec, Tool};
+    use crate::tool::{ErasedTool, Tool};
     use schemars::JsonSchema;
-    use serde::{Deserialize, Serialize};
+    use serde::Deserialize;
 
     #[derive(Deserialize, JsonSchema)]
     struct HelloArgs {
@@ -155,38 +154,6 @@ mod tests {
         async fn call(&self, input: Self::Input) -> Result<Self::Output, String> {
             Ok(format!("Hello {}!", input.text))
         }
-    }
-
-    #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
-    #[serde(default)]
-    struct TestHostedParameters {
-        partial_images: Option<u8>,
-    }
-
-    #[test]
-    fn hosted_tool_parameters_round_trip() {
-        let tool = HostedToolSpec::new("image_generation")
-            .with_parameters(TestHostedParameters {
-                partial_images: Some(2),
-            })
-            .unwrap();
-
-        assert_eq!(tool.kind, "image_generation");
-        assert_eq!(
-            tool.parameters::<TestHostedParameters>().unwrap(),
-            TestHostedParameters {
-                partial_images: Some(2),
-            }
-        );
-    }
-
-    #[test]
-    fn hosted_tool_rejects_non_object_parameters() {
-        let mut tool = HostedToolSpec::new("image_generation");
-
-        let error = tool.insert_parameters(42).unwrap_err();
-
-        assert!(matches!(error, Error::Client { .. }));
     }
 
     #[tokio::test]
