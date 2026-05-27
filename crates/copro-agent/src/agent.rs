@@ -1,6 +1,6 @@
 use crate::event::{AgentEvent, AgentStream};
 use crate::hook::{AgentHook, ToolDecision};
-use crate::tools::ToolProvider;
+use crate::tools::ToolRouter;
 use copro_api::error::{Error, Result};
 use copro_api::message::{
     InputContent, Message, OutputContent, ToolCall, ToolResult, ToolResultStatus,
@@ -13,14 +13,14 @@ use std::sync::Arc;
 /// Conversational agent bound to one model with tools, hooks, and conversation state.
 pub struct Agent {
     pub model: Arc<dyn Model>,
-    pub tools: Arc<dyn ToolProvider>,
+    pub tools: Arc<dyn ToolRouter>,
     pub hooks: Vec<Arc<dyn AgentHook>>,
     pub max_tool_rounds: usize,
     pub messages: Vec<Message>,
 }
 
 impl Agent {
-    pub fn new(model: Arc<dyn Model>, tools: Arc<dyn ToolProvider>) -> Self {
+    pub fn new(model: Arc<dyn Model>, tools: Arc<dyn ToolRouter>) -> Self {
         Self {
             model,
             tools,

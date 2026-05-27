@@ -1,4 +1,4 @@
-use copro_agent::{Agent, AgentEvent, AgentHook, ToolProvider, async_trait};
+use copro_agent::{Agent, AgentEvent, AgentHook, ToolRouter, async_trait};
 use copro_api::error::Result;
 use copro_api::message::{
     InputContent, Message, OutputContent, ToolCall, ToolResult, ToolResultStatus,
@@ -98,7 +98,7 @@ async fn run_stream_awaits_async_erased_tool() {
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
-        Arc::new(DoubleToolProvider),
+        Arc::new(DoubleToolRouter),
     );
 
     let events = agent
@@ -130,7 +130,7 @@ async fn run_stream_awaits_async_erased_tool() {
 }
 
 fn test_agent(events: Vec<OutputStreamEvent>) -> Agent {
-    Agent::new(Arc::new(TestModel { events }), Arc::new(EmptyToolProvider))
+    Agent::new(Arc::new(TestModel { events }), Arc::new(EmptyToolRouter))
 }
 
 struct RedactHook;
@@ -143,10 +143,10 @@ impl AgentHook for RedactHook {
     }
 }
 
-struct EmptyToolProvider;
+struct EmptyToolRouter;
 
 #[async_trait]
-impl ToolProvider for EmptyToolProvider {
+impl ToolRouter for EmptyToolRouter {
     async fn definitions(&self) -> Result<Vec<ToolDefinition>> {
         Ok(Vec::new())
     }
@@ -156,10 +156,10 @@ impl ToolProvider for EmptyToolProvider {
     }
 }
 
-struct DoubleToolProvider;
+struct DoubleToolRouter;
 
 #[async_trait]
-impl ToolProvider for DoubleToolProvider {
+impl ToolRouter for DoubleToolRouter {
     async fn definitions(&self) -> Result<Vec<ToolDefinition>> {
         Ok(vec![ToolDefinition {
             name: "double".to_string(),

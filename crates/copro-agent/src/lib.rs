@@ -11,4 +11,4 @@ mod tools;
 pub use agent::Agent;
 pub use event::{AgentEvent, AgentStream};
 pub use hook::{AgentHook, ToolDecision};
-pub use tools::ToolProvider;
+pub use tools::ToolRouter;

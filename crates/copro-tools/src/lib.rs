@@ -1,17 +1,17 @@
-use copro_agent::{ToolProvider, async_trait};
+use copro_agent::{ToolRouter, async_trait};
 use copro_api::error::Result;
 use copro_api::message::{InputContent, ToolCall, ToolResult, ToolResultStatus};
 use copro_api::tool::{ErasedTool, ToolDefinition};
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Tool provider backed by in-process [`ErasedTool`] implementations.
+/// Tool router backed by in-process [`ErasedTool`] implementations.
 #[derive(Default, Clone)]
-pub struct LocalToolProvider {
+pub struct LocalToolRouter {
     tools: Vec<Arc<dyn ErasedTool>>,
 }
 
-impl LocalToolProvider {
+impl LocalToolRouter {
     pub fn new(tools: Vec<Arc<dyn ErasedTool>>) -> Self {
         Self { tools }
     }
@@ -29,7 +29,7 @@ impl LocalToolProvider {
 }
 
 #[async_trait]
-impl ToolProvider for LocalToolProvider {
+impl ToolRouter for LocalToolRouter {
     async fn definitions(&self) -> Result<Vec<ToolDefinition>> {
         Ok(self.tools.iter().map(|tool| tool.definition()).collect())
     }

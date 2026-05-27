@@ -4,7 +4,7 @@ use copro_api::stream::OutputContentDelta;
 use copro_provider_openai::{
     OpenAiResponsesModelConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
 };
-use copro_tools::LocalToolProvider;
+use copro_tools::LocalToolRouter;
 use futures_util::StreamExt;
 use std::env;
 use std::io::{self, Write};
@@ -32,8 +32,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..OpenAiResponsesModelConfig::default()
         },
     )?;
-    let tool_provider = LocalToolProvider::new(vec![Arc::new(Calculator), Arc::new(DateTimeTool)]);
-    let mut agent = Agent::new(model, Arc::new(tool_provider));
+    let tool_router = LocalToolRouter::new(vec![Arc::new(Calculator), Arc::new(DateTimeTool)]);
+    let mut agent = Agent::new(model, Arc::new(tool_router));
 
     agent
         .messages
