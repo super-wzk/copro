@@ -31,7 +31,7 @@ impl LocalToolProvider {
 #[async_trait]
 impl ToolProvider for LocalToolProvider {
     async fn definitions(&self) -> Result<Vec<ToolDefinition>> {
-        Ok(self.tools.iter().map(|tool| tool.as_ref().into()).collect())
+        Ok(self.tools.iter().map(|tool| tool.definition()).collect())
     }
 
     async fn execute(&self, call: ToolCall) -> Result<ToolResult> {
@@ -41,7 +41,11 @@ impl ToolProvider for LocalToolProvider {
             arguments,
         } = call;
 
-        let Some(tool) = self.tools.iter().find(|tool| tool.name() == name) else {
+        let Some(tool) = self
+            .tools
+            .iter()
+            .find(|tool| tool.definition().name == name)
+        else {
             return Ok(ToolResult {
                 call_id: id,
                 name: name.clone(),
@@ -50,16 +54,13 @@ impl ToolProvider for LocalToolProvider {
             });
         };
 
-        let result = match tool.call_json(Value::Object(arguments)).await {
-            Ok(output) => {
-                let text = serde_json::to_string(&output).unwrap_or_else(|_| format!("{output:?}"));
-                ToolResult {
-                    call_id: id,
-                    name,
-                    status: ToolResultStatus::Success,
-                    content: vec![InputContent::Text(text)],
-                }
-            }
+        let result = match tool.call_content(Value::Object(arguments)).await {
+            Ok(content) => ToolResult {
+                call_id: id,
+                name,
+                status: ToolResultStatus::Success,
+                content,
+            },
             Err(error) => ToolResult {
                 call_id: id,
                 name,

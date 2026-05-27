@@ -174,17 +174,16 @@ impl ToolProvider for DoubleToolProvider {
             name,
             arguments,
         } = call;
-        let output = AsyncDoubleTool
-            .call_json(Value::Object(arguments))
+        let content = AsyncDoubleTool
+            .call_content(Value::Object(arguments))
             .await
             .map_err(copro_api::error::Error::client)?;
-        let text = serde_json::to_string(&output).unwrap_or_else(|_| format!("{output:?}"));
 
         Ok(ToolResult {
             call_id: id,
             name,
             status: ToolResultStatus::Success,
-            content: vec![InputContent::Text(text)],
+            content,
         })
     }
 }
@@ -193,25 +192,21 @@ struct AsyncDoubleTool;
 
 #[async_trait]
 impl ErasedTool for AsyncDoubleTool {
-    fn name(&self) -> &str {
-        "double"
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "double".to_string(),
+            description: "Double an integer.".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
     }
 
-    fn description(&self) -> &str {
-        "Double an integer."
-    }
-
-    fn parameters(&self) -> Value {
-        serde_json::json!({"type": "object"})
-    }
-
-    async fn call_json(&self, args: Value) -> std::result::Result<Value, String> {
+    async fn call_content(&self, args: Value) -> std::result::Result<Vec<InputContent>, String> {
         tokio::task::yield_now().await;
         let value = args
             .get("value")
             .and_then(Value::as_i64)
             .ok_or_else(|| "missing value".to_string())?;
-        Ok(Value::from(value * 2))
+        Ok(vec![InputContent::Text((value * 2).to_string())])
     }
 }
 

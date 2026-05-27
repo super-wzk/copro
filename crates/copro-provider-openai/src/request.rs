@@ -1,6 +1,8 @@
 use base64::Engine;
 use copro_api::error::{Error, Result};
-use copro_api::message::{ImageContent, InputContent, Message, OutputContent, ToolResultStatus};
+use copro_api::message::{
+    ImageContent, InputContent, Message, OutputContent, ToolResult, ToolResultStatus,
+};
 use copro_api::tool::{HostedToolSpec, ToolChoice, ToolDefinition};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -89,21 +91,14 @@ fn build_input_items(messages: Vec<Message>) -> Result<Vec<Value>> {
 
 fn build_message_items(message: Message) -> Result<Vec<Value>> {
     match message {
-        Message::System(content) => Ok(vec![message_item("system", input_content(content)?)]),
-        Message::Developer(content) => Ok(vec![message_item("developer", input_content(content)?)]),
-        Message::User(content) => Ok(vec![message_item("user", input_content(content)?)]),
+        Message::System(content) => Ok(vec![message_item("system", input_content_parts(content))]),
+        Message::Developer(content) => Ok(vec![message_item(
+            "developer",
+            input_content_parts(content),
+        )]),
+        Message::User(content) => Ok(vec![message_item("user", input_content_parts(content))]),
         Message::Assistant(content) => build_output_items(content),
-        Message::Tool(result) => {
-            let mut output = tool_output_content(result.content)?;
-            if result.status == ToolResultStatus::Error {
-                output = format!("Error: {output}");
-            }
-            Ok(vec![json!({
-                "type": "function_call_output",
-                "call_id": result.call_id,
-                "output": output,
-            })])
-        }
+        Message::Tool(result) => Ok(vec![tool_result_item(result)]),
     }
 }
 
@@ -115,28 +110,33 @@ fn message_item(role: &str, content: Vec<Value>) -> Value {
     })
 }
 
-fn input_content(content: Vec<InputContent>) -> Result<Vec<Value>> {
+fn input_content_parts(content: Vec<InputContent>) -> Vec<Value> {
     content.into_iter().map(input_content_part).collect()
 }
 
-fn input_content_part(content: InputContent) -> Result<Value> {
+fn input_content_part(content: InputContent) -> Value {
     match content {
-        InputContent::Text(text) => Ok(json!({
-            "type": "input_text",
-            "text": text,
-        })),
-        InputContent::Image(ImageContent::Url { url }) => Ok(json!({
-            "type": "input_image",
-            "image_url": url,
-        })),
+        InputContent::Text(text) => input_text_part(text),
+        InputContent::Image(ImageContent::Url { url }) => input_image_part(url),
         InputContent::Image(ImageContent::Data { mime_type, data }) => {
             let image = base64::engine::general_purpose::STANDARD.encode(data);
-            Ok(json!({
-                "type": "input_image",
-                "image_url": format!("data:{mime_type};base64,{image}"),
-            }))
+            input_image_part(format!("data:{mime_type};base64,{image}"))
         }
     }
+}
+
+fn input_text_part(text: impl Into<String>) -> Value {
+    json!({
+        "type": "input_text",
+        "text": text.into(),
+    })
+}
+
+fn input_image_part(image_url: impl Into<String>) -> Value {
+    json!({
+        "type": "input_image",
+        "image_url": image_url.into(),
+    })
 }
 
 fn build_output_items(content: Vec<OutputContent>) -> Result<Vec<Value>> {
@@ -176,19 +176,17 @@ fn build_output_items(content: Vec<OutputContent>) -> Result<Vec<Value>> {
     Ok(items)
 }
 
-fn tool_output_content(content: Vec<InputContent>) -> Result<String> {
-    let mut text = Vec::new();
-    for content in content {
-        match content {
-            InputContent::Text(part) => text.push(part),
-            InputContent::Image(_) => {
-                return Err(Error::client(
-                    "OpenAI function call outputs only support text content",
-                ));
-            }
-        }
+fn tool_result_item(result: ToolResult) -> Value {
+    let mut output = input_content_parts(result.content);
+    if result.status == ToolResultStatus::Error {
+        output.insert(0, input_text_part("Error:"));
     }
-    Ok(text.join("\n"))
+
+    json!({
+        "type": "function_call_output",
+        "call_id": result.call_id,
+        "output": output,
+    })
 }
 
 fn build_request_tools(
@@ -482,6 +480,54 @@ mod tests {
 
         assert_eq!(items[0]["type"], "function_call_output");
         assert_eq!(items[0]["call_id"], "call_123");
-        assert_eq!(items[0]["output"], "sunny");
+        assert_eq!(items[0]["output"][0]["type"], "input_text");
+        assert_eq!(items[0]["output"][0]["text"], "sunny");
+    }
+
+    #[test]
+    fn maps_multiple_text_tool_output_as_content_array() {
+        let items = build_message_items(Message::Tool(ToolResult {
+            call_id: "call_123".to_string(),
+            name: "multi_text".to_string(),
+            status: ToolResultStatus::Success,
+            content: vec![
+                InputContent::Text("first".to_string()),
+                InputContent::Text("second".to_string()),
+            ],
+        }))
+        .unwrap();
+
+        assert_eq!(items[0]["type"], "function_call_output");
+        assert_eq!(items[0]["call_id"], "call_123");
+        assert_eq!(items[0]["output"][0]["type"], "input_text");
+        assert_eq!(items[0]["output"][0]["text"], "first");
+        assert_eq!(items[0]["output"][1]["type"], "input_text");
+        assert_eq!(items[0]["output"][1]["text"], "second");
+    }
+
+    #[test]
+    fn maps_tool_output_images() {
+        let items = build_message_items(Message::Tool(ToolResult {
+            call_id: "call_123".to_string(),
+            name: "inspect_image".to_string(),
+            status: ToolResultStatus::Success,
+            content: vec![
+                InputContent::Text("screenshot".to_string()),
+                InputContent::Image(ImageContent::Url {
+                    url: "https://example.com/screenshot.png".to_string(),
+                }),
+            ],
+        }))
+        .unwrap();
+
+        assert_eq!(items[0]["type"], "function_call_output");
+        assert_eq!(items[0]["call_id"], "call_123");
+        assert_eq!(items[0]["output"][0]["type"], "input_text");
+        assert_eq!(items[0]["output"][0]["text"], "screenshot");
+        assert_eq!(items[0]["output"][1]["type"], "input_image");
+        assert_eq!(
+            items[0]["output"][1]["image_url"],
+            "https://example.com/screenshot.png"
+        );
     }
 }
