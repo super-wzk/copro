@@ -38,9 +38,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     registry.register_provider(provider);
     registry.register_model(model);
 
-    let tools: Vec<Arc<dyn ErasedTool>> = vec![Arc::new(Calculator), Arc::new(DateTimeTool)];
     let mut agent = Agent::new(registry);
-    agent.tools = tools;
+    agent.tools = vec![Arc::new(Calculator), Arc::new(DateTimeTool)];
 
     agent.messages.push(Message::System {
         content: vec![text(SYSTEM_PROMPT)],

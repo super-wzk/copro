@@ -38,10 +38,54 @@ pub enum AgentEvent {
 pub type AgentStream<'a> =
     Pin<Box<dyn futures_util::Stream<Item = Result<AgentEvent>> + Send + 'a>>;
 
-/// Conversational agent that holds providers, tools, and conversation state.
+/// Hook points that can inspect or modify agent execution.
+pub trait AgentHook: Send + Sync {
+    fn before_request(&self, _request: &mut GenerateRequest) -> Result<()> {
+        Ok(())
+    }
+
+    fn before_tool_call(&self, _call: &mut ToolCallContext) -> Result<ToolDecision> {
+        Ok(ToolDecision::Allow)
+    }
+
+    fn after_tool_result(&self, _result: &mut ToolResultContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn before_commit(&self, _message: &mut Message) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Decision returned by [`AgentHook::before_tool_call`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolDecision {
+    Allow,
+    Reject { reason: String },
+}
+
+/// Tool call context passed to [`AgentHook::before_tool_call`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallContext {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: Map<String, Value>,
+}
+
+/// Tool result context passed to [`AgentHook::after_tool_result`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResultContext {
+    pub call_id: String,
+    pub name: String,
+    pub status: ToolResultStatus,
+    pub content: Vec<InputContent>,
+}
+
+/// Conversational agent that holds providers, tools, hooks, and conversation state.
 pub struct Agent {
     pub registry: ProviderRegistry,
     pub tools: Vec<Arc<dyn ErasedTool>>,
+    pub hooks: Vec<Arc<dyn AgentHook>>,
     pub max_tool_rounds: usize,
     pub messages: Vec<Message>,
 }
@@ -51,6 +95,7 @@ impl Agent {
         Self {
             registry,
             tools: Vec::new(),
+            hooks: Vec::new(),
             max_tool_rounds: 10,
             messages: Vec::new(),
         }
@@ -67,7 +112,8 @@ impl Agent {
             let mut done = false;
 
             for _round in 0..self.max_tool_rounds {
-                let request = self.build_request(self.messages.clone());
+                let mut request = self.build_request(self.messages.clone());
+                self.apply_before_request(&mut request)?;
                 let mut stream = chat.stream(request);
                 let mut output_state = OutputStreamState::new();
 
@@ -98,34 +144,17 @@ impl Agent {
                                     Error::protocol("stream ended before finished event")
                                 })?;
 
-                            let content = match &response.message {
-                                Message::Assistant { content } => content.clone(),
-                                other => {
-                                    Err(Error::protocol(format!(
-                                        "expected assistant message, got {other:?}"
-                                    )))?;
-                                    unreachable!()
-                                }
-                            };
-
-                            let has_tool_calls = content
-                                .iter()
-                                .any(|c| matches!(c, OutputContent::ToolCall { .. }));
                             let finish_reason = response.finish_reason;
                             let usage = response.usage.clone();
-                            let assistant_message = strip_thinking(response.message);
-                            let output_content = match &assistant_message {
-                                Message::Assistant { content } => content.clone(),
-                                other => {
-                                    Err(Error::protocol(format!(
-                                        "expected assistant message, got {other:?}"
-                                    )))?;
-                                    unreachable!()
-                                }
-                            };
+                            let mut assistant_message = strip_thinking(response.message);
+                            self.apply_before_commit(&mut assistant_message)?;
+                            let output_content = assistant_content(&assistant_message)?;
+                            let has_tool_calls = output_content
+                                .iter()
+                                .any(|c| matches!(c, OutputContent::ToolCall { .. }));
                             self.messages.push(assistant_message);
                             yield AgentEvent::Output {
-                                content: output_content,
+                                content: output_content.clone(),
                                 finish_reason,
                                 usage,
                             };
@@ -136,27 +165,44 @@ impl Agent {
                                 break;
                             }
 
-                            for item in &content {
+                            for item in &output_content {
                                 if let OutputContent::ToolCall {
                                     id,
                                     name,
                                     arguments,
                                 } = item
                                 {
-                                    let result = self.execute_tool(name, arguments);
-                                    let tool_message = Message::Tool {
+                                    let mut call = ToolCallContext {
                                         call_id: id.clone(),
                                         name: name.clone(),
-                                        status: result.status.clone(),
-                                        content: result.content.clone(),
+                                        arguments: arguments.clone(),
                                     };
-                                    self.messages.push(tool_message);
-                                    yield AgentEvent::ToolResult {
-                                        call_id: id.clone(),
-                                        name: name.clone(),
+                                    let result = match self.apply_before_tool_call(&mut call)? {
+                                        ToolDecision::Allow => {
+                                            self.execute_tool(&call.name, &call.arguments)
+                                        }
+                                        ToolDecision::Reject { reason } => ToolExecutionResult {
+                                            status: ToolResultStatus::Error,
+                                            content: vec![InputContent::Text { text: reason }],
+                                        },
+                                    };
+                                    let mut result = ToolResultContext {
+                                        call_id: call.call_id,
+                                        name: call.name,
                                         status: result.status,
                                         content: result.content,
                                     };
+                                    self.apply_after_tool_result(&mut result)?;
+                                    let mut tool_message = Message::Tool {
+                                        call_id: result.call_id.clone(),
+                                        name: result.name.clone(),
+                                        status: result.status.clone(),
+                                        content: result.content.clone(),
+                                    };
+                                    self.apply_before_commit(&mut tool_message)?;
+                                    let event = tool_result_event(&tool_message)?;
+                                    self.messages.push(tool_message);
+                                    yield event;
                                 }
                             }
 
@@ -189,6 +235,37 @@ impl Agent {
         }
     }
 
+    fn apply_before_request(&self, request: &mut GenerateRequest) -> Result<()> {
+        for hook in &self.hooks {
+            hook.before_request(request)?;
+        }
+        Ok(())
+    }
+
+    fn apply_before_tool_call(&self, call: &mut ToolCallContext) -> Result<ToolDecision> {
+        for hook in &self.hooks {
+            match hook.before_tool_call(call)? {
+                ToolDecision::Allow => {}
+                decision => return Ok(decision),
+            }
+        }
+        Ok(ToolDecision::Allow)
+    }
+
+    fn apply_after_tool_result(&self, result: &mut ToolResultContext) -> Result<()> {
+        for hook in &self.hooks {
+            hook.after_tool_result(result)?;
+        }
+        Ok(())
+    }
+
+    fn apply_before_commit(&self, message: &mut Message) -> Result<()> {
+        for hook in &self.hooks {
+            hook.before_commit(message)?;
+        }
+        Ok(())
+    }
+
     fn execute_tool(&self, name: &str, arguments: &Map<String, Value>) -> ToolExecutionResult {
         let Some(tool) = self.tools.iter().find(|t| t.name() == name) else {
             return ToolExecutionResult {
@@ -212,6 +289,34 @@ impl Agent {
                 content: vec![InputContent::Text { text: error }],
             },
         }
+    }
+}
+
+fn assistant_content(message: &Message) -> Result<Vec<OutputContent>> {
+    match message {
+        Message::Assistant { content } => Ok(content.clone()),
+        other => Err(Error::protocol(format!(
+            "expected assistant message, got {other:?}"
+        ))),
+    }
+}
+
+fn tool_result_event(message: &Message) -> Result<AgentEvent> {
+    match message {
+        Message::Tool {
+            call_id,
+            name,
+            status,
+            content,
+        } => Ok(AgentEvent::ToolResult {
+            call_id: call_id.clone(),
+            name: name.clone(),
+            status: status.clone(),
+            content: content.clone(),
+        }),
+        other => Err(Error::protocol(format!(
+            "expected tool message, got {other:?}"
+        ))),
     }
 }
 
@@ -307,6 +412,73 @@ mod tests {
                 assistant,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn before_commit_hook_can_modify_output() {
+        let mut registry = ProviderRegistry::new();
+        registry.register_provider(TestProvider {
+            events: vec![
+                OutputStreamEvent::Delta {
+                    content_index: 0,
+                    delta: OutputContentDelta::Text {
+                        text: "secret".to_string(),
+                    },
+                },
+                OutputStreamEvent::Finished {
+                    reason: FinishReason::Stop,
+                    usage: None,
+                },
+            ],
+        });
+        registry.register_model(ModelDefinition::new("test", "test-model"));
+        let mut agent = Agent::new(registry);
+        agent.hooks.push(Arc::new(RedactHook));
+
+        let events = agent
+            .run_stream("test-model")
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        let redacted = vec![OutputContent::Text {
+            text: "redacted".to_string(),
+        }];
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::OutputDelta {
+                    delta: OutputContentDelta::Text {
+                        text: "secret".to_string(),
+                    },
+                },
+                AgentEvent::Output {
+                    content: redacted.clone(),
+                    finish_reason: FinishReason::Stop,
+                    usage: None,
+                },
+                AgentEvent::TurnFinish,
+            ]
+        );
+        assert_eq!(
+            agent.messages,
+            vec![Message::Assistant { content: redacted }]
+        );
+    }
+
+    struct RedactHook;
+
+    impl AgentHook for RedactHook {
+        fn before_commit(&self, message: &mut Message) -> Result<()> {
+            if let Message::Assistant { content } = message {
+                *content = vec![OutputContent::Text {
+                    text: "redacted".to_string(),
+                }];
+            }
+            Ok(())
+        }
     }
 
     struct TestProvider {
