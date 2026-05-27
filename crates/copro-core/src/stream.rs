@@ -5,7 +5,6 @@ use crate::response::*;
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::future::Future;
 use std::pin::Pin;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,8 +32,6 @@ pub enum OutputContentDelta {
 }
 
 pub type ModelStream<'a> = Pin<Box<dyn Stream<Item = Result<OutputStreamEvent>> + Send + 'a>>;
-
-pub type ModelFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 /// A live model that can generate responses for requests.
 pub trait Model: Send + Sync {
@@ -72,7 +69,7 @@ impl OutputStreamState {
                     message: Message::Assistant(finish_output_content(std::mem::take(
                         &mut self.content,
                     ))?),
-                    finish_reason: reason,
+                    reason,
                     usage,
                 }))
             }

@@ -94,11 +94,11 @@ impl OpenAiEventMapper {
             "response.image_generation_call.partial_image" => self.map_partial_image(&event),
             "response.created" | "response.in_progress" | "response.queued" => Ok(Vec::new()),
             "response.completed" => Ok(vec![OutputStreamEvent::Finished {
-                reason: self.finish_reason(FinishReason::Stop),
+                reason: self.resolve_reason(FinishReason::Stop),
                 usage: usage_from_event(&event),
             }]),
             "response.incomplete" => Ok(vec![OutputStreamEvent::Finished {
-                reason: self.finish_reason(FinishReason::Length),
+                reason: self.resolve_reason(FinishReason::Length),
                 usage: usage_from_event(&event),
             }]),
             "response.failed" => Err(response_failed_error(&event)),
@@ -311,7 +311,7 @@ impl OpenAiEventMapper {
         index
     }
 
-    fn finish_reason(&self, fallback: FinishReason) -> FinishReason {
+    fn resolve_reason(&self, fallback: FinishReason) -> FinishReason {
         if self.saw_tool_call {
             FinishReason::ToolCalls
         } else {

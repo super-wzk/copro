@@ -93,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             eprint!("{text}");
                             io::stderr().flush()?;
                         }
-                        OutputContentDelta::Image { .. } => {}
+                        OutputContentDelta::Image(_) => {}
                         OutputContentDelta::ToolCall { .. } => {}
                     },
                     AgentEvent::OutputFinished { content, .. } => {

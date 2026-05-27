@@ -19,6 +19,6 @@ pub enum FinishReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerateResponse {
     pub message: Message,
-    pub finish_reason: FinishReason,
+    pub reason: FinishReason,
     pub usage: Option<Usage>,
 }

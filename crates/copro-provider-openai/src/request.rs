@@ -3,7 +3,7 @@ use copro_core::error::{Error, Result};
 use copro_core::message::{ImageContent, InputContent, Message, OutputContent, ToolResultStatus};
 use copro_core::tool::{HostedToolSpec, ToolChoice, ToolDefinition};
 use serde::Serialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::config::{OpenAiResponsesModelConfig, OpenAiResponsesRequestOptions};
 
@@ -265,7 +265,7 @@ mod tests {
         request::GenerateRequestOptions,
         tool::{ToolChoice, ToolDefinition},
     };
-    use serde_json::{json, Map};
+    use serde_json::{Map, json};
 
     fn empty_options() -> GenerateRequestOptions {
         GenerateRequestOptions::default()

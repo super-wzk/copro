@@ -8,7 +8,7 @@ use copro_core::request::{GenerateRequest, GenerateRequestOptions};
 use copro_core::stream::{Model, ModelStream, OutputStreamEvent, OutputStreamState};
 use copro_core::tool::{ErasedTool, ToolDefinition};
 use futures_util::StreamExt;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::sync::Arc;
 
 /// Conversational agent bound to one model with tools, hooks, and conversation state.
@@ -89,7 +89,6 @@ impl Agent {
                                         Error::protocol("stream ended before finished event")
                                     })?;
 
-                                let _finish_reason = response.finish_reason;
                                 let usage = response.usage.clone();
                                 let mut assistant_message = response.message;
                                 self.apply_on_output_finished(&mut assistant_message).await?;
@@ -117,20 +116,16 @@ impl Agent {
                             let OutputContent::ToolCall(mut tool) = item else {
                                 continue;
                             };
-                            let result = match self.apply_before_tool_execute(&mut tool).await? {
+                            let mut result = match self.apply_before_tool_execute(&mut tool).await? {
                                 ToolDecision::Allow => {
-                                    self.execute_tool(&tool.name, &tool.arguments).await
+                                    self.execute_tool(&tool).await
                                 }
-                                ToolDecision::Reject { reason } => ToolExecutionResult {
+                                ToolDecision::Reject { reason } => ToolResult {
+                                    call_id: tool.id,
+                                    name: tool.name,
                                     status: ToolResultStatus::Error,
                                     content: vec![InputContent::Text(reason)],
                                 },
-                            };
-                            let mut result = ToolResult {
-                                call_id: tool.id,
-                                name: tool.name,
-                                status: result.status,
-                                content: result.content,
                             };
                             self.apply_after_tool_result(&mut result).await?;
                             self.messages.push(Message::Tool(result.clone()));
@@ -189,27 +184,29 @@ impl Agent {
         Ok(())
     }
 
-    async fn execute_tool(
-        &self,
-        name: &str,
-        arguments: &Map<String, Value>,
-    ) -> ToolExecutionResult {
-        let Some(tool) = self.tools.iter().find(|t| t.name() == name) else {
-            return ToolExecutionResult {
+    async fn execute_tool(&self, call: &ToolCall) -> ToolResult {
+        let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) else {
+            return ToolResult {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
                 status: ToolResultStatus::Error,
-                content: vec![InputContent::Text(format!("unknown tool: {name}"))],
+                content: vec![InputContent::Text(format!("unknown tool: {}", call.name))],
             };
         };
 
-        match tool.call_json(Value::Object(arguments.clone())).await {
+        match tool.call_json(Value::Object(call.arguments.clone())).await {
             Ok(output) => {
                 let text = serde_json::to_string(&output).unwrap_or_else(|_| format!("{output:?}"));
-                ToolExecutionResult {
+                ToolResult {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
                     status: ToolResultStatus::Success,
                     content: vec![InputContent::Text(text)],
                 }
             }
-            Err(error) => ToolExecutionResult {
+            Err(error) => ToolResult {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
                 status: ToolResultStatus::Error,
                 content: vec![InputContent::Text(error)],
             },
@@ -248,9 +245,4 @@ enum TurnState<'a> {
         output_content: Vec<OutputContent>,
     },
     Finished,
-}
-
-struct ToolExecutionResult {
-    status: ToolResultStatus,
-    content: Vec<InputContent>,
 }

@@ -15,9 +15,7 @@ async fn run_stream_commits_assistant_message() {
     let mut agent = test_agent(vec![
         OutputStreamEvent::Delta {
             content_index: 0,
-            delta: OutputContentDelta::Text {
-                text: "Hello".to_string(),
-            },
+            delta: OutputContentDelta::Text("Hello".to_string()),
         },
         OutputStreamEvent::Finished {
             reason: FinishReason::Stop,
@@ -38,9 +36,7 @@ async fn run_stream_commits_assistant_message() {
     assert_eq!(
         events,
         vec![
-            AgentEvent::OutputDelta(OutputContentDelta::Text {
-                text: "Hello".to_string(),
-            }),
+            AgentEvent::OutputDelta(OutputContentDelta::Text("Hello".to_string())),
             AgentEvent::OutputFinished {
                 content: vec![OutputContent::Text("Hello".to_string())],
                 reason: FinishReason::Stop,
@@ -62,9 +58,7 @@ async fn on_output_finished_hook_can_modify_output() {
     let mut agent = test_agent(vec![
         OutputStreamEvent::Delta {
             content_index: 0,
-            delta: OutputContentDelta::Text {
-                text: "secret".to_string(),
-            },
+            delta: OutputContentDelta::Text("secret".to_string()),
         },
         OutputStreamEvent::Finished {
             reason: FinishReason::Stop,
@@ -85,9 +79,7 @@ async fn on_output_finished_hook_can_modify_output() {
     assert_eq!(
         events,
         vec![
-            AgentEvent::OutputDelta(OutputContentDelta::Text {
-                text: "secret".to_string(),
-            }),
+            AgentEvent::OutputDelta(OutputContentDelta::Text("secret".to_string())),
             AgentEvent::OutputFinished {
                 content: redacted.clone(),
                 reason: FinishReason::Stop,
@@ -199,9 +191,7 @@ impl Model for ToolThenDoneModel {
             _ => vec![
                 OutputStreamEvent::Delta {
                     content_index: 0,
-                    delta: OutputContentDelta::Text {
-                        text: "done".to_string(),
-                    },
+                    delta: OutputContentDelta::Text("done".to_string()),
                 },
                 OutputStreamEvent::Finished {
                     reason: FinishReason::Stop,
