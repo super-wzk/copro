@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use base64::Engine;
-use copro_core::error::{Error, Result};
-use copro_core::message::ImageContent;
-use copro_core::response::{FinishReason, Usage};
-use copro_core::stream::{OutputContentDelta, OutputStreamEvent};
+use copro_api::error::{Error, Result};
+use copro_api::message::ImageContent;
+use copro_api::response::{FinishReason, Usage};
+use copro_api::stream::{OutputContentDelta, OutputStreamEvent};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -461,7 +461,7 @@ fn tool_call_from_item(item: &Value) -> Option<ToolCallDelta> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use copro_core::stream::OutputStreamEvent;
+    use copro_api::stream::OutputStreamEvent;
     use serde_json::json;
 
     #[test]

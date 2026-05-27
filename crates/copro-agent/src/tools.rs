@@ -1,7 +1,7 @@
-use copro_core::async_trait;
-use copro_core::error::Result;
-use copro_core::message::{ToolCall, ToolResult};
-use copro_core::tool::ToolDefinition;
+use copro_api::async_trait;
+use copro_api::error::Result;
+use copro_api::message::{ToolCall, ToolResult};
+use copro_api::tool::ToolDefinition;
 
 /// Provides model-callable tool definitions and executes tool calls.
 #[async_trait]

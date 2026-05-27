@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 copro-agent.workspace = true
-copro-core.workspace = true
+copro-api.workspace = true
 copro-provider-openai.workspace = true
 copro-tools.workspace = true
 futures-util.workspace = true

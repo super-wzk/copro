@@ -1,7 +1,7 @@
-use copro_core::error::Result;
-use copro_core::message::{OutputContent, ToolResult};
-use copro_core::response::{FinishReason, Usage};
-use copro_core::stream::OutputContentDelta;
+use copro_api::error::Result;
+use copro_api::message::{OutputContent, ToolResult};
+use copro_api::response::{FinishReason, Usage};
+use copro_api::stream::OutputContentDelta;
 use std::pin::Pin;
 
 /// Events emitted during one agent turn.

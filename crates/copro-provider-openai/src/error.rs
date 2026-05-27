@@ -1,5 +1,5 @@
 use async_openai::error::OpenAIError;
-use copro_core::error::Error;
+use copro_api::error::Error;
 
 pub(crate) fn map_openai_error(error: OpenAIError) -> Error {
     match error {

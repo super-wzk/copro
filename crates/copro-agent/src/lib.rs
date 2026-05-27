@@ -1,5 +1,5 @@
-pub use copro_core::async_trait;
-pub use copro_core::message::{ToolCall, ToolResult};
+pub use copro_api::async_trait;
+pub use copro_api::message::{ToolCall, ToolResult};
 
 pub mod runtime;
 

@@ -1,12 +1,12 @@
 use crate::event::{AgentEvent, AgentStream};
 use crate::hook::{AgentHook, ToolDecision};
 use crate::tools::ToolProvider;
-use copro_core::error::{Error, Result};
-use copro_core::message::{
+use copro_api::error::{Error, Result};
+use copro_api::message::{
     InputContent, Message, OutputContent, ToolCall, ToolResult, ToolResultStatus,
 };
-use copro_core::request::{GenerateRequest, GenerateRequestOptions};
-use copro_core::stream::{Model, ModelStream, OutputStreamEvent, OutputStreamState};
+use copro_api::request::{GenerateRequest, GenerateRequestOptions};
+use copro_api::stream::{Model, ModelStream, OutputStreamEvent, OutputStreamState};
 use futures_util::StreamExt;
 use std::sync::Arc;
 

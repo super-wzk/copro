@@ -174,10 +174,23 @@ name = "copro-agent"
 version = "0.1.0"
 dependencies = [
  "async-stream",
- "copro-core",
+ "copro-api",
  "futures-util",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "copro-api"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
  "tokio",
 ]
 
@@ -191,23 +204,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "copro-core"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures-util",
- "schemars",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
 name = "copro-derive"
 version = "0.1.0"
 dependencies = [
- "copro-core",
+ "copro-api",
  "futures-util",
  "proc-macro2",
  "quote",
@@ -224,7 +224,7 @@ dependencies = [
  "async-openai",
  "async-stream",
  "base64",
- "copro-core",
+ "copro-api",
  "copro-derive",
  "futures-util",
  "schemars",
@@ -237,7 +237,7 @@ name = "copro-tools"
 version = "0.1.0"
 dependencies = [
  "copro-agent",
- "copro-core",
+ "copro-api",
  "serde_json",
 ]
 
@@ -1365,7 +1365,7 @@ name = "simple-cli"
 version = "0.1.0"
 dependencies = [
  "copro-agent",
- "copro-core",
+ "copro-api",
  "copro-provider-openai",
  "copro-tools",
  "futures-util",

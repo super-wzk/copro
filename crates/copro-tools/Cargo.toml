@@ -5,5 +5,5 @@ edition.workspace = true
 
 [dependencies]
 copro-agent.workspace = true
-copro-core.workspace = true
+copro-api.workspace = true
 serde_json.workspace = true

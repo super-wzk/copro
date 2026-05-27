@@ -1,4 +1,4 @@
-use copro_core::tool::HostedToolSpec;
+use copro_api::tool::HostedToolSpec;
 use copro_derive::CoproHostedTool;
 use serde::{Deserialize, Serialize};
 

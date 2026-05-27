@@ -1,12 +1,12 @@
 use copro_agent::{Agent, AgentEvent, AgentHook, ToolProvider, async_trait};
-use copro_core::error::Result;
-use copro_core::message::{
+use copro_api::error::Result;
+use copro_api::message::{
     InputContent, Message, OutputContent, ToolCall, ToolResult, ToolResultStatus,
 };
-use copro_core::request::GenerateRequest;
-use copro_core::response::FinishReason;
-use copro_core::stream::{Model, ModelStream, OutputContentDelta, OutputStreamEvent};
-use copro_core::tool::{ErasedTool, ToolDefinition};
+use copro_api::request::GenerateRequest;
+use copro_api::response::FinishReason;
+use copro_api::stream::{Model, ModelStream, OutputContentDelta, OutputStreamEvent};
+use copro_api::tool::{ErasedTool, ToolDefinition};
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::sync::Arc;
@@ -177,7 +177,7 @@ impl ToolProvider for DoubleToolProvider {
         let output = AsyncDoubleTool
             .call_json(Value::Object(arguments))
             .await
-            .map_err(copro_core::error::Error::client)?;
+            .map_err(copro_api::error::Error::client)?;
         let text = serde_json::to_string(&output).unwrap_or_else(|_| format!("{output:?}"));
 
         Ok(ToolResult {

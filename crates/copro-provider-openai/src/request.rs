@@ -1,7 +1,7 @@
 use base64::Engine;
-use copro_core::error::{Error, Result};
-use copro_core::message::{ImageContent, InputContent, Message, OutputContent, ToolResultStatus};
-use copro_core::tool::{HostedToolSpec, ToolChoice, ToolDefinition};
+use copro_api::error::{Error, Result};
+use copro_api::message::{ImageContent, InputContent, Message, OutputContent, ToolResultStatus};
+use copro_api::tool::{HostedToolSpec, ToolChoice, ToolDefinition};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
@@ -10,7 +10,7 @@ use crate::config::{OpenAiResponsesModelConfig, OpenAiResponsesRequestOptions};
 pub(crate) fn build_response_body(
     model_id: &str,
     model_config: &OpenAiResponsesModelConfig,
-    request: copro_core::request::GenerateRequest,
+    request: copro_api::request::GenerateRequest,
 ) -> Result<Value> {
     let request_options = request.options.extra::<OpenAiResponsesRequestOptions>()?;
     let mut body = Map::new();
@@ -260,7 +260,7 @@ mod tests {
     use crate::config::{
         OpenAiImageGenerationTool, OpenAiResponsesModelConfig, OpenAiResponsesRequestOptions,
     };
-    use copro_core::{
+    use copro_api::{
         message::{InputContent, Message, ToolResult},
         request::GenerateRequestOptions,
         tool::{ToolChoice, ToolDefinition},
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn builds_basic_text_request() {
-        let request = copro_core::request::GenerateRequest {
+        let request = copro_api::request::GenerateRequest {
             messages: vec![Message::User(vec![InputContent::Text("hello".to_string())])],
             tools: Vec::new(),
             hosted_tools: Vec::new(),
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn builds_developer_message_request() {
-        let request = copro_core::request::GenerateRequest {
+        let request = copro_api::request::GenerateRequest {
             messages: vec![Message::Developer(vec![InputContent::Text(
                 "follow these instructions".to_string(),
             )])],
@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn builds_function_tools_and_choice() {
-        let request = copro_core::request::GenerateRequest {
+        let request = copro_api::request::GenerateRequest {
             messages: vec![Message::User(vec![InputContent::Text(
                 "weather".to_string(),
             )])],
@@ -368,7 +368,7 @@ mod tests {
             reasoning_summary: Some("auto".to_string()),
             extra_body: Map::from_iter([("metadata".to_string(), json!({"trace_id": "req_123"}))]),
         };
-        let request = copro_core::request::GenerateRequest {
+        let request = copro_api::request::GenerateRequest {
             messages: vec![Message::User(vec![InputContent::Text("hello".to_string())])],
             tools: Vec::new(),
             hosted_tools: Vec::new(),
@@ -396,7 +396,7 @@ mod tests {
             ]),
             ..OpenAiResponsesModelConfig::default()
         };
-        let request = copro_core::request::GenerateRequest {
+        let request = copro_api::request::GenerateRequest {
             messages: vec![Message::User(vec![InputContent::Text("hello".to_string())])],
             tools: Vec::new(),
             hosted_tools: Vec::new(),
@@ -430,7 +430,7 @@ mod tests {
                 ]),
             })
             .unwrap();
-        let request = copro_core::request::GenerateRequest {
+        let request = copro_api::request::GenerateRequest {
             messages: vec![Message::User(vec![InputContent::Text("hello".to_string())])],
             tools: Vec::new(),
             hosted_tools: Vec::new(),
@@ -446,7 +446,7 @@ mod tests {
 
     #[test]
     fn maps_hosted_response_tools() {
-        let request = copro_core::request::GenerateRequest {
+        let request = copro_api::request::GenerateRequest {
             messages: vec![Message::User(vec![InputContent::Text(
                 "draw a cat".to_string(),
             )])],

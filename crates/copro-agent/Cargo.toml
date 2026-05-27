@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-copro-core.workspace = true
+copro-api.workspace = true
 async-stream.workspace = true
 futures-util.workspace = true
 serde.workspace = true

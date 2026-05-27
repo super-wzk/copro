@@ -6,9 +6,9 @@ use crate::request::build_response_body;
 use crate::stream::OpenAiEventMapper;
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
-use copro_core::error::{Error, Result};
-use copro_core::request::GenerateRequest;
-use copro_core::stream::{Model, ModelStream};
+use copro_api::error::{Error, Result};
+use copro_api::request::GenerateRequest;
+use copro_api::stream::{Model, ModelStream};
 use futures_util::StreamExt;
 use serde_json::Value;
 

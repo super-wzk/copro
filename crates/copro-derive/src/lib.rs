@@ -4,7 +4,7 @@ use syn::{
     Attribute, Data, DeriveInput, Error, LitStr, Path, Result, Type, parse_macro_input, parse_quote,
 };
 
-/// Derives `TryInto<copro_core::tool::HostedToolSpec>` for a hosted tool parameter type.
+/// Derives `TryInto<copro_api::tool::HostedToolSpec>` for a hosted tool parameter type.
 ///
 /// Required attributes:
 ///
@@ -65,7 +65,7 @@ fn expand_hosted_tool(input: DeriveInput) -> Result<proc_macro2::TokenStream> {
 fn parse_hosted_tool_args(attrs: &[Attribute], span: proc_macro2::Span) -> Result<HostedToolArgs> {
     let mut saw_hosted_tool_attr = false;
     let mut kind = None;
-    let mut core_crate = parse_quote!(::copro_core);
+    let mut core_crate = parse_quote!(::copro_api);
     let mut core_crate_set = false;
 
     for attr in attrs

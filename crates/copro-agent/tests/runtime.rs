@@ -1,6 +1,6 @@
 use copro_agent::runtime::{RequestDeadline, RuntimeOptions};
-use copro_core::error::{Error, Result};
-use copro_core::stream::{ModelStream, OutputStreamEvent};
+use copro_api::error::{Error, Result};
+use copro_api::stream::{ModelStream, OutputStreamEvent};
 use std::time::Duration;
 
 #[tokio::test(start_paused = true)]

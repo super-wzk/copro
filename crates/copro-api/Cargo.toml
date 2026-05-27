@@ -1,5 +1,5 @@
 [package]
-name = "copro-core"
+name = "copro-api"
 version.workspace = true
 edition.workspace = true
 

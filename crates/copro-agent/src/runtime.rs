@@ -1,5 +1,5 @@
-use copro_core::error::{Error, Result};
-use copro_core::stream::{ModelStream, OutputStreamEvent};
+use copro_api::error::{Error, Result};
+use copro_api::stream::{ModelStream, OutputStreamEvent};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::future::Future;

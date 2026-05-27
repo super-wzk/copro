@@ -1,6 +1,6 @@
 use copro_agent::{Agent, AgentEvent};
-use copro_core::message::{InputContent, Message, OutputContent, ToolResultStatus};
-use copro_core::stream::OutputContentDelta;
+use copro_api::message::{InputContent, Message, OutputContent, ToolResultStatus};
+use copro_api::stream::OutputContentDelta;
 use copro_provider_openai::{
     OpenAiResponsesModelConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
 };

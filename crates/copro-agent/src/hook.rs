@@ -1,7 +1,7 @@
-use copro_core::async_trait;
-use copro_core::error::Result;
-use copro_core::message::{OutputContent, ToolCall, ToolResult};
-use copro_core::request::GenerateRequest;
+use copro_api::async_trait;
+use copro_api::error::Result;
+use copro_api::message::{OutputContent, ToolCall, ToolResult};
+use copro_api::request::GenerateRequest;
 
 /// Hook points that can inspect or modify agent execution.
 #[async_trait]

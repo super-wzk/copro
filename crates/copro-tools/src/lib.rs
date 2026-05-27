@@ -1,7 +1,7 @@
 use copro_agent::{ToolProvider, async_trait};
-use copro_core::error::Result;
-use copro_core::message::{InputContent, ToolCall, ToolResult, ToolResultStatus};
-use copro_core::tool::{ErasedTool, ToolDefinition};
+use copro_api::error::Result;
+use copro_api::message::{InputContent, ToolCall, ToolResult, ToolResultStatus};
+use copro_api::tool::{ErasedTool, ToolDefinition};
 use serde_json::Value;
 use std::sync::Arc;
 
