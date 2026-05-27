@@ -10,8 +10,6 @@ use std::env;
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use copro_core::tool::ErasedTool;
-
 mod tools;
 use tools::{Calculator, DateTimeTool};
 
@@ -38,7 +36,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     registry.register_provider(provider);
     registry.register_model(model);
 
-    let mut agent = Agent::new(registry);
+    let chat = registry.chat("gpt-5.5")?;
+    let mut agent = Agent::new(chat);
     agent.tools = vec![Arc::new(Calculator), Arc::new(DateTimeTool)];
 
     agent.messages.push(Message::System {
@@ -74,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             content: vec![text(&input)],
         });
 
-        let mut stream = agent.run_stream("gpt-5.5");
+        let mut stream = agent.run_stream();
         let mut started_assistant = false;
         let mut streaming_thinking = false;
 

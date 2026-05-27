@@ -1,13 +1,11 @@
 use copro_agent::{Agent, AgentEvent, AgentHook};
 use copro_core::error::Result;
 use copro_core::message::{InputContent, Message, OutputContent};
-use copro_core::model::ModelDefinition;
-use copro_core::provider::{Chat, Provider, ProviderRegistry};
+use copro_core::provider::Chat;
 use copro_core::request::GenerateRequest;
 use copro_core::response::FinishReason;
 use copro_core::stream::{ModelStream, OutputContentDelta, OutputStreamEvent};
 use futures_util::StreamExt;
-use serde_json::Value;
 use std::sync::Arc;
 
 #[tokio::test]
@@ -31,7 +29,7 @@ async fn run_stream_commits_assistant_message() {
     }];
 
     let events = agent
-        .run_stream("test-model")
+        .run_stream()
         .collect::<Vec<_>>()
         .await
         .into_iter()
@@ -91,7 +89,7 @@ async fn on_output_finished_hook_can_modify_output() {
     agent.hooks.push(Arc::new(RedactHook));
 
     let events = agent
-        .run_stream("test-model")
+        .run_stream()
         .collect::<Vec<_>>()
         .await
         .into_iter()
@@ -124,10 +122,7 @@ async fn on_output_finished_hook_can_modify_output() {
 }
 
 fn test_agent(events: Vec<OutputStreamEvent>) -> Agent {
-    let mut registry = ProviderRegistry::new();
-    registry.register_provider(TestProvider { events });
-    registry.register_model(ModelDefinition::new("test", "test-model"));
-    Agent::new(registry)
+    Agent::new(Arc::new(TestChat { events }))
 }
 
 struct RedactHook;
@@ -140,22 +135,6 @@ impl AgentHook for RedactHook {
             }];
         }
         Ok(())
-    }
-}
-
-struct TestProvider {
-    events: Vec<OutputStreamEvent>,
-}
-
-impl Provider for TestProvider {
-    fn id(&self) -> &str {
-        "test"
-    }
-
-    fn chat(&self, _id: &str, _config: Value) -> Result<Arc<dyn Chat>> {
-        Ok(Arc::new(TestChat {
-            events: self.events.clone(),
-        }))
     }
 }
 

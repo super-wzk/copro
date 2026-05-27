@@ -2,7 +2,7 @@ use crate::event::{AgentEvent, AgentStream};
 use crate::hook::{AgentHook, ToolDecision, ToolExecuteContext, ToolResultContext};
 use copro_core::error::{Error, Result};
 use copro_core::message::{InputContent, Message, OutputContent, ToolResultStatus};
-use copro_core::provider::ProviderRegistry;
+use copro_core::provider::{Chat, ProviderRegistry};
 use copro_core::request::{GenerateRequest, GenerateRequestOptions};
 use copro_core::stream::{OutputStreamEvent, OutputStreamState};
 use copro_core::tool::{ErasedTool, ToolDefinition};
@@ -10,9 +10,9 @@ use futures_util::StreamExt;
 use serde_json::{Map, Value};
 use std::sync::Arc;
 
-/// Conversational agent that holds providers, tools, hooks, and conversation state.
+/// Conversational agent bound to one chat model with tools, hooks, and conversation state.
 pub struct Agent {
-    pub registry: ProviderRegistry,
+    pub chat: Arc<dyn Chat>,
     pub tools: Vec<Arc<dyn ErasedTool>>,
     pub hooks: Vec<Arc<dyn AgentHook>>,
     pub max_tool_rounds: usize,
@@ -20,9 +20,9 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(registry: ProviderRegistry) -> Self {
+    pub fn new(chat: Arc<dyn Chat>) -> Self {
         Self {
-            registry,
+            chat,
             tools: Vec::new(),
             hooks: Vec::new(),
             max_tool_rounds: 10,
@@ -30,14 +30,19 @@ impl Agent {
         }
     }
 
-    /// Run one streaming turn against `model_id` using this agent's conversation state.
+    /// Convenience constructor that resolves a chat model from a registry.
+    pub fn from_registry(registry: &ProviderRegistry, model_id: &str) -> Result<Self> {
+        Ok(Self::new(registry.chat(model_id)?))
+    }
+
+    /// Run one streaming turn using this agent's bound chat model and conversation state.
     ///
     /// Model content is streamed as [`AgentEvent::OutputDelta`] events.
     /// Completed model outputs and tool results are yielded when they are
     /// committed to state. The final event is always [`AgentEvent::TurnFinish`].
-    pub fn run_stream<'a>(&'a mut self, model_id: &'a str) -> AgentStream<'a> {
+    pub fn run_stream(&mut self) -> AgentStream<'_> {
         Box::pin(async_stream::try_stream! {
-            let chat = self.registry.chat(model_id)?;
+            let chat = Arc::clone(&self.chat);
             let mut done = false;
 
             for _round in 0..self.max_tool_rounds {
