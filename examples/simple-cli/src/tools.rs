@@ -1,3 +1,4 @@
+use copro_agent::CancellationToken;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -9,7 +10,7 @@ pub struct CalculatorInput {
     pub expression: String,
 }
 
-pub async fn calculator(input: CalculatorInput) -> Result<f64, String> {
+pub async fn calculator(input: CalculatorInput, _cancel: CancellationToken) -> Result<f64, String> {
     evaluate_expression(&input.expression).map_err(|e| e.to_string())
 }
 
@@ -153,7 +154,7 @@ pub struct DateTimeInput {
     pub timezone_offset: i32,
 }
 
-pub async fn datetime(input: DateTimeInput) -> Result<String, String> {
+pub async fn datetime(input: DateTimeInput, _cancel: CancellationToken) -> Result<String, String> {
     let now = std::time::SystemTime::now();
     let total_secs = now
         .duration_since(std::time::UNIX_EPOCH)

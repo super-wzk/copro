@@ -3,9 +3,9 @@ use copro_api::async_trait;
 use copro_api::error::Result;
 use copro_api::message::{InputContent, ToolCall, ToolResult, ToolResultStatus};
 use copro_api::tool::ToolDefinition;
+use copro_harness::tool;
 use copro_harness::tools::{
-    CompositeToolRouter, ErasedTool, FnTool, LocalToolRouter, ToolExecutionPolicy, tool_fn,
-    tool_fn_with_execution_policy,
+    CompositeToolRouter, ErasedTool, FnTool, LocalToolRouter, ToolExecutionPolicy,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 #[tokio::test]
 async fn fn_tool_wraps_async_functions() {
-    let router = LocalToolRouter::new(vec![tool_fn("echo", "Echo a message.", echo)]);
+    let router = LocalToolRouter::new(vec![tool!("echo", "Echo a message.", echo)]);
 
     let definitions = router.definitions().await.unwrap();
     assert_eq!(definitions.len(), 1);
@@ -56,10 +56,12 @@ async fn fn_tool_can_be_used_directly() {
 
 #[tokio::test]
 async fn fn_tool_wraps_async_closures() {
-    let router = LocalToolRouter::new(vec![tool_fn(
+    let router = LocalToolRouter::new(vec![tool!(
         "length",
         "Return the message length.",
-        |input: EchoInput| async move { Ok::<_, String>(input.message.len()) },
+        |input: EchoInput, _cancel: CancellationToken| async move {
+            Ok::<_, String>(input.message.len())
+        },
     )]);
 
     let result = router
@@ -80,11 +82,11 @@ async fn fn_tool_wraps_async_closures() {
 
 #[tokio::test]
 async fn local_tool_router_reports_tool_execution_policy() {
-    let router = LocalToolRouter::new(vec![tool_fn_with_execution_policy(
+    let router = LocalToolRouter::new(vec![tool!(
         "echo",
         "Echo a message.",
-        ToolExecutionPolicy::Parallel,
         echo,
+        policy = ToolExecutionPolicy::Parallel,
     )]);
 
     assert_eq!(
@@ -102,7 +104,7 @@ struct EchoInput {
     message: String,
 }
 
-async fn echo(input: EchoInput) -> std::result::Result<String, String> {
+async fn echo(input: EchoInput, _cancel: CancellationToken) -> std::result::Result<String, String> {
     Ok(format!("echo: {}", input.message))
 }
 
