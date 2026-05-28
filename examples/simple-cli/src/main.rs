@@ -1,7 +1,8 @@
-use copro_agent::{Agent, AgentEvent};
+use copro_agent::{Agent, AgentEvent, ToolRouter};
 use copro_api::message::{InputContent, Message, OutputContent, ToolResultStatus};
 use copro_api::stream::OutputContentDelta;
 use copro_harness::LocalToolRouter;
+use copro_harness::skills::{SkillHook, SkillRuntime, SkillToolRouter};
 use copro_provider_openai::{
     OpenAiResponsesModelConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
 };
@@ -10,7 +11,12 @@ use std::env;
 use std::io::{self, Write};
 use std::sync::Arc;
 
+mod router;
+mod skills;
 mod tools;
+
+use router::CompositeToolRouter;
+use skills::ExampleSkillStore;
 use tools::{Calculator, DateTimeTool};
 
 const SYSTEM_PROMPT: &str = "You are a helpful assistant. Answer concisely.";
@@ -32,8 +38,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..OpenAiResponsesModelConfig::default()
         },
     )?;
-    let tool_router = LocalToolRouter::new(vec![Arc::new(Calculator), Arc::new(DateTimeTool)]);
+    let local_tools: Arc<dyn ToolRouter> = Arc::new(LocalToolRouter::new(vec![
+        Arc::new(Calculator),
+        Arc::new(DateTimeTool),
+    ]));
+    let skill_runtime = Arc::new(SkillRuntime::new(Arc::new(ExampleSkillStore::new(
+        env::current_dir()?.join("examples/simple-cli/skills"),
+    ))));
+    let skill_tools: Arc<dyn ToolRouter> =
+        Arc::new(SkillToolRouter::new(Arc::clone(&skill_runtime)));
+    let tool_router = CompositeToolRouter::new(vec![local_tools, skill_tools]);
     let mut agent = Agent::new(model, Arc::new(tool_router));
+    agent.hooks.push(Arc::new(SkillHook::new(skill_runtime)));
 
     agent
         .messages
