@@ -2,7 +2,7 @@ use copro_agent::{Agent, AgentEvent, ToolRouter};
 use copro_api::message::{InputContent, Message, OutputContent, ToolResultStatus};
 use copro_api::stream::OutputContentDelta;
 use copro_harness::skills::{SkillHook, SkillRuntime, SkillToolRouter};
-use copro_harness::{CompositeToolRouter, LocalToolRouter, tool_fn};
+use copro_harness::tools::{CompositeToolRouter, LocalToolRouter, tool_fn};
 use copro_provider_openai::{
     OpenAiResponsesModelConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
 };

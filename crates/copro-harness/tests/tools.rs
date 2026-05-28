@@ -3,7 +3,7 @@ use copro_api::async_trait;
 use copro_api::error::Result;
 use copro_api::message::{InputContent, ToolCall, ToolResult, ToolResultStatus};
 use copro_api::tool::ToolDefinition;
-use copro_harness::{CompositeToolRouter, ErasedTool, FnTool, LocalToolRouter, tool_fn};
+use copro_harness::tools::{CompositeToolRouter, ErasedTool, FnTool, LocalToolRouter, tool_fn};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
