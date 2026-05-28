@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 pub(crate) const LOAD_SKILL_TOOL_NAME: &str = "load_skill";
 
-const LOAD_SKILL_TOOL_DESCRIPTION: &str = "Load the full instructions for an available Agent Skill by name. Use this before applying a skill whose summary matches the current task.";
+const LOAD_SKILL_TOOL_DESCRIPTION: &str = "Load full skill instructions by exact skill name.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 struct LoadSkillInput {

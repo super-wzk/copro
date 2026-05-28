@@ -30,15 +30,11 @@ pub(crate) fn format_skill_document(skill: &SkillDocument) -> String {
 
     format!(
         "\
-Skill loaded. Follow these instructions for the current task.
-
-## Skill
+## Loaded Skill
 
 - Name: `{name}`
 - Description: {description}
-- Root: `{root}`
-
-Resolve relative file references in this skill against the root above. Do not auto-run scripts; use normal tools only when the instructions require it.
+- Root: `{root}` — resolve relative file references against this directory.
 
 --- SKILL.md ---
 {content}
