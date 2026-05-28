@@ -6,7 +6,7 @@ use copro_api::message::{
 use copro_api::request::GenerateRequest;
 use copro_api::response::FinishReason;
 use copro_api::stream::{Model, ModelStream, OutputContentDelta, OutputStreamEvent};
-use copro_api::tool::{ErasedTool, ToolDefinition};
+use copro_api::tool::ToolDefinition;
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::sync::Arc;
@@ -93,7 +93,7 @@ async fn before_output_commit_hook_can_modify_output() {
 }
 
 #[tokio::test]
-async fn run_stream_awaits_async_erased_tool() {
+async fn run_stream_awaits_async_tool_router() {
     let mut agent = Agent::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
@@ -174,39 +174,23 @@ impl ToolRouter for DoubleToolRouter {
             name,
             arguments,
         } = call;
-        let content = AsyncDoubleTool
-            .call_content(Value::Object(arguments))
-            .await
-            .map_err(copro_api::error::Error::client)?;
-
-        Ok(ToolResult {
-            call_id: id,
-            name,
-            status: ToolResultStatus::Success,
-            content,
-        })
-    }
-}
-
-struct AsyncDoubleTool;
-
-#[async_trait]
-impl ErasedTool for AsyncDoubleTool {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "double".to_string(),
-            description: "Double an integer.".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
-        }
-    }
-
-    async fn call_content(&self, args: Value) -> std::result::Result<Vec<InputContent>, String> {
         tokio::task::yield_now().await;
-        let value = args
-            .get("value")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| "missing value".to_string())?;
-        Ok(vec![InputContent::Text((value * 2).to_string())])
+        let result = match arguments.get("value").and_then(Value::as_i64) {
+            Some(value) => ToolResult {
+                call_id: id,
+                name,
+                status: ToolResultStatus::Success,
+                content: vec![InputContent::Text((value * 2).to_string())],
+            },
+            None => ToolResult {
+                call_id: id,
+                name,
+                status: ToolResultStatus::Error,
+                content: vec![InputContent::Text("missing value".to_string())],
+            },
+        };
+
+        Ok(result)
     }
 }
 

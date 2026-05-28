@@ -1,4 +1,5 @@
-use copro_api::{async_trait, tool::Tool};
+use copro_api::async_trait;
+use copro_harness::Tool;
 use schemars::JsonSchema;
 use serde::Deserialize;
 

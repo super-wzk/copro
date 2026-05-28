@@ -1,10 +1,11 @@
 use super::SkillRuntime;
 use super::format::format_skill_document;
+use crate::tools::{ErasedTool, Tool};
 use copro_agent::ToolRouter;
 use copro_api::async_trait;
 use copro_api::error::Result;
 use copro_api::message::{InputContent, ToolCall, ToolResult, ToolResultStatus};
-use copro_api::tool::{ErasedTool, Tool, ToolDefinition};
+use copro_api::tool::ToolDefinition;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::sync::Arc;

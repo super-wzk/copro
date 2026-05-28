@@ -2,4 +2,4 @@ pub mod skills;
 
 mod tools;
 
-pub use tools::LocalToolRouter;
+pub use tools::{ErasedTool, Json, LocalToolRouter, Tool, ToolOutput};
