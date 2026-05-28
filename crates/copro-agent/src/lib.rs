@@ -10,5 +10,6 @@ mod tools;
 
 pub use agent::Agent;
 pub use event::{AgentEvent, AgentStream};
-pub use hook::{AgentHook, ToolDecision};
+pub use hook::{AgentHook, AgentHooks, ToolCallDecision};
+pub use runtime::StopSignal;
 pub use tools::{ToolExecutionPolicy, ToolRouter};

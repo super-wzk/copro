@@ -1,5 +1,6 @@
 use crate::event::{AgentEvent, AgentStream};
-use crate::hook::{AgentHook, ToolDecision};
+use crate::hook::{AgentHooks, ToolCallDecision};
+use crate::runtime::StopSignal;
 use crate::tools::{ToolExecutionPolicy, ToolRouter};
 use copro_api::error::{Error, Result};
 use copro_api::message::{
@@ -14,8 +15,8 @@ use std::sync::Arc;
 pub struct Agent {
     pub model: Arc<dyn Model>,
     pub tools: Arc<dyn ToolRouter>,
-    pub hooks: Vec<Arc<dyn AgentHook>>,
-    pub max_tool_rounds: usize,
+    pub hooks: AgentHooks,
+    pub stop_signal: StopSignal,
     pub messages: Vec<Message>,
 }
 
@@ -24,8 +25,8 @@ impl Agent {
         Self {
             model,
             tools,
-            hooks: Vec::new(),
-            max_tool_rounds: 10,
+            hooks: AgentHooks::new(),
+            stop_signal: StopSignal::new(),
             messages: Vec::new(),
         }
     }
@@ -38,19 +39,22 @@ impl Agent {
     pub fn run_stream(&mut self) -> AgentStream<'_> {
         Box::pin(async_stream::try_stream! {
             let model = Arc::clone(&self.model);
+            self.hooks.before_turn(&mut self.messages).await?;
             let mut state = TurnState::ModelRequest;
-            let mut model_rounds = 0usize;
 
             loop {
+                if state.is_finished() {
+                    break;
+                }
+                if self.stop_signal.is_requested() {
+                    self.hooks.after_turn(&self.messages).await?;
+                    break;
+                }
+
                 state = match state {
                     TurnState::ModelRequest => {
-                        if model_rounds >= self.max_tool_rounds {
-                            Err(Error::client("max tool rounds exceeded"))?;
-                        }
-                        model_rounds += 1;
-
                         let mut request = self.build_request(self.messages.clone()).await?;
-                        self.apply_before_request(&mut request).await?;
+                        self.hooks.before_request(&mut request).await?;
                         TurnState::ModelStreaming {
                             stream: model.stream(request),
                             output_state: OutputStreamState::new(),
@@ -69,8 +73,9 @@ impl Agent {
                         match event {
                             OutputStreamEvent::Delta {
                                 content_index,
-                                delta,
+                                mut delta,
                             } => {
+                                self.hooks.before_output_delta(content_index, &mut delta).await?;
                                 yield AgentEvent::OutputDelta(delta.clone());
                                 output_state.apply(OutputStreamEvent::Delta {
                                     content_index,
@@ -90,17 +95,11 @@ impl Agent {
 
                                 let usage = response.usage.clone();
                                 let mut output_content = into_assistant_content(response.message)?;
-                                self.apply_before_output_commit(&mut output_content).await?;
+                                self.hooks.before_output_commit(&mut output_content).await?;
                                 self.messages.push(normalize_for_history(Message::Assistant(
                                     output_content.clone(),
                                 )));
-                                self.apply_after_output_commit(&output_content).await?;
-                                yield AgentEvent::OutputFinished {
-                                    content: output_content.clone(),
-                                    reason,
-                                    usage,
-                                };
-
+                                self.hooks.after_output_commit(&output_content).await?;
                                 let tool_calls = output_content
                                     .iter()
                                     .filter_map(|content| match content {
@@ -108,12 +107,20 @@ impl Agent {
                                         _ => None,
                                     })
                                     .collect::<Vec<_>>();
-
-                                if tool_calls.is_empty() {
+                                let next_state = if tool_calls.is_empty() {
+                                    self.hooks.after_turn(&self.messages).await?;
                                     TurnState::Finished
                                 } else {
                                     TurnState::ToolPlanning { tool_calls }
-                                }
+                                };
+
+                                yield AgentEvent::OutputFinished {
+                                    content: output_content.clone(),
+                                    reason,
+                                    usage,
+                                };
+
+                                next_state
                             }
                         }
                     }
@@ -126,13 +133,21 @@ impl Agent {
                         TurnState::ToolResultCommit { completed_tools }
                     }
                     TurnState::ToolResultCommit { completed_tools } => {
+                        let mut next_state = TurnState::ModelRequest;
                         for (tool, mut result) in completed_tools {
-                            self.apply_after_tool_call(&tool, &mut result).await?;
+                            if self.stop_signal.is_requested() {
+                                self.hooks.after_turn(&self.messages).await?;
+                                next_state = TurnState::Finished;
+                                break;
+                            }
+
+                            self.hooks.after_tool_call(&tool, &mut result).await?;
                             self.messages.push(Message::Tool(result.clone()));
+                            self.hooks.after_tool_result_commit(&tool, &result).await?;
                             yield AgentEvent::ToolResult(result);
                         }
 
-                        TurnState::ModelRequest
+                        next_state
                     }
                     TurnState::Finished => break,
                 };
@@ -154,15 +169,18 @@ impl Agent {
         &self,
         tool_calls: Vec<ToolCall>,
     ) -> Result<Vec<(ToolCall, ToolExecutionPolicy, Option<ToolResult>)>> {
+        let mut tool_calls = tool_calls;
+        self.hooks.before_tool_plan(&mut tool_calls).await?;
+
         let mut plan = Vec::new();
 
         for mut tool in tool_calls {
-            match self.apply_before_tool_call(&mut tool).await? {
-                ToolDecision::Allow => {
+            match self.hooks.before_tool_call(&mut tool).await? {
+                ToolCallDecision::Allow => {
                     let policy = self.tools.execution_policy(&tool).await?;
                     plan.push((tool, policy, None));
                 }
-                ToolDecision::Reject { reason } => {
+                ToolCallDecision::Reject { reason } => {
                     let result = rejected_tool_result(&tool, reason);
                     plan.push((tool, ToolExecutionPolicy::Serial, Some(result)));
                 }
@@ -215,44 +233,6 @@ impl Agent {
         }))
         .await
     }
-
-    async fn apply_before_request(&self, request: &mut GenerateRequest) -> Result<()> {
-        for hook in &self.hooks {
-            hook.before_request(request).await?;
-        }
-        Ok(())
-    }
-
-    async fn apply_before_tool_call(&self, tool: &mut ToolCall) -> Result<ToolDecision> {
-        for hook in &self.hooks {
-            match hook.before_tool_call(tool).await? {
-                ToolDecision::Allow => {}
-                decision => return Ok(decision),
-            }
-        }
-        Ok(ToolDecision::Allow)
-    }
-
-    async fn apply_after_tool_call(&self, tool: &ToolCall, result: &mut ToolResult) -> Result<()> {
-        for hook in &self.hooks {
-            hook.after_tool_call(tool, result).await?;
-        }
-        Ok(())
-    }
-
-    async fn apply_before_output_commit(&self, content: &mut Vec<OutputContent>) -> Result<()> {
-        for hook in &self.hooks {
-            hook.before_output_commit(content).await?;
-        }
-        Ok(())
-    }
-
-    async fn apply_after_output_commit(&self, content: &[OutputContent]) -> Result<()> {
-        for hook in &self.hooks {
-            hook.after_output_commit(content).await?;
-        }
-        Ok(())
-    }
 }
 
 fn rejected_tool_result(tool: &ToolCall, reason: String) -> ToolResult {
@@ -282,6 +262,12 @@ fn normalize_for_history(message: Message) -> Message {
                 .collect(),
         ),
         other => other,
+    }
+}
+
+impl<'a> TurnState<'a> {
+    fn is_finished(&self) -> bool {
+        matches!(self, Self::Finished)
     }
 }
 

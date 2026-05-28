@@ -3,12 +3,48 @@ use copro_api::stream::{ModelStream, OutputStreamEvent};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 use tokio::time::Instant;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeOptions {
     pub timeout: Option<Duration>,
+}
+
+/// Cloneable stop signal checked by agent runtimes at safe transition points.
+#[derive(Debug, Clone)]
+pub struct StopSignal {
+    requested: Arc<AtomicBool>,
+}
+
+impl StopSignal {
+    pub fn new() -> Self {
+        Self {
+            requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn request_stop(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+    }
+
+    pub fn clear(&self) {
+        self.requested.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for StopSignal {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]

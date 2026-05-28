@@ -94,6 +94,113 @@ async fn before_output_commit_hook_can_modify_output() {
 }
 
 #[tokio::test]
+async fn before_output_delta_hook_can_modify_stream_and_history() {
+    let mut agent = test_agent(vec![
+        OutputStreamEvent::Delta {
+            content_index: 0,
+            delta: OutputContentDelta::Text("secret".to_string()),
+        },
+        OutputStreamEvent::Finished {
+            reason: FinishReason::Stop,
+            usage: None,
+        },
+    ]);
+    agent.hooks.push(Arc::new(DeltaRedactHook));
+
+    let events = agent
+        .run_stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+
+    let redacted = vec![OutputContent::Text("redacted".to_string())];
+    assert_eq!(
+        events,
+        vec![
+            AgentEvent::OutputDelta(OutputContentDelta::Text("redacted".to_string())),
+            AgentEvent::OutputFinished {
+                content: redacted.clone(),
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ]
+    );
+    assert_eq!(agent.messages, vec![Message::Assistant(redacted)]);
+}
+
+#[tokio::test]
+async fn after_turn_hook_runs_before_final_event_is_yielded() {
+    let completed = Arc::new(AtomicUsize::new(0));
+    let mut agent = test_agent(vec![
+        OutputStreamEvent::Delta {
+            content_index: 0,
+            delta: OutputContentDelta::Text("done".to_string()),
+        },
+        OutputStreamEvent::Finished {
+            reason: FinishReason::Stop,
+            usage: None,
+        },
+    ]);
+    agent.hooks.push(Arc::new(TurnDoneHook {
+        completed: Arc::clone(&completed),
+    }));
+
+    let mut stream = agent.run_stream();
+    assert!(matches!(
+        stream.next().await.transpose().unwrap(),
+        Some(AgentEvent::OutputDelta(_))
+    ));
+    assert_eq!(completed.load(Ordering::SeqCst), 0);
+
+    assert!(matches!(
+        stream.next().await.transpose().unwrap(),
+        Some(AgentEvent::OutputFinished { .. })
+    ));
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn run_stream_stops_when_stop_signal_is_requested() {
+    let completed = Arc::new(AtomicUsize::new(0));
+    let mut agent = test_agent(vec![
+        OutputStreamEvent::Delta {
+            content_index: 0,
+            delta: OutputContentDelta::Text("first".to_string()),
+        },
+        OutputStreamEvent::Delta {
+            content_index: 0,
+            delta: OutputContentDelta::Text(" second".to_string()),
+        },
+        OutputStreamEvent::Finished {
+            reason: FinishReason::Stop,
+            usage: None,
+        },
+    ]);
+    agent.hooks.push(Arc::new(TurnDoneHook {
+        completed: Arc::clone(&completed),
+    }));
+    let stop_signal = agent.stop_signal.clone();
+
+    {
+        let mut stream = agent.run_stream();
+        assert_eq!(
+            stream.next().await.transpose().unwrap(),
+            Some(AgentEvent::OutputDelta(OutputContentDelta::Text(
+                "first".to_string()
+            )))
+        );
+
+        stop_signal.request_stop();
+        assert!(stream.next().await.is_none());
+    }
+
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
+    assert!(agent.messages.is_empty());
+}
+
+#[tokio::test]
 async fn run_stream_awaits_async_tool_router() {
     let mut agent = Agent::new(
         Arc::new(ToolThenDoneModel {
@@ -172,6 +279,32 @@ struct RedactHook;
 impl AgentHook for RedactHook {
     async fn before_output_commit(&self, content: &mut Vec<OutputContent>) -> Result<()> {
         *content = vec![OutputContent::Text("redacted".to_string())];
+        Ok(())
+    }
+}
+
+struct DeltaRedactHook;
+
+#[async_trait]
+impl AgentHook for DeltaRedactHook {
+    async fn before_output_delta(
+        &self,
+        _content_index: usize,
+        delta: &mut OutputContentDelta,
+    ) -> Result<()> {
+        *delta = OutputContentDelta::Text("redacted".to_string());
+        Ok(())
+    }
+}
+
+struct TurnDoneHook {
+    completed: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl AgentHook for TurnDoneHook {
+    async fn after_turn(&self, _messages: &[Message]) -> Result<()> {
+        self.completed.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }

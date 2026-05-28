@@ -1,7 +1,19 @@
-use copro_agent::runtime::{RequestDeadline, RuntimeOptions};
+use copro_agent::runtime::{RequestDeadline, RuntimeOptions, StopSignal};
 use copro_api::error::{Error, Result};
 use copro_api::stream::{ModelStream, OutputStreamEvent};
 use std::time::Duration;
+
+#[test]
+fn stop_signal_tracks_requested_state_across_clones() {
+    let signal = StopSignal::new();
+    let clone = signal.clone();
+
+    assert!(!signal.is_requested());
+    clone.request_stop();
+    assert!(signal.is_requested());
+    signal.clear();
+    assert!(!clone.is_requested());
+}
 
 #[tokio::test(start_paused = true)]
 async fn deadline_times_out_future() {
