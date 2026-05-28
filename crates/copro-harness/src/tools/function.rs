@@ -10,8 +10,62 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 type BoxToolFuture<Output> = Pin<Box<dyn Future<Output = Result<Output, String>> + Send>>;
-type FnToolHandler<Input, Output> = dyn Fn(Input) -> BoxToolFuture<Output> + Send + Sync;
+type FnToolHandler<Input, Output> =
+    dyn Fn(Input, CancellationToken) -> BoxToolFuture<Output> + Send + Sync;
 
+/// Builder for constructing an erased [`FnTool`] with optional configuration.
+///
+/// Created via [`ToolBuilder::new`] or the [`tool!`] macro.
+pub struct ToolBuilder<Input, Output, F, Fut> {
+    name: String,
+    description: String,
+    handler: F,
+    execution_policy: ToolExecutionPolicy,
+    _marker: PhantomData<(Input, Output, Fut)>,
+}
+
+impl<Input, Output, F, Fut> ToolBuilder<Input, Output, F, Fut>
+where
+    Input: DeserializeOwned + JsonSchema + Send + 'static,
+    Output: ToolOutput + Send + 'static,
+    F: Fn(Input, CancellationToken) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Output, String>> + Send + 'static,
+{
+    pub fn new(name: impl Into<String>, description: impl Into<String>, handler: F) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            handler,
+            execution_policy: ToolExecutionPolicy::Serial,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Set the execution policy for this tool.
+    pub fn policy(mut self, execution_policy: ToolExecutionPolicy) -> Self {
+        self.execution_policy = execution_policy;
+        self
+    }
+
+    /// Build the tool, returning an erased reference.
+    pub fn build(self) -> Arc<dyn ErasedTool> {
+        let handler = Arc::new(
+            move |input: Input, cancel: CancellationToken| -> BoxToolFuture<Output> {
+                Box::pin((self.handler)(input, cancel))
+            },
+        );
+        Arc::new(FnTool {
+            name: self.name,
+            description: self.description,
+            execution_policy: self.execution_policy,
+            handler,
+            _marker: PhantomData,
+        })
+    }
+}
+
+/// Create a [`ToolBuilder`] with the minimal required fields.
+///
 /// Tool implementation backed by an async function or closure.
 pub struct FnTool<Input, Output> {
     name: String,
@@ -26,11 +80,14 @@ impl<Input, Output> FnTool<Input, Output> {
     where
         Input: 'static,
         Output: 'static,
-        F: Fn(Input) -> Fut + Send + Sync + 'static,
+        F: Fn(Input, CancellationToken) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Output, String>> + Send + 'static,
     {
-        let handler =
-            Arc::new(move |input: Input| -> BoxToolFuture<Output> { Box::pin(handler(input)) });
+        let handler = Arc::new(
+            move |input: Input, cancel: CancellationToken| -> BoxToolFuture<Output> {
+                Box::pin(handler(input, cancel))
+            },
+        );
 
         Self {
             name: name.into(),
@@ -83,42 +140,32 @@ where
     async fn call(
         &self,
         input: Self::Input,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<Self::Output, String> {
-        (self.handler)(input).await
+        (self.handler)(input, cancel).await
     }
 }
 
 /// Create an erased [`FnTool`] from an async function or closure.
-pub fn tool_fn<Input, Output, F, Fut>(
-    name: impl Into<String>,
-    description: impl Into<String>,
-    handler: F,
-) -> Arc<dyn ErasedTool>
-where
-    Input: DeserializeOwned + JsonSchema + Send + 'static,
-    Output: ToolOutput + Send + 'static,
-    F: Fn(Input) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Output, String>> + Send + 'static,
-{
-    tool_fn_with_execution_policy(name, description, ToolExecutionPolicy::Serial, handler)
-}
-
-/// Create an erased [`FnTool`] with an explicit execution policy.
-pub fn tool_fn_with_execution_policy<Input, Output, F, Fut>(
-    name: impl Into<String>,
-    description: impl Into<String>,
-    execution_policy: ToolExecutionPolicy,
-    handler: F,
-) -> Arc<dyn ErasedTool>
-where
-    Input: DeserializeOwned + JsonSchema + Send + 'static,
-    Output: ToolOutput + Send + 'static,
-    F: Fn(Input) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Output, String>> + Send + 'static,
-{
-    Arc::new(
-        FnTool::<Input, Output>::new(name, description, handler)
-            .with_execution_policy(execution_policy),
-    )
+///
+/// ```ignore
+/// // Builder API (full IDE support):
+/// ToolBuilder::new("echo", "Echo a message.", echo)
+///     .policy(ToolExecutionPolicy::Parallel)
+///     .build()
+///
+/// // Macro shorthand:
+/// tool!("echo", "Echo a message.", echo);
+/// tool!("echo", "Echo a message.", echo, policy = ToolExecutionPolicy::Parallel);
+/// ```
+#[macro_export]
+macro_rules! tool {
+    ($name:expr, $desc:expr, $handler:expr) => {
+        $crate::tools::ToolBuilder::new($name, $desc, $handler).build()
+    };
+    ($name:expr, $desc:expr, $handler:expr, $($key:ident = $value:expr),* $(,)?) => {
+        $crate::tools::ToolBuilder::new($name, $desc, $handler)
+            $( .$key($value) )*
+            .build()
+    };
 }

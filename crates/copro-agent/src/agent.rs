@@ -8,9 +8,11 @@ use copro_api::message::{
 };
 use copro_api::request::{GenerateRequest, GenerateRequestOptions};
 use copro_api::stream::{Model, ModelStream, OutputStreamEvent, OutputStreamState};
-use futures_util::{StreamExt, future::try_join_all};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 /// Conversational agent bound to one model with tools, hooks, and conversation state.
 pub struct Agent {
@@ -263,12 +265,35 @@ impl Agent {
         let tools = Arc::clone(&self.tools);
         let cancel = self.stop_signal.token();
         let calls = std::mem::take(batch);
-        try_join_all(calls.into_iter().map(|tool| {
-            let tools = Arc::clone(&tools);
-            let cancel = cancel.child_token();
-            async move { Self::execute_tool_call_with_router(tools, tool, cancel).await }
-        }))
-        .await
+        let mut futures: FuturesUnordered<_> = calls
+            .into_iter()
+            .map(|tool| {
+                let tools = Arc::clone(&tools);
+                let cancel = cancel.child_token();
+                async move { Self::execute_tool_call_with_router(tools, tool, cancel).await }
+            })
+            .collect();
+
+        let mut completed = Vec::new();
+        loop {
+            if futures.is_empty() {
+                break;
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    while let Some(result) = futures.next().await {
+                        completed.push(result?);
+                    }
+                    break;
+                }
+                result = futures.next() => {
+                    if let Some(result) = result {
+                        completed.push(result?);
+                    }
+                }
+            }
+        }
+        Ok(completed)
     }
 
     async fn execute_tool_call_with_router(
@@ -277,11 +302,38 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<(ToolCall, ToolResult)> {
         let tool_cancel = cancel.child_token();
-        let mut execution = Box::pin(tools.execute(tool.clone(), tool_cancel));
+        let tool_for_abort = tool.clone();
+        let mut handle = AbortOnDropHandle::new(tokio::spawn(async move {
+            tools.execute(tool, tool_cancel).await
+        }));
         tokio::select! {
             biased;
-            result = &mut execution => Ok((tool, result?)),
-            _ = cancel.cancelled() => Ok((tool.clone(), aborted_tool_result(&tool))),
+            result = &mut handle => {
+                match result {
+                    Ok(Ok(result)) => Ok((tool_for_abort, result)),
+                    Ok(Err(error)) => Err(error),
+                    Err(join_error) if join_error.is_cancelled() => {
+                        Ok((tool_for_abort.clone(), aborted_tool_result(&tool_for_abort)))
+                    }
+                    Err(join_error) => Err(Error::client(format!("tool task panicked: {join_error}"))),
+                }
+            }
+            _ = cancel.cancelled() => {
+                tokio::select! {
+                    biased;
+                    result = &mut handle => {
+                        match result {
+                            Ok(Ok(result)) => Ok((tool_for_abort, result)),
+                            Ok(Err(error)) => Err(error),
+                            Err(_) => Ok((tool_for_abort.clone(), aborted_tool_result(&tool_for_abort))),
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        handle.abort();
+                        Ok((tool_for_abort.clone(), aborted_tool_result(&tool_for_abort)))
+                    }
+                }
+            }
         }
     }
 }
