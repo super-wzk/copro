@@ -1,8 +1,8 @@
 use copro_agent::{Agent, AgentEvent, ToolRouter};
 use copro_api::message::{InputContent, Message, OutputContent, ToolResultStatus};
 use copro_api::stream::OutputContentDelta;
-use copro_harness::LocalToolRouter;
 use copro_harness::skills::{SkillHook, SkillRuntime, SkillToolRouter};
+use copro_harness::{CompositeToolRouter, LocalToolRouter};
 use copro_provider_openai::{
     OpenAiResponsesModelConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
 };
@@ -11,11 +11,9 @@ use std::env;
 use std::io::{self, Write};
 use std::sync::Arc;
 
-mod router;
 mod skills;
 mod tools;
 
-use router::CompositeToolRouter;
 use skills::ExampleSkillStore;
 use tools::{Calculator, DateTimeTool};
 

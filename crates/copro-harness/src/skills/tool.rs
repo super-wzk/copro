@@ -57,7 +57,7 @@ impl Tool for LoadSkillTool {
 ///
 /// This router intentionally exposes and handles only skill-related tools. It
 /// does not wrap, proxy, or compose unrelated tool routers; callers that need
-/// multiple routers should compose them outside this crate.
+/// multiple routers can compose them with [`crate::CompositeToolRouter`].
 #[derive(Clone)]
 pub struct SkillToolRouter {
     load_skill: LoadSkillTool,
