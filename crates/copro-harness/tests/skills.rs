@@ -1,7 +1,9 @@
 use copro_agent::{AgentHook, ToolRouter};
 use copro_api::async_trait;
 use copro_api::error::{Error, Result};
-use copro_api::message::{InputContent, Message, ToolCall, ToolResult, ToolResultStatus};
+use copro_api::message::{
+    InputContent, Message, OutputContent, ToolCall, ToolResult, ToolResultStatus,
+};
 use copro_api::request::{GenerateRequest, GenerateRequestOptions};
 use copro_harness::skills::{
     SkillDocument, SkillHook, SkillRuntime, SkillStore, SkillSummary, SkillToolRouter,
@@ -33,6 +35,73 @@ async fn hook_injects_available_skills_after_initial_instructions() {
         Some(Message::Developer(_))
     ));
     assert!(matches!(request.messages.get(2), Some(Message::User(_))));
+}
+
+#[tokio::test]
+async fn hook_prunes_loaded_skill_context_from_previous_turns() {
+    let runtime = runtime_with(vec![skill("test-skill", "Use for testing.")]);
+    let hook = SkillHook::new(runtime);
+    let mut request = GenerateRequest {
+        messages: vec![
+            Message::System(vec![InputContent::Text("system".to_string())]),
+            Message::User(vec![InputContent::Text("old request".to_string())]),
+            Message::Assistant(vec![OutputContent::ToolCall(load_skill_call(
+                "load_skill",
+                "test-skill",
+            ))]),
+            load_skill_result(),
+            Message::Assistant(vec![OutputContent::Text("done".to_string())]),
+            Message::User(vec![InputContent::Text("new request".to_string())]),
+        ],
+        tools: Vec::new(),
+        tool_choice: None,
+        hosted_tools: Vec::new(),
+        options: GenerateRequestOptions::default(),
+    };
+
+    hook.before_request(&mut request).await.unwrap();
+
+    assert_eq!(request.messages.len(), 5);
+    assert!(matches!(request.messages.first(), Some(Message::System(_))));
+    assert!(matches!(
+        request.messages.get(1),
+        Some(Message::Developer(_))
+    ));
+    assert!(matches!(request.messages.get(2), Some(Message::User(_))));
+    assert!(matches!(
+        request.messages.get(3),
+        Some(Message::Assistant(content))
+            if matches!(content.first(), Some(OutputContent::Text(text)) if text == "done")
+    ));
+    assert!(matches!(request.messages.get(4), Some(Message::User(_))));
+    assert!(!has_load_skill_tool_call(&request.messages));
+    assert!(!has_load_skill_result(&request.messages));
+}
+
+#[tokio::test]
+async fn hook_keeps_loaded_skill_context_in_current_turn() {
+    let runtime = runtime_with(vec![skill("test-skill", "Use for testing.")]);
+    let hook = SkillHook::new(runtime);
+    let mut request = GenerateRequest {
+        messages: vec![
+            Message::System(vec![InputContent::Text("system".to_string())]),
+            Message::User(vec![InputContent::Text("current request".to_string())]),
+            Message::Assistant(vec![OutputContent::ToolCall(load_skill_call(
+                "load_skill",
+                "test-skill",
+            ))]),
+            load_skill_result(),
+        ],
+        tools: Vec::new(),
+        tool_choice: None,
+        hosted_tools: Vec::new(),
+        options: GenerateRequestOptions::default(),
+    };
+
+    hook.before_request(&mut request).await.unwrap();
+
+    assert!(has_load_skill_tool_call(&request.messages));
+    assert!(has_load_skill_result(&request.messages));
 }
 
 #[tokio::test]
@@ -115,6 +184,36 @@ fn load_skill_call(tool_name: &str, skill_name: &str) -> ToolCall {
             Value::String(skill_name.to_string()),
         )]),
     }
+}
+
+fn load_skill_result() -> Message {
+    Message::Tool(ToolResult {
+        call_id: "call-1".to_string(),
+        name: "load_skill".to_string(),
+        status: ToolResultStatus::Success,
+        content: vec![InputContent::Text("full skill".to_string())],
+    })
+}
+
+fn has_load_skill_tool_call(messages: &[Message]) -> bool {
+    messages.iter().any(|message| match message {
+        Message::Assistant(content) => content.iter().any(|item| {
+            matches!(
+                item,
+                OutputContent::ToolCall(tool_call) if tool_call.name == "load_skill"
+            )
+        }),
+        _ => false,
+    })
+}
+
+fn has_load_skill_result(messages: &[Message]) -> bool {
+    messages.iter().any(|message| {
+        matches!(
+            message,
+            Message::Tool(result) if result.name == "load_skill"
+        )
+    })
 }
 
 fn tool_text(result: &ToolResult) -> &str {

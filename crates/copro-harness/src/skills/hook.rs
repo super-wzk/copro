@@ -1,8 +1,9 @@
 use super::SkillRuntime;
+use super::tool::LOAD_SKILL_TOOL_NAME;
 use copro_agent::AgentHook;
 use copro_api::async_trait;
 use copro_api::error::Result;
-use copro_api::message::{InputContent, Message};
+use copro_api::message::{InputContent, Message, OutputContent};
 use copro_api::request::GenerateRequest;
 use std::sync::Arc;
 
@@ -21,6 +22,8 @@ impl SkillHook {
 #[async_trait]
 impl AgentHook for SkillHook {
     async fn before_request(&self, request: &mut GenerateRequest) -> Result<()> {
+        prune_stale_skill_loads(&mut request.messages);
+
         if let Some(prompt) = self.runtime.available_skills_prompt().await? {
             let insertion_index = request
                 .messages
@@ -34,4 +37,44 @@ impl AgentHook for SkillHook {
         }
         Ok(())
     }
+}
+
+/// Remove loaded skill instructions from previous user turns before sending the
+/// next model request.
+///
+/// The current turn must keep its `load_skill` call/result pair so the model can
+/// consume the loaded instructions. Once a later user message exists, the old
+/// pair is just historical scaffolding and can be omitted from context.
+fn prune_stale_skill_loads(messages: &mut Vec<Message>) {
+    let Some(last_user_index) = messages
+        .iter()
+        .rposition(|message| matches!(message, Message::User(_)))
+    else {
+        return;
+    };
+
+    let mut original_index = 0usize;
+    messages.retain_mut(|message| {
+        let stale = original_index < last_user_index;
+        original_index += 1;
+
+        if !stale {
+            return true;
+        }
+
+        match message {
+            Message::Assistant(content) => {
+                content.retain(|item| {
+                    !matches!(
+                        item,
+                        OutputContent::ToolCall(tool_call)
+                            if tool_call.name == LOAD_SKILL_TOOL_NAME
+                    )
+                });
+                !content.is_empty()
+            }
+            Message::Tool(result) if result.name == LOAD_SKILL_TOOL_NAME => false,
+            _ => true,
+        }
+    });
 }

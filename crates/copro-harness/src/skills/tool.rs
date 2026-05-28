@@ -10,7 +10,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use std::sync::Arc;
 
-const LOAD_SKILL_TOOL_NAME: &str = "load_skill";
+pub(crate) const LOAD_SKILL_TOOL_NAME: &str = "load_skill";
 
 const LOAD_SKILL_TOOL_DESCRIPTION: &str = "Load the full instructions for an available Agent Skill by name. Use this before applying a skill whose summary matches the current task.";
 
