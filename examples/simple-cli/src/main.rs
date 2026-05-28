@@ -1,8 +1,8 @@
-use copro_agent::{Agent, AgentEvent, ToolRouter};
+use copro_agent::{Agent, AgentEvent, ToolExecutionPolicy, ToolRouter};
 use copro_api::message::{InputContent, Message, OutputContent, ToolResultStatus};
 use copro_api::stream::OutputContentDelta;
 use copro_harness::skills::{SkillHook, SkillRuntime, SkillToolRouter};
-use copro_harness::tools::{CompositeToolRouter, LocalToolRouter, tool_fn};
+use copro_harness::tools::{CompositeToolRouter, LocalToolRouter, tool_fn_with_execution_policy};
 use copro_provider_openai::{
     OpenAiResponsesModelConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
 };
@@ -31,20 +31,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = provider.model(
         "gpt-5.5",
         OpenAiResponsesModelConfig {
-            reasoning_effort: Some("xhigh".to_string()),
+            parallel_tool_calls: Some(true),
+            reasoning_effort: None,
             reasoning_summary: Some("auto".to_string()),
             ..OpenAiResponsesModelConfig::default()
         },
     )?;
     let local_tools: Arc<dyn ToolRouter> = Arc::new(LocalToolRouter::new(vec![
-        tool_fn(
+        tool_fn_with_execution_policy(
             "calculator",
             "Evaluate a simple arithmetic expression. Supports +, -, *, /, and parentheses.",
+            ToolExecutionPolicy::Parallel,
             calculator,
         ),
-        tool_fn(
+        tool_fn_with_execution_policy(
             "datetime",
             "Get the current date and time, optionally adjusted by a timezone offset.",
+            ToolExecutionPolicy::Parallel,
             datetime,
         ),
     ]));

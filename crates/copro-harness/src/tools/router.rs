@@ -1,5 +1,5 @@
 use super::tool::ErasedTool;
-use copro_agent::ToolRouter;
+use copro_agent::{ToolExecutionPolicy, ToolRouter};
 use copro_api::async_trait;
 use copro_api::error::Result;
 use copro_api::message::{InputContent, ToolCall, ToolResult, ToolResultStatus};
@@ -17,6 +17,12 @@ impl LocalToolRouter {
     pub fn new(tools: Vec<Arc<dyn ErasedTool>>) -> Self {
         Self { tools }
     }
+
+    fn tool_by_name(&self, name: &str) -> Option<&Arc<dyn ErasedTool>> {
+        self.tools
+            .iter()
+            .find(|tool| tool.definition().name == name)
+    }
 }
 
 #[async_trait]
@@ -32,11 +38,7 @@ impl ToolRouter for LocalToolRouter {
             arguments,
         } = call;
 
-        let Some(tool) = self
-            .tools
-            .iter()
-            .find(|tool| tool.definition().name == name)
-        else {
+        let Some(tool) = self.tool_by_name(&name) else {
             return Ok(ToolResult {
                 call_id: id,
                 name: name.clone(),
@@ -62,6 +64,13 @@ impl ToolRouter for LocalToolRouter {
 
         Ok(result)
     }
+
+    async fn execution_policy(&self, call: &ToolCall) -> Result<ToolExecutionPolicy> {
+        Ok(self
+            .tool_by_name(&call.name)
+            .map(|tool| tool.execution_policy())
+            .unwrap_or(ToolExecutionPolicy::Serial))
+    }
 }
 
 /// Tool router that exposes and delegates to multiple child routers.
@@ -73,6 +82,21 @@ pub struct CompositeToolRouter {
 impl CompositeToolRouter {
     pub fn new(routers: Vec<Arc<dyn ToolRouter>>) -> Self {
         Self { routers }
+    }
+
+    async fn router_for(&self, name: &str) -> Result<Option<Arc<dyn ToolRouter>>> {
+        for router in &self.routers {
+            if router
+                .definitions()
+                .await?
+                .iter()
+                .any(|definition| definition.name == name)
+            {
+                return Ok(Some(Arc::clone(router)));
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -87,15 +111,9 @@ impl ToolRouter for CompositeToolRouter {
     }
 
     async fn execute(&self, call: ToolCall) -> Result<ToolResult> {
-        for router in &self.routers {
-            if router
-                .definitions()
-                .await?
-                .iter()
-                .any(|definition| definition.name == call.name)
-            {
-                return router.execute(call).await;
-            }
+        let name = call.name.clone();
+        if let Some(router) = self.router_for(&name).await? {
+            return router.execute(call).await;
         }
 
         Ok(ToolResult {
@@ -104,5 +122,13 @@ impl ToolRouter for CompositeToolRouter {
             status: ToolResultStatus::Error,
             content: vec![InputContent::Text(format!("unknown tool: {}", call.name))],
         })
+    }
+
+    async fn execution_policy(&self, call: &ToolCall) -> Result<ToolExecutionPolicy> {
+        if let Some(router) = self.router_for(&call.name).await? {
+            return router.execution_policy(call).await;
+        }
+
+        Ok(ToolExecutionPolicy::Serial)
     }
 }

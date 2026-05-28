@@ -1,4 +1,5 @@
 use super::output::ToolOutput;
+use copro_agent::ToolExecutionPolicy;
 use copro_api::async_trait;
 use copro_api::message::InputContent;
 use copro_api::tool::ToolDefinition;
@@ -14,12 +15,21 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
 
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::Serial
+    }
+
     async fn call(&self, input: Self::Input) -> Result<Self::Output, String>;
 }
 
 #[async_trait]
 pub trait ErasedTool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
+
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        ToolExecutionPolicy::Serial
+    }
+
     async fn call_content(&self, args: Value) -> Result<Vec<InputContent>, String>;
 }
 
@@ -32,6 +42,10 @@ impl<T: Tool> ErasedTool for T {
             description: Tool::description(self).to_string(),
             parameters: serde_json::to_value(schema).unwrap_or_default(),
         }
+    }
+
+    fn execution_policy(&self) -> ToolExecutionPolicy {
+        Tool::execution_policy(self)
     }
 
     async fn call_content(&self, args: Value) -> Result<Vec<InputContent>, String> {

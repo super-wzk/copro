@@ -1,13 +1,13 @@
 use crate::event::{AgentEvent, AgentStream};
 use crate::hook::{AgentHook, ToolDecision};
-use crate::tools::ToolRouter;
+use crate::tools::{ToolExecutionPolicy, ToolRouter};
 use copro_api::error::{Error, Result};
 use copro_api::message::{
     InputContent, Message, OutputContent, ToolCall, ToolResult, ToolResultStatus,
 };
 use copro_api::request::{GenerateRequest, GenerateRequestOptions};
 use copro_api::stream::{Model, ModelStream, OutputStreamEvent, OutputStreamState};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, future::try_join_all};
 use std::sync::Arc;
 
 /// Conversational agent bound to one model with tools, hooks, and conversation state.
@@ -101,31 +101,32 @@ impl Agent {
                                     usage,
                                 };
 
-                                if output_content
+                                let tool_calls = output_content
                                     .iter()
-                                    .any(|content| matches!(content, OutputContent::ToolCall(_)))
-                                {
-                                    TurnState::ToolExecution { output_content }
-                                } else {
+                                    .filter_map(|content| match content {
+                                        OutputContent::ToolCall(tool) => Some(tool.clone()),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>();
+
+                                if tool_calls.is_empty() {
                                     TurnState::Finished
+                                } else {
+                                    TurnState::ToolPlanning { tool_calls }
                                 }
                             }
                         }
                     }
-                    TurnState::ToolExecution { output_content } => {
-                        for item in output_content {
-                            let OutputContent::ToolCall(mut tool) = item else {
-                                continue;
-                            };
-                            let mut result = match self.apply_before_tool_call(&mut tool).await? {
-                                ToolDecision::Allow => self.tools.execute(tool.clone()).await?,
-                                ToolDecision::Reject { reason } => ToolResult {
-                                    call_id: tool.id.clone(),
-                                    name: tool.name.clone(),
-                                    status: ToolResultStatus::Error,
-                                    content: vec![InputContent::Text(reason)],
-                                },
-                            };
+                    TurnState::ToolPlanning { tool_calls } => {
+                        let plan = self.plan_tool_execution(tool_calls).await?;
+                        TurnState::ToolExecution { plan }
+                    }
+                    TurnState::ToolExecution { plan } => {
+                        let completed_tools = self.execute_tool_plan(plan).await?;
+                        TurnState::ToolResultCommit { completed_tools }
+                    }
+                    TurnState::ToolResultCommit { completed_tools } => {
+                        for (tool, mut result) in completed_tools {
                             self.apply_after_tool_call(&tool, &mut result).await?;
                             self.messages.push(Message::Tool(result.clone()));
                             yield AgentEvent::ToolResult(result);
@@ -147,6 +148,72 @@ impl Agent {
             tool_choice: None,
             options: GenerateRequestOptions::default(),
         })
+    }
+
+    async fn plan_tool_execution(
+        &self,
+        tool_calls: Vec<ToolCall>,
+    ) -> Result<Vec<(ToolCall, ToolExecutionPolicy, Option<ToolResult>)>> {
+        let mut plan = Vec::new();
+
+        for mut tool in tool_calls {
+            match self.apply_before_tool_call(&mut tool).await? {
+                ToolDecision::Allow => {
+                    let policy = self.tools.execution_policy(&tool).await?;
+                    plan.push((tool, policy, None));
+                }
+                ToolDecision::Reject { reason } => {
+                    let result = rejected_tool_result(&tool, reason);
+                    plan.push((tool, ToolExecutionPolicy::Serial, Some(result)));
+                }
+            }
+        }
+
+        Ok(plan)
+    }
+
+    async fn execute_tool_plan(
+        &self,
+        plan: Vec<(ToolCall, ToolExecutionPolicy, Option<ToolResult>)>,
+    ) -> Result<Vec<(ToolCall, ToolResult)>> {
+        let mut completed_tools = Vec::new();
+        let mut parallel_batch = Vec::new();
+
+        for (tool, policy, completed_result) in plan {
+            if let Some(result) = completed_result {
+                completed_tools.extend(self.execute_parallel_batch(&mut parallel_batch).await?);
+                completed_tools.push((tool, result));
+            } else if policy == ToolExecutionPolicy::Parallel {
+                parallel_batch.push(tool);
+            } else {
+                completed_tools.extend(self.execute_parallel_batch(&mut parallel_batch).await?);
+                let result = self.tools.execute(tool.clone()).await?;
+                completed_tools.push((tool, result));
+            }
+        }
+
+        completed_tools.extend(self.execute_parallel_batch(&mut parallel_batch).await?);
+        Ok(completed_tools)
+    }
+
+    async fn execute_parallel_batch(
+        &self,
+        batch: &mut Vec<ToolCall>,
+    ) -> Result<Vec<(ToolCall, ToolResult)>> {
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let tools = Arc::clone(&self.tools);
+        let calls = std::mem::take(batch);
+        try_join_all(calls.into_iter().map(|tool| {
+            let tools = Arc::clone(&tools);
+            async move {
+                let result = tools.execute(tool.clone()).await?;
+                Ok((tool, result))
+            }
+        }))
+        .await
     }
 
     async fn apply_before_request(&self, request: &mut GenerateRequest) -> Result<()> {
@@ -188,6 +255,15 @@ impl Agent {
     }
 }
 
+fn rejected_tool_result(tool: &ToolCall, reason: String) -> ToolResult {
+    ToolResult {
+        call_id: tool.id.clone(),
+        name: tool.name.clone(),
+        status: ToolResultStatus::Error,
+        content: vec![InputContent::Text(reason)],
+    }
+}
+
 fn into_assistant_content(message: Message) -> Result<Vec<OutputContent>> {
     match message {
         Message::Assistant(content) => Ok(content),
@@ -215,8 +291,14 @@ enum TurnState<'a> {
         stream: ModelStream<'a>,
         output_state: OutputStreamState,
     },
+    ToolPlanning {
+        tool_calls: Vec<ToolCall>,
+    },
     ToolExecution {
-        output_content: Vec<OutputContent>,
+        plan: Vec<(ToolCall, ToolExecutionPolicy, Option<ToolResult>)>,
+    },
+    ToolResultCommit {
+        completed_tools: Vec<(ToolCall, ToolResult)>,
     },
     Finished,
 }

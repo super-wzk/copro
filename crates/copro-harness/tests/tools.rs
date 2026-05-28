@@ -3,7 +3,10 @@ use copro_api::async_trait;
 use copro_api::error::Result;
 use copro_api::message::{InputContent, ToolCall, ToolResult, ToolResultStatus};
 use copro_api::tool::ToolDefinition;
-use copro_harness::tools::{CompositeToolRouter, ErasedTool, FnTool, LocalToolRouter, tool_fn};
+use copro_harness::tools::{
+    CompositeToolRouter, ErasedTool, FnTool, LocalToolRouter, ToolExecutionPolicy, tool_fn,
+    tool_fn_with_execution_policy,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
@@ -69,6 +72,25 @@ async fn fn_tool_wraps_async_closures() {
     assert_eq!(tool_text(&result), "5");
 }
 
+#[tokio::test]
+async fn local_tool_router_reports_tool_execution_policy() {
+    let router = LocalToolRouter::new(vec![tool_fn_with_execution_policy(
+        "echo",
+        "Echo a message.",
+        ToolExecutionPolicy::Parallel,
+        echo,
+    )]);
+
+    assert_eq!(
+        router.execution_policy(&call("echo")).await.unwrap(),
+        ToolExecutionPolicy::Parallel
+    );
+    assert_eq!(
+        router.execution_policy(&call("missing")).await.unwrap(),
+        ToolExecutionPolicy::Serial
+    );
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct EchoInput {
     message: String,
@@ -108,14 +130,40 @@ async fn composite_tool_router_rejects_unknown_tools() {
     assert_eq!(tool_text(&result), "unknown tool: missing");
 }
 
+#[tokio::test]
+async fn composite_tool_router_delegates_execution_policy() {
+    let router = CompositeToolRouter::new(vec![Arc::new(
+        StaticRouter::new("parallel", "parallel result").with_policy(ToolExecutionPolicy::Parallel),
+    )]);
+
+    assert_eq!(
+        router.execution_policy(&call("parallel")).await.unwrap(),
+        ToolExecutionPolicy::Parallel
+    );
+    assert_eq!(
+        router.execution_policy(&call("missing")).await.unwrap(),
+        ToolExecutionPolicy::Serial
+    );
+}
+
 struct StaticRouter {
     name: &'static str,
     output: &'static str,
+    policy: ToolExecutionPolicy,
 }
 
 impl StaticRouter {
     fn new(name: &'static str, output: &'static str) -> Self {
-        Self { name, output }
+        Self {
+            name,
+            output,
+            policy: ToolExecutionPolicy::Serial,
+        }
+    }
+
+    fn with_policy(mut self, policy: ToolExecutionPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 }
 
@@ -136,6 +184,10 @@ impl ToolRouter for StaticRouter {
             status: ToolResultStatus::Success,
             content: vec![InputContent::Text(self.output.to_string())],
         })
+    }
+
+    async fn execution_policy(&self, _call: &ToolCall) -> Result<ToolExecutionPolicy> {
+        Ok(self.policy)
     }
 }
 

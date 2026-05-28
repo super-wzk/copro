@@ -1,4 +1,4 @@
-use copro_agent::{Agent, AgentEvent, AgentHook, ToolRouter, async_trait};
+use copro_agent::{Agent, AgentEvent, AgentHook, ToolExecutionPolicy, ToolRouter, async_trait};
 use copro_api::error::Result;
 use copro_api::message::{
     InputContent, Message, OutputContent, ToolCall, ToolResult, ToolResultStatus,
@@ -11,6 +11,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 #[tokio::test]
 async fn run_stream_commits_assistant_message() {
@@ -129,6 +130,38 @@ async fn run_stream_awaits_async_tool_router() {
     ));
 }
 
+#[tokio::test]
+async fn run_stream_batches_parallel_tools_behind_serial_barriers() {
+    let router = Arc::new(ConcurrentToolRouter::default());
+    let tool_router: Arc<dyn ToolRouter> = router.clone();
+    let mut agent = Agent::new(
+        Arc::new(MultiToolThenDoneModel {
+            calls: AtomicUsize::new(0),
+        }),
+        tool_router,
+    );
+
+    let events = agent
+        .run_stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+
+    let tool_names = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolResult(result) => Some(result.name.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(tool_names, vec!["p1", "p2", "serial", "p3", "p4"]);
+    assert_eq!(router.max_parallel.load(Ordering::SeqCst), 2);
+    assert_eq!(router.barrier_violations.load(Ordering::SeqCst), 0);
+}
+
 fn test_agent(events: Vec<OutputStreamEvent>) -> Agent {
     Agent::new(Arc::new(TestModel { events }), Arc::new(EmptyToolRouter))
 }
@@ -194,6 +227,74 @@ impl ToolRouter for DoubleToolRouter {
     }
 }
 
+#[derive(Default)]
+struct ConcurrentToolRouter {
+    active_parallel: AtomicUsize,
+    active_serial: AtomicUsize,
+    max_parallel: AtomicUsize,
+    barrier_violations: AtomicUsize,
+}
+
+#[async_trait]
+impl ToolRouter for ConcurrentToolRouter {
+    async fn definitions(&self) -> Result<Vec<ToolDefinition>> {
+        Ok(["p1", "p2", "serial", "p3", "p4"]
+            .into_iter()
+            .map(|name| ToolDefinition {
+                name: name.to_string(),
+                description: format!("{name} test tool"),
+                parameters: serde_json::json!({"type": "object"}),
+            })
+            .collect())
+    }
+
+    async fn execution_policy(&self, call: &ToolCall) -> Result<ToolExecutionPolicy> {
+        Ok(if call.name == "serial" {
+            ToolExecutionPolicy::Serial
+        } else {
+            ToolExecutionPolicy::Parallel
+        })
+    }
+
+    async fn execute(&self, call: ToolCall) -> Result<ToolResult> {
+        if call.name == "serial" {
+            if self.active_parallel.load(Ordering::SeqCst) != 0 {
+                self.barrier_violations.fetch_add(1, Ordering::SeqCst);
+            }
+            if self.active_serial.fetch_add(1, Ordering::SeqCst) != 0 {
+                self.barrier_violations.fetch_add(1, Ordering::SeqCst);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            self.active_serial.fetch_sub(1, Ordering::SeqCst);
+        } else {
+            if self.active_serial.load(Ordering::SeqCst) != 0 {
+                self.barrier_violations.fetch_add(1, Ordering::SeqCst);
+            }
+            let active = self.active_parallel.fetch_add(1, Ordering::SeqCst) + 1;
+            update_max(&self.max_parallel, active);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            self.active_parallel.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        Ok(ToolResult {
+            call_id: call.id,
+            name: call.name,
+            status: ToolResultStatus::Success,
+            content: vec![InputContent::Text("ok".to_string())],
+        })
+    }
+}
+
+fn update_max(max: &AtomicUsize, value: usize) {
+    let mut current = max.load(Ordering::SeqCst);
+    while value > current {
+        match max.compare_exchange(current, value, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
+
 struct ToolThenDoneModel {
     calls: AtomicUsize,
 }
@@ -227,6 +328,50 @@ impl Model for ToolThenDoneModel {
             ],
         };
         Box::pin(futures_util::stream::iter(events.into_iter().map(Ok)))
+    }
+}
+
+struct MultiToolThenDoneModel {
+    calls: AtomicUsize,
+}
+
+impl Model for MultiToolThenDoneModel {
+    fn stream(&self, _request: GenerateRequest) -> ModelStream<'_> {
+        let events = match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => vec![
+                tool_call_delta(0, "call-p1", "p1"),
+                tool_call_delta(1, "call-p2", "p2"),
+                tool_call_delta(2, "call-serial", "serial"),
+                tool_call_delta(3, "call-p3", "p3"),
+                tool_call_delta(4, "call-p4", "p4"),
+                OutputStreamEvent::Finished {
+                    reason: FinishReason::ToolCalls,
+                    usage: None,
+                },
+            ],
+            _ => vec![
+                OutputStreamEvent::Delta {
+                    content_index: 0,
+                    delta: OutputContentDelta::Text("done".to_string()),
+                },
+                OutputStreamEvent::Finished {
+                    reason: FinishReason::Stop,
+                    usage: None,
+                },
+            ],
+        };
+        Box::pin(futures_util::stream::iter(events.into_iter().map(Ok)))
+    }
+}
+
+fn tool_call_delta(content_index: usize, id: &str, name: &str) -> OutputStreamEvent {
+    OutputStreamEvent::Delta {
+        content_index,
+        delta: OutputContentDelta::ToolCall {
+            id: Some(id.to_string()),
+            name: Some(name.to_string()),
+            arguments: "{}".to_string(),
+        },
     }
 }
 
