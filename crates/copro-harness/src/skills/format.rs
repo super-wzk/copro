@@ -13,7 +13,7 @@ pub(crate) fn format_available_skills_prompt(summaries: &[SkillSummary]) -> Opti
 
     Some(format!(
         "\
-Skills are available via progressive disclosure. When the user's task matches a skill description, call `load_skill` with the exact skill name before following that skill. If the full skill instructions already appear in the conversation, use them instead of loading the same skill again. Skill scripts and assets are not executed automatically; use normal tools only when the loaded instructions say to do so.
+Use skills via progressive disclosure. If the task matches a skill below, call `load_skill` once with the exact skill name, then follow the loaded instructions. Run skill scripts/assets only when those instructions require it.
 
 ## Available Skills
 

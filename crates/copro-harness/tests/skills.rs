@@ -143,24 +143,24 @@ async fn skill_tool_router_rejects_unknown_skill_tools() {
 }
 
 #[tokio::test]
-async fn load_skill_uses_runtime_cache() {
+async fn load_skill_reads_from_store_each_time() {
     let store = Arc::new(CountingStore {
         loads: AtomicUsize::new(0),
-        skill: skill("cached-skill", "Use cache."),
+        skill: skill("dynamic-skill", "Use current file contents."),
     });
     let router = SkillToolRouter::new(Arc::new(SkillRuntime::new(store.clone())));
     let tool_name = router.definitions().await.unwrap()[0].name.clone();
 
     router
-        .execute(load_skill_call(&tool_name, "cached-skill"))
+        .execute(load_skill_call(&tool_name, "dynamic-skill"))
         .await
         .unwrap();
     router
-        .execute(load_skill_call(&tool_name, "cached-skill"))
+        .execute(load_skill_call(&tool_name, "dynamic-skill"))
         .await
         .unwrap();
 
-    assert_eq!(store.loads.load(Ordering::SeqCst), 1);
+    assert_eq!(store.loads.load(Ordering::SeqCst), 2);
 }
 
 fn runtime_with(skills: Vec<SkillDocument>) -> Arc<SkillRuntime> {
