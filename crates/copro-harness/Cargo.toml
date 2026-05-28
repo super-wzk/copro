@@ -1,9 +1,14 @@
 [package]
-name = "copro-tools"
+name = "copro-harness"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 copro-agent.workspace = true
 copro-api.workspace = true
+schemars.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

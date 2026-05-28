@@ -1,10 +1,10 @@
 use copro_agent::{Agent, AgentEvent};
 use copro_api::message::{InputContent, Message, OutputContent, ToolResultStatus};
 use copro_api::stream::OutputContentDelta;
+use copro_harness::LocalToolRouter;
 use copro_provider_openai::{
     OpenAiResponsesModelConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
 };
-use copro_tools::LocalToolRouter;
 use futures_util::StreamExt;
 use std::env;
 use std::io::{self, Write};

@@ -218,6 +218,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "copro-harness"
+version = "0.1.0"
+dependencies = [
+ "copro-agent",
+ "copro-api",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "copro-provider-openai"
 version = "0.1.0"
 dependencies = [
@@ -229,15 +241,6 @@ dependencies = [
  "futures-util",
  "schemars",
  "serde",
- "serde_json",
-]
-
-[[package]]
-name = "copro-tools"
-version = "0.1.0"
-dependencies = [
- "copro-agent",
- "copro-api",
  "serde_json",
 ]
 
@@ -1366,8 +1369,8 @@ version = "0.1.0"
 dependencies = [
  "copro-agent",
  "copro-api",
+ "copro-harness",
  "copro-provider-openai",
- "copro-tools",
  "futures-util",
  "schemars",
  "serde",

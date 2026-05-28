@@ -15,17 +15,6 @@ impl LocalToolRouter {
     pub fn new(tools: Vec<Arc<dyn ErasedTool>>) -> Self {
         Self { tools }
     }
-
-    pub fn push(&mut self, tool: Arc<dyn ErasedTool>) {
-        self.tools.push(tool);
-    }
-
-    pub fn add_tool<T>(&mut self, tool: T)
-    where
-        T: ErasedTool + 'static,
-    {
-        self.tools.push(Arc::new(tool));
-    }
 }
 
 #[async_trait]
