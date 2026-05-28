@@ -46,7 +46,7 @@ impl Agent {
                 if state.is_finished() {
                     break;
                 }
-                if self.stop_signal.is_requested() {
+                if self.stop_signal.is_requested() && !state.needs_tool_result_commit() {
                     self.hooks.after_turn(&self.messages).await?;
                     break;
                 }
@@ -64,90 +64,117 @@ impl Agent {
                         mut stream,
                         mut output_state,
                     } => {
-                        let event = stream
-                            .next()
-                            .await
-                            .transpose()?
-                            .ok_or_else(|| Error::protocol("stream ended before finished event"))?;
+                        let stop_signal = self.stop_signal.clone();
+                        let event = tokio::select! {
+                            _ = stop_signal.wait_requested() => {
+                                self.hooks.after_turn(&self.messages).await.map(|()| None)
+                            }
+                            event = stream.next() => match event {
+                                Some(Ok(event)) => Ok(Some(event)),
+                                Some(Err(error)) => Err(error),
+                                None => Err(Error::protocol("stream ended before finished event")),
+                            },
+                        }?;
 
                         match event {
-                            OutputStreamEvent::Delta {
-                                content_index,
-                                mut delta,
-                            } => {
-                                self.hooks.before_output_delta(content_index, &mut delta).await?;
-                                yield AgentEvent::OutputDelta(delta.clone());
-                                output_state.apply(OutputStreamEvent::Delta {
+                            Some(event) => match event {
+                                OutputStreamEvent::Delta {
                                     content_index,
-                                    delta,
-                                })?;
-                                TurnState::ModelStreaming {
-                                    stream,
-                                    output_state,
-                                }
-                            }
-                            OutputStreamEvent::Finished { reason, usage } => {
-                                let response = output_state
-                                    .apply(OutputStreamEvent::Finished { reason, usage })?
-                                    .ok_or_else(|| {
-                                        Error::protocol("stream ended before finished event")
+                                    mut delta,
+                                } => {
+                                    self.hooks.before_output_delta(content_index, &mut delta).await?;
+                                    yield AgentEvent::OutputDelta(delta.clone());
+                                    output_state.apply(OutputStreamEvent::Delta {
+                                        content_index,
+                                        delta,
                                     })?;
+                                    TurnState::ModelStreaming {
+                                        stream,
+                                        output_state,
+                                    }
+                                }
+                                OutputStreamEvent::Finished { reason, usage } => {
+                                    let response = output_state
+                                        .apply(OutputStreamEvent::Finished { reason, usage })?
+                                        .ok_or_else(|| {
+                                            Error::protocol("stream ended before finished event")
+                                        })?;
 
-                                let usage = response.usage.clone();
-                                let mut output_content = into_assistant_content(response.message)?;
-                                self.hooks.before_output_commit(&mut output_content).await?;
-                                self.messages.push(normalize_for_history(Message::Assistant(
-                                    output_content.clone(),
-                                )));
-                                self.hooks.after_output_commit(&output_content).await?;
-                                let tool_calls = output_content
-                                    .iter()
-                                    .filter_map(|content| match content {
-                                        OutputContent::ToolCall(tool) => Some(tool.clone()),
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>();
-                                let next_state = if tool_calls.is_empty() {
-                                    self.hooks.after_turn(&self.messages).await?;
-                                    TurnState::Finished
-                                } else {
-                                    TurnState::ToolPlanning { tool_calls }
-                                };
+                                    let usage = response.usage.clone();
+                                    let mut output_content = into_assistant_content(response.message)?;
+                                    self.hooks.before_output_commit(&mut output_content).await?;
+                                    self.messages.push(normalize_for_history(Message::Assistant(
+                                        output_content.clone(),
+                                    )));
+                                    self.hooks.after_output_commit(&output_content).await?;
+                                    let tool_calls = output_content
+                                        .iter()
+                                        .filter_map(|content| match content {
+                                            OutputContent::ToolCall(tool) => Some(tool.clone()),
+                                            _ => None,
+                                        })
+                                        .collect::<Vec<_>>();
+                                    let next_state = if tool_calls.is_empty() {
+                                        self.hooks.after_turn(&self.messages).await?;
+                                        TurnState::Finished
+                                    } else {
+                                        TurnState::ToolPlanning { tool_calls }
+                                    };
 
-                                yield AgentEvent::OutputFinished {
-                                    content: output_content.clone(),
-                                    reason,
-                                    usage,
-                                };
+                                    yield AgentEvent::OutputFinished {
+                                        content: output_content.clone(),
+                                        reason,
+                                        usage,
+                                    };
 
-                                next_state
-                            }
+                                    next_state
+                                }
+                            },
+                            None => TurnState::Finished,
                         }
                     }
                     TurnState::ToolPlanning { tool_calls } => {
-                        let plan = self.plan_tool_execution(tool_calls).await?;
-                        TurnState::ToolExecution { plan }
+                        if self.stop_signal.is_requested() {
+                            TurnState::ToolResultCommit {
+                                completed_tools: aborted_tool_calls(tool_calls),
+                                finish_after_commit: true,
+                            }
+                        } else {
+                            let plan = self.plan_tool_execution(tool_calls).await?;
+                            TurnState::ToolExecution { plan }
+                        }
                     }
                     TurnState::ToolExecution { plan } => {
-                        let completed_tools = self.execute_tool_plan(plan).await?;
-                        TurnState::ToolResultCommit { completed_tools }
-                    }
-                    TurnState::ToolResultCommit { completed_tools } => {
-                        let mut next_state = TurnState::ModelRequest;
-                        for (tool, mut result) in completed_tools {
-                            if self.stop_signal.is_requested() {
-                                self.hooks.after_turn(&self.messages).await?;
-                                next_state = TurnState::Finished;
-                                break;
+                        if self.stop_signal.is_requested() {
+                            TurnState::ToolResultCommit {
+                                completed_tools: abort_tool_plan(plan),
+                                finish_after_commit: true,
                             }
-
+                        } else {
+                            let completed_tools = self.execute_tool_plan(plan).await?;
+                            TurnState::ToolResultCommit {
+                                completed_tools,
+                                finish_after_commit: self.stop_signal.is_requested(),
+                            }
+                        }
+                    }
+                    TurnState::ToolResultCommit {
+                        completed_tools,
+                        finish_after_commit,
+                    } => {
+                        for (tool, mut result) in completed_tools {
                             self.hooks.after_tool_call(&tool, &mut result).await?;
                             self.messages.push(Message::Tool(result.clone()));
                             self.hooks.after_tool_result_commit(&tool, &result).await?;
                             yield AgentEvent::ToolResult(result);
                         }
 
-                        next_state
+                        if finish_after_commit || self.stop_signal.is_requested() {
+                            self.hooks.after_turn(&self.messages).await?;
+                            TurnState::Finished
+                        } else {
+                            TurnState::ModelRequest
+                        }
                     }
                     TurnState::Finished => break,
                 };
@@ -244,6 +271,36 @@ fn rejected_tool_result(tool: &ToolCall, reason: String) -> ToolResult {
     }
 }
 
+fn aborted_tool_calls(tool_calls: Vec<ToolCall>) -> Vec<(ToolCall, ToolResult)> {
+    tool_calls
+        .into_iter()
+        .map(|tool| {
+            let result = aborted_tool_result(&tool);
+            (tool, result)
+        })
+        .collect()
+}
+
+fn abort_tool_plan(
+    plan: Vec<(ToolCall, ToolExecutionPolicy, Option<ToolResult>)>,
+) -> Vec<(ToolCall, ToolResult)> {
+    plan.into_iter()
+        .map(|(tool, _policy, result)| {
+            let result = result.unwrap_or_else(|| aborted_tool_result(&tool));
+            (tool, result)
+        })
+        .collect()
+}
+
+fn aborted_tool_result(tool: &ToolCall) -> ToolResult {
+    ToolResult {
+        call_id: tool.id.clone(),
+        name: tool.name.clone(),
+        status: ToolResultStatus::Error,
+        content: vec![InputContent::Text("aborted by user".to_string())],
+    }
+}
+
 fn into_assistant_content(message: Message) -> Result<Vec<OutputContent>> {
     match message {
         Message::Assistant(content) => Ok(content),
@@ -269,6 +326,13 @@ impl<'a> TurnState<'a> {
     fn is_finished(&self) -> bool {
         matches!(self, Self::Finished)
     }
+
+    fn needs_tool_result_commit(&self) -> bool {
+        matches!(
+            self,
+            Self::ToolPlanning { .. } | Self::ToolExecution { .. } | Self::ToolResultCommit { .. }
+        )
+    }
 }
 
 enum TurnState<'a> {
@@ -285,6 +349,7 @@ enum TurnState<'a> {
     },
     ToolResultCommit {
         completed_tools: Vec<(ToolCall, ToolResult)>,
+        finish_after_commit: bool,
     },
     Finished,
 }

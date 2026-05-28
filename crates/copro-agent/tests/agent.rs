@@ -1,4 +1,6 @@
-use copro_agent::{Agent, AgentEvent, AgentHook, ToolExecutionPolicy, ToolRouter, async_trait};
+use copro_agent::{
+    Agent, AgentEvent, AgentHook, StopSignal, ToolExecutionPolicy, ToolRouter, async_trait,
+};
 use copro_api::error::Result;
 use copro_api::message::{
     InputContent, Message, OutputContent, ToolCall, ToolResult, ToolResultStatus,
@@ -201,6 +203,138 @@ async fn run_stream_stops_when_stop_signal_is_requested() {
 }
 
 #[tokio::test]
+async fn run_stream_interrupts_pending_model_stream() {
+    let completed = Arc::new(AtomicUsize::new(0));
+    let mut agent = Agent::new(
+        Arc::new(PendingAfterFirstDeltaModel),
+        Arc::new(EmptyToolRouter),
+    );
+    agent.hooks.push(Arc::new(TurnDoneHook {
+        completed: Arc::clone(&completed),
+    }));
+    let stop_signal = agent.stop_signal.clone();
+
+    {
+        let mut stream = agent.run_stream();
+        assert_eq!(
+            stream.next().await.transpose().unwrap(),
+            Some(AgentEvent::OutputDelta(OutputContentDelta::Text(
+                "first".to_string()
+            )))
+        );
+
+        stop_signal.request_stop();
+        let next = tokio::time::timeout(Duration::from_millis(100), stream.next())
+            .await
+            .unwrap();
+        assert!(next.is_none());
+    }
+
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
+    assert!(agent.messages.is_empty());
+}
+
+#[tokio::test]
+async fn stop_after_tool_call_commit_records_aborted_tool_result() {
+    let mut agent = Agent::new(
+        Arc::new(ToolThenDoneModel {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(DoubleToolRouter),
+    );
+    let stop_signal = agent.stop_signal.clone();
+
+    {
+        let mut stream = agent.run_stream();
+        assert!(matches!(
+            stream.next().await.transpose().unwrap(),
+            Some(AgentEvent::OutputDelta(OutputContentDelta::ToolCall { .. }))
+        ));
+        assert!(matches!(
+            stream.next().await.transpose().unwrap(),
+            Some(AgentEvent::OutputFinished {
+                reason: FinishReason::ToolCalls,
+                ..
+            })
+        ));
+
+        stop_signal.request_stop();
+        assert!(matches!(
+            stream.next().await.transpose().unwrap(),
+            Some(AgentEvent::ToolResult(ToolResult {
+                name,
+                status: ToolResultStatus::Error,
+                content,
+                ..
+            })) if name == "double"
+                && content == vec![InputContent::Text("aborted by user".to_string())]
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    assert!(matches!(
+        agent.messages.as_slice(),
+        [
+            Message::Assistant(content),
+            Message::Tool(ToolResult {
+                call_id,
+                name,
+                status: ToolResultStatus::Error,
+                content: result_content,
+            })
+        ] if matches!(content.as_slice(), [OutputContent::ToolCall(ToolCall { id, name, .. })]
+            if id == "call-1" && name == "double")
+            && call_id == "call-1"
+            && name == "double"
+            && result_content == &vec![InputContent::Text("aborted by user".to_string())]
+    ));
+}
+
+#[tokio::test]
+async fn stop_during_tool_execution_still_commits_tool_result() {
+    let model = Arc::new(ToolThenDoneModel {
+        calls: AtomicUsize::new(0),
+    });
+    let stop_signal = StopSignal::new();
+    let mut agent = Agent::new(
+        model.clone(),
+        Arc::new(StopDuringToolRouter {
+            stop_signal: stop_signal.clone(),
+        }),
+    );
+    agent.stop_signal = stop_signal;
+
+    let events = agent
+        .run_stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolResult(ToolResult {
+            name,
+            status: ToolResultStatus::Success,
+            content,
+            ..
+        }) if name == "double" && content == &vec![InputContent::Text("42".to_string())]
+    )));
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        agent.messages.as_slice(),
+        [
+            Message::Assistant(_),
+            Message::Tool(ToolResult {
+                status: ToolResultStatus::Success,
+                ..
+            })
+        ]
+    ));
+}
+
+#[tokio::test]
 async fn run_stream_awaits_async_tool_router() {
     let mut agent = Agent::new(
         Arc::new(ToolThenDoneModel {
@@ -360,6 +494,27 @@ impl ToolRouter for DoubleToolRouter {
     }
 }
 
+struct StopDuringToolRouter {
+    stop_signal: StopSignal,
+}
+
+#[async_trait]
+impl ToolRouter for StopDuringToolRouter {
+    async fn definitions(&self) -> Result<Vec<ToolDefinition>> {
+        DoubleToolRouter.definitions().await
+    }
+
+    async fn execute(&self, call: ToolCall) -> Result<ToolResult> {
+        self.stop_signal.request_stop();
+        Ok(ToolResult {
+            call_id: call.id,
+            name: call.name,
+            status: ToolResultStatus::Success,
+            content: vec![InputContent::Text("42".to_string())],
+        })
+    }
+}
+
 #[derive(Default)]
 struct ConcurrentToolRouter {
     active_parallel: AtomicUsize,
@@ -505,6 +660,20 @@ fn tool_call_delta(content_index: usize, id: &str, name: &str) -> OutputStreamEv
             name: Some(name.to_string()),
             arguments: "{}".to_string(),
         },
+    }
+}
+
+struct PendingAfterFirstDeltaModel;
+
+impl Model for PendingAfterFirstDeltaModel {
+    fn stream(&self, _request: GenerateRequest) -> ModelStream<'_> {
+        let first = futures_util::stream::once(async {
+            Ok(OutputStreamEvent::Delta {
+                content_index: 0,
+                delta: OutputContentDelta::Text("first".to_string()),
+            })
+        });
+        Box::pin(first.chain(futures_util::stream::pending()))
     }
 }
 

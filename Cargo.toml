@@ -39,4 +39,4 @@ quote = "1"
 schemars = "1.2.1"
 syn = { version = "2", features = ["derive", "parsing", "printing"] }
 thiserror = "2"
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["macros", "sync", "time"] }

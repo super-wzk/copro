@@ -3,11 +3,8 @@ use copro_api::stream::{ModelStream, OutputStreamEvent};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::time::Instant;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,26 +15,37 @@ pub struct RuntimeOptions {
 /// Cloneable stop signal checked by agent runtimes at safe transition points.
 #[derive(Debug, Clone)]
 pub struct StopSignal {
-    requested: Arc<AtomicBool>,
+    requested: watch::Sender<bool>,
 }
 
 impl StopSignal {
     pub fn new() -> Self {
-        Self {
-            requested: Arc::new(AtomicBool::new(false)),
-        }
+        let (requested, _receiver) = watch::channel(false);
+        Self { requested }
     }
 
     pub fn request_stop(&self) {
-        self.requested.store(true, Ordering::SeqCst);
+        self.requested.send_replace(true);
     }
 
     pub fn clear(&self) {
-        self.requested.store(false, Ordering::SeqCst);
+        self.requested.send_replace(false);
     }
 
     pub fn is_requested(&self) -> bool {
-        self.requested.load(Ordering::SeqCst)
+        *self.requested.borrow()
+    }
+
+    pub(crate) async fn wait_requested(&self) {
+        let mut requested = self.requested.subscribe();
+        loop {
+            if *requested.borrow_and_update() {
+                return;
+            }
+            if requested.changed().await.is_err() {
+                return;
+            }
+        }
     }
 }
 
