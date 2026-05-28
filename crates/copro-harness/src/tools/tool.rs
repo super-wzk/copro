@@ -1,5 +1,5 @@
 use super::output::ToolOutput;
-use copro_agent::ToolExecutionPolicy;
+use copro_agent::{CancellationToken, ToolExecutionPolicy};
 use copro_api::async_trait;
 use copro_api::message::InputContent;
 use copro_api::tool::ToolDefinition;
@@ -19,7 +19,11 @@ pub trait Tool: Send + Sync {
         ToolExecutionPolicy::Serial
     }
 
-    async fn call(&self, input: Self::Input) -> Result<Self::Output, String>;
+    async fn call(
+        &self,
+        input: Self::Input,
+        cancel: CancellationToken,
+    ) -> Result<Self::Output, String>;
 }
 
 #[async_trait]
@@ -30,7 +34,11 @@ pub trait ErasedTool: Send + Sync {
         ToolExecutionPolicy::Serial
     }
 
-    async fn call_content(&self, args: Value) -> Result<Vec<InputContent>, String>;
+    async fn call_content(
+        &self,
+        args: Value,
+        cancel: CancellationToken,
+    ) -> Result<Vec<InputContent>, String>;
 }
 
 #[async_trait]
@@ -48,9 +56,13 @@ impl<T: Tool> ErasedTool for T {
         Tool::execution_policy(self)
     }
 
-    async fn call_content(&self, args: Value) -> Result<Vec<InputContent>, String> {
+    async fn call_content(
+        &self,
+        args: Value,
+        cancel: CancellationToken,
+    ) -> Result<Vec<InputContent>, String> {
         let input = serde_json::from_value::<T::Input>(args).map_err(|e| e.to_string())?;
-        let output = self.call(input).await?;
+        let output = self.call(input, cancel).await?;
         output.into_tool_result_content()
     }
 }

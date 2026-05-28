@@ -1,7 +1,7 @@
 use super::SkillRuntime;
 use super::format::format_skill_document;
 use crate::tools::{ErasedTool, Tool};
-use copro_agent::ToolRouter;
+use copro_agent::{CancellationToken, ToolRouter};
 use copro_api::async_trait;
 use copro_api::error::Result;
 use copro_api::message::{InputContent, ToolCall, ToolResult, ToolResultStatus};
@@ -44,7 +44,11 @@ impl Tool for LoadSkillTool {
         LOAD_SKILL_TOOL_DESCRIPTION
     }
 
-    async fn call(&self, input: Self::Input) -> std::result::Result<Self::Output, String> {
+    async fn call(
+        &self,
+        input: Self::Input,
+        _cancel: CancellationToken,
+    ) -> std::result::Result<Self::Output, String> {
         self.runtime
             .load(&input.name)
             .await
@@ -77,7 +81,7 @@ impl ToolRouter for SkillToolRouter {
         Ok(vec![self.load_skill.definition()])
     }
 
-    async fn execute(&self, call: ToolCall) -> Result<ToolResult> {
+    async fn execute(&self, call: ToolCall, cancel: CancellationToken) -> Result<ToolResult> {
         let ToolCall {
             id,
             name,
@@ -87,7 +91,7 @@ impl ToolRouter for SkillToolRouter {
         if name == LOAD_SKILL_TOOL_NAME {
             return match self
                 .load_skill
-                .call_content(serde_json::Value::Object(arguments))
+                .call_content(serde_json::Value::Object(arguments), cancel)
                 .await
             {
                 Ok(content) => Ok(ToolResult {

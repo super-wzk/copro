@@ -2,6 +2,7 @@ use copro_api::async_trait;
 use copro_api::error::Result;
 use copro_api::message::{ToolCall, ToolResult};
 use copro_api::tool::ToolDefinition;
+use tokio_util::sync::CancellationToken;
 
 /// Declares how a tool call may be scheduled relative to other tool calls in
 /// the same model output.
@@ -21,7 +22,7 @@ pub trait ToolRouter: Send + Sync {
     async fn definitions(&self) -> Result<Vec<ToolDefinition>>;
 
     /// Execute one model-requested tool call.
-    async fn execute(&self, call: ToolCall) -> Result<ToolResult>;
+    async fn execute(&self, call: ToolCall, cancel: CancellationToken) -> Result<ToolResult>;
 
     /// Return the execution policy for one model-requested tool call.
     async fn execution_policy(&self, _call: &ToolCall) -> Result<ToolExecutionPolicy> {

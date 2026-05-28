@@ -1,6 +1,6 @@
 use super::output::ToolOutput;
 use super::tool::{ErasedTool, Tool};
-use copro_agent::ToolExecutionPolicy;
+use copro_agent::{CancellationToken, ToolExecutionPolicy};
 use copro_api::async_trait;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -80,7 +80,11 @@ where
         self.execution_policy
     }
 
-    async fn call(&self, input: Self::Input) -> Result<Self::Output, String> {
+    async fn call(
+        &self,
+        input: Self::Input,
+        _cancel: CancellationToken,
+    ) -> Result<Self::Output, String> {
         (self.handler)(input).await
     }
 }

@@ -1,5 +1,5 @@
 use super::tool::ErasedTool;
-use copro_agent::{ToolExecutionPolicy, ToolRouter};
+use copro_agent::{CancellationToken, ToolExecutionPolicy, ToolRouter};
 use copro_api::async_trait;
 use copro_api::error::Result;
 use copro_api::message::{InputContent, ToolCall, ToolResult, ToolResultStatus};
@@ -31,7 +31,7 @@ impl ToolRouter for LocalToolRouter {
         Ok(self.tools.iter().map(|tool| tool.definition()).collect())
     }
 
-    async fn execute(&self, call: ToolCall) -> Result<ToolResult> {
+    async fn execute(&self, call: ToolCall, cancel: CancellationToken) -> Result<ToolResult> {
         let ToolCall {
             id,
             name,
@@ -47,7 +47,7 @@ impl ToolRouter for LocalToolRouter {
             });
         };
 
-        let result = match tool.call_content(Value::Object(arguments)).await {
+        let result = match tool.call_content(Value::Object(arguments), cancel).await {
             Ok(content) => ToolResult {
                 call_id: id,
                 name,
@@ -110,10 +110,10 @@ impl ToolRouter for CompositeToolRouter {
         Ok(definitions)
     }
 
-    async fn execute(&self, call: ToolCall) -> Result<ToolResult> {
+    async fn execute(&self, call: ToolCall, cancel: CancellationToken) -> Result<ToolResult> {
         let name = call.name.clone();
         if let Some(router) = self.router_for(&name).await? {
-            return router.execute(call).await;
+            return router.execute(call, cancel).await;
         }
 
         Ok(ToolResult {

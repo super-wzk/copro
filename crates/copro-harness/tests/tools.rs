@@ -1,4 +1,4 @@
-use copro_agent::ToolRouter;
+use copro_agent::{CancellationToken, ToolRouter};
 use copro_api::async_trait;
 use copro_api::error::Result;
 use copro_api::message::{InputContent, ToolCall, ToolResult, ToolResultStatus};
@@ -22,11 +22,14 @@ async fn fn_tool_wraps_async_functions() {
     assert_eq!(definitions[0].description, "Echo a message.");
 
     let result = router
-        .execute(ToolCall {
-            id: "call-echo".to_string(),
-            name: "echo".to_string(),
-            arguments: serde_json::Map::from_iter([("message".to_string(), json!("hello"))]),
-        })
+        .execute(
+            ToolCall {
+                id: "call-echo".to_string(),
+                name: "echo".to_string(),
+                arguments: serde_json::Map::from_iter([("message".to_string(), json!("hello"))]),
+            },
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
 
@@ -44,7 +47,7 @@ async fn fn_tool_can_be_used_directly() {
     assert_eq!(definition.description, "Echo a message.");
 
     let content = tool
-        .call_content(json!({ "message": "direct" }))
+        .call_content(json!({ "message": "direct" }), CancellationToken::new())
         .await
         .unwrap();
 
@@ -60,11 +63,14 @@ async fn fn_tool_wraps_async_closures() {
     )]);
 
     let result = router
-        .execute(ToolCall {
-            id: "call-length".to_string(),
-            name: "length".to_string(),
-            arguments: serde_json::Map::from_iter([("message".to_string(), json!("hello"))]),
-        })
+        .execute(
+            ToolCall {
+                id: "call-length".to_string(),
+                name: "length".to_string(),
+                arguments: serde_json::Map::from_iter([("message".to_string(), json!("hello"))]),
+            },
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
 
@@ -112,7 +118,10 @@ async fn composite_tool_router_merges_definitions_and_routes_calls() {
     assert_eq!(definitions[0].name, "first");
     assert_eq!(definitions[1].name, "second");
 
-    let result = router.execute(call("second")).await.unwrap();
+    let result = router
+        .execute(call("second"), CancellationToken::new())
+        .await
+        .unwrap();
     assert_eq!(result.status, ToolResultStatus::Success);
     assert_eq!(result.name, "second");
     assert_eq!(tool_text(&result), "second result");
@@ -123,7 +132,10 @@ async fn composite_tool_router_rejects_unknown_tools() {
     let router =
         CompositeToolRouter::new(vec![Arc::new(StaticRouter::new("known", "known result"))]);
 
-    let result = router.execute(call("missing")).await.unwrap();
+    let result = router
+        .execute(call("missing"), CancellationToken::new())
+        .await
+        .unwrap();
 
     assert_eq!(result.status, ToolResultStatus::Error);
     assert_eq!(result.name, "missing");
@@ -177,7 +189,7 @@ impl ToolRouter for StaticRouter {
         }])
     }
 
-    async fn execute(&self, call: ToolCall) -> Result<ToolResult> {
+    async fn execute(&self, call: ToolCall, _cancel: CancellationToken) -> Result<ToolResult> {
         Ok(ToolResult {
             call_id: call.id,
             name: call.name,

@@ -10,6 +10,7 @@ use copro_api::request::{GenerateRequest, GenerateRequestOptions};
 use copro_api::stream::{Model, ModelStream, OutputStreamEvent, OutputStreamState};
 use futures_util::{StreamExt, future::try_join_all};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// Conversational agent bound to one model with tools, hooks, and conversation state.
 pub struct Agent {
@@ -64,9 +65,9 @@ impl Agent {
                         mut stream,
                         mut output_state,
                     } => {
-                        let stop_signal = self.stop_signal.clone();
+                        let cancel = self.stop_signal.token();
                         let event = tokio::select! {
-                            _ = stop_signal.wait_requested() => {
+                            _ = cancel.cancelled() => {
                                 self.hooks.after_turn(&self.messages).await.map(|()| None)
                             }
                             event = stream.next() => match event {
@@ -232,13 +233,23 @@ impl Agent {
                 parallel_batch.push(tool);
             } else {
                 completed_tools.extend(self.execute_parallel_batch(&mut parallel_batch).await?);
-                let result = self.tools.execute(tool.clone()).await?;
-                completed_tools.push((tool, result));
+                completed_tools.push(
+                    self.execute_tool_call(tool, self.stop_signal.token())
+                        .await?,
+                );
             }
         }
 
         completed_tools.extend(self.execute_parallel_batch(&mut parallel_batch).await?);
         Ok(completed_tools)
+    }
+
+    async fn execute_tool_call(
+        &self,
+        tool: ToolCall,
+        cancel: CancellationToken,
+    ) -> Result<(ToolCall, ToolResult)> {
+        Self::execute_tool_call_with_router(Arc::clone(&self.tools), tool, cancel).await
     }
 
     async fn execute_parallel_batch(
@@ -250,15 +261,28 @@ impl Agent {
         }
 
         let tools = Arc::clone(&self.tools);
+        let cancel = self.stop_signal.token();
         let calls = std::mem::take(batch);
         try_join_all(calls.into_iter().map(|tool| {
             let tools = Arc::clone(&tools);
-            async move {
-                let result = tools.execute(tool.clone()).await?;
-                Ok((tool, result))
-            }
+            let cancel = cancel.child_token();
+            async move { Self::execute_tool_call_with_router(tools, tool, cancel).await }
         }))
         .await
+    }
+
+    async fn execute_tool_call_with_router(
+        tools: Arc<dyn ToolRouter>,
+        tool: ToolCall,
+        cancel: CancellationToken,
+    ) -> Result<(ToolCall, ToolResult)> {
+        let tool_cancel = cancel.child_token();
+        let mut execution = Box::pin(tools.execute(tool.clone(), tool_cancel));
+        tokio::select! {
+            biased;
+            result = &mut execution => Ok((tool, result?)),
+            _ = cancel.cancelled() => Ok((tool.clone(), aborted_tool_result(&tool))),
+        }
     }
 }
 

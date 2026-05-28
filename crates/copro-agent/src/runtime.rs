@@ -3,9 +3,10 @@ use copro_api::stream::{ModelStream, OutputStreamEvent};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::watch;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeOptions {
@@ -15,37 +16,33 @@ pub struct RuntimeOptions {
 /// Cloneable stop signal checked by agent runtimes at safe transition points.
 #[derive(Debug, Clone)]
 pub struct StopSignal {
-    requested: watch::Sender<bool>,
+    token: Arc<Mutex<CancellationToken>>,
 }
 
 impl StopSignal {
     pub fn new() -> Self {
-        let (requested, _receiver) = watch::channel(false);
-        Self { requested }
+        Self {
+            token: Arc::new(Mutex::new(CancellationToken::new())),
+        }
     }
 
     pub fn request_stop(&self) {
-        self.requested.send_replace(true);
+        self.token().cancel();
     }
 
     pub fn clear(&self) {
-        self.requested.send_replace(false);
+        *self.token.lock().expect("stop signal mutex poisoned") = CancellationToken::new();
     }
 
     pub fn is_requested(&self) -> bool {
-        *self.requested.borrow()
+        self.token().is_cancelled()
     }
 
-    pub(crate) async fn wait_requested(&self) {
-        let mut requested = self.requested.subscribe();
-        loop {
-            if *requested.borrow_and_update() {
-                return;
-            }
-            if requested.changed().await.is_err() {
-                return;
-            }
-        }
+    pub(crate) fn token(&self) -> CancellationToken {
+        self.token
+            .lock()
+            .expect("stop signal mutex poisoned")
+            .clone()
     }
 }
 

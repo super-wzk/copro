@@ -1,5 +1,6 @@
 pub use copro_api::async_trait;
 pub use copro_api::message::{ToolCall, ToolResult};
+pub use tokio_util::sync::CancellationToken;
 
 pub mod runtime;
 

@@ -1,4 +1,4 @@
-use copro_agent::{AgentHook, ToolRouter};
+use copro_agent::{AgentHook, CancellationToken, ToolRouter};
 use copro_api::async_trait;
 use copro_api::error::{Error, Result};
 use copro_api::message::{
@@ -114,7 +114,10 @@ async fn skill_tool_router_exposes_and_executes_load_skill() {
     assert_eq!(definitions[0].name, "load_skill");
 
     let result = router
-        .execute(load_skill_call(&definitions[0].name, "test-skill"))
+        .execute(
+            load_skill_call(&definitions[0].name, "test-skill"),
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
 
@@ -130,11 +133,14 @@ async fn skill_tool_router_rejects_unknown_skill_tools() {
     let router = SkillToolRouter::new(runtime);
 
     let result = router
-        .execute(ToolCall {
-            id: "call-2".to_string(),
-            name: "echo".to_string(),
-            arguments: serde_json::Map::new(),
-        })
+        .execute(
+            ToolCall {
+                id: "call-2".to_string(),
+                name: "echo".to_string(),
+                arguments: serde_json::Map::new(),
+            },
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
 
@@ -152,11 +158,17 @@ async fn load_skill_reads_from_store_each_time() {
     let tool_name = router.definitions().await.unwrap()[0].name.clone();
 
     router
-        .execute(load_skill_call(&tool_name, "dynamic-skill"))
+        .execute(
+            load_skill_call(&tool_name, "dynamic-skill"),
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     router
-        .execute(load_skill_call(&tool_name, "dynamic-skill"))
+        .execute(
+            load_skill_call(&tool_name, "dynamic-skill"),
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
 

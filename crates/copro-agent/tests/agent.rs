@@ -1,5 +1,6 @@
 use copro_agent::{
-    Agent, AgentEvent, AgentHook, StopSignal, ToolExecutionPolicy, ToolRouter, async_trait,
+    Agent, AgentEvent, AgentHook, CancellationToken, StopSignal, ToolExecutionPolicy, ToolRouter,
+    async_trait,
 };
 use copro_api::error::Result;
 use copro_api::message::{
@@ -451,7 +452,7 @@ impl ToolRouter for EmptyToolRouter {
         Ok(Vec::new())
     }
 
-    async fn execute(&self, _call: ToolCall) -> Result<ToolResult> {
+    async fn execute(&self, _call: ToolCall, _cancel: CancellationToken) -> Result<ToolResult> {
         unreachable!("empty runtime has no tools")
     }
 }
@@ -468,7 +469,7 @@ impl ToolRouter for DoubleToolRouter {
         }])
     }
 
-    async fn execute(&self, call: ToolCall) -> Result<ToolResult> {
+    async fn execute(&self, call: ToolCall, _cancel: CancellationToken) -> Result<ToolResult> {
         let ToolCall {
             id,
             name,
@@ -504,7 +505,7 @@ impl ToolRouter for StopDuringToolRouter {
         DoubleToolRouter.definitions().await
     }
 
-    async fn execute(&self, call: ToolCall) -> Result<ToolResult> {
+    async fn execute(&self, call: ToolCall, _cancel: CancellationToken) -> Result<ToolResult> {
         self.stop_signal.request_stop();
         Ok(ToolResult {
             call_id: call.id,
@@ -544,7 +545,7 @@ impl ToolRouter for ConcurrentToolRouter {
         })
     }
 
-    async fn execute(&self, call: ToolCall) -> Result<ToolResult> {
+    async fn execute(&self, call: ToolCall, _cancel: CancellationToken) -> Result<ToolResult> {
         if call.name == "serial" {
             if self.active_parallel.load(Ordering::SeqCst) != 0 {
                 self.barrier_violations.fetch_add(1, Ordering::SeqCst);
