@@ -1,5 +1,3 @@
-use copro_api::async_trait;
-use copro_harness::Tool;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -11,25 +9,8 @@ pub struct CalculatorInput {
     pub expression: String,
 }
 
-#[derive(Debug)]
-pub struct Calculator;
-
-#[async_trait]
-impl Tool for Calculator {
-    type Input = CalculatorInput;
-    type Output = f64;
-
-    fn name(&self) -> &str {
-        "calculator"
-    }
-
-    fn description(&self) -> &str {
-        "Evaluate a simple arithmetic expression. Supports +, -, *, /, and parentheses."
-    }
-
-    async fn call(&self, input: Self::Input) -> Result<Self::Output, String> {
-        evaluate_expression(&input.expression).map_err(|e| e.to_string())
-    }
+pub async fn calculator(input: CalculatorInput) -> Result<f64, String> {
+    evaluate_expression(&input.expression).map_err(|e| e.to_string())
 }
 
 fn evaluate_expression(expr: &str) -> Result<f64, String> {
@@ -172,47 +153,30 @@ pub struct DateTimeInput {
     pub timezone_offset: i32,
 }
 
-#[derive(Debug)]
-pub struct DateTimeTool;
+pub async fn datetime(input: DateTimeInput) -> Result<String, String> {
+    let now = std::time::SystemTime::now();
+    let total_secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs() as i64;
+    let adjusted = total_secs + input.timezone_offset as i64 * 3600;
+    let days = adjusted / 86400;
+    let secs_in_day = adjusted % 86400;
+    let hours = secs_in_day / 3600;
+    let minutes = (secs_in_day % 3600) / 60;
+    let seconds = secs_in_day % 60;
 
-#[async_trait]
-impl Tool for DateTimeTool {
-    type Input = DateTimeInput;
-    type Output = String;
+    // Simple date calculation from Unix epoch
+    let (year, month, day) = epoch_to_date(days);
+    let offset_label = if input.timezone_offset >= 0 {
+        format!("+{}", input.timezone_offset)
+    } else {
+        format!("{}", input.timezone_offset)
+    };
 
-    fn name(&self) -> &str {
-        "datetime"
-    }
-
-    fn description(&self) -> &str {
-        "Get the current date and time, optionally adjusted by a timezone offset."
-    }
-
-    async fn call(&self, input: Self::Input) -> Result<Self::Output, String> {
-        let now = std::time::SystemTime::now();
-        let total_secs = now
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_secs() as i64;
-        let adjusted = total_secs + input.timezone_offset as i64 * 3600;
-        let days = adjusted / 86400;
-        let secs_in_day = adjusted % 86400;
-        let hours = secs_in_day / 3600;
-        let minutes = (secs_in_day % 3600) / 60;
-        let seconds = secs_in_day % 60;
-
-        // Simple date calculation from Unix epoch
-        let (year, month, day) = epoch_to_date(days);
-        let offset_label = if input.timezone_offset >= 0 {
-            format!("+{}", input.timezone_offset)
-        } else {
-            format!("{}", input.timezone_offset)
-        };
-
-        Ok(format!(
-            "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02} UTC{offset_label}",
-        ))
-    }
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02} UTC{offset_label}",
+    ))
 }
 
 fn epoch_to_date(days: i64) -> (i64, u32, u32) {

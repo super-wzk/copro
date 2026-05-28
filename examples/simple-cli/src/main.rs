@@ -2,7 +2,7 @@ use copro_agent::{Agent, AgentEvent, ToolRouter};
 use copro_api::message::{InputContent, Message, OutputContent, ToolResultStatus};
 use copro_api::stream::OutputContentDelta;
 use copro_harness::skills::{SkillHook, SkillRuntime, SkillToolRouter};
-use copro_harness::{CompositeToolRouter, LocalToolRouter};
+use copro_harness::{CompositeToolRouter, LocalToolRouter, tool_fn};
 use copro_provider_openai::{
     OpenAiResponsesModelConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
 };
@@ -15,7 +15,7 @@ mod skills;
 mod tools;
 
 use skills::ExampleSkillStore;
-use tools::{Calculator, DateTimeTool};
+use tools::{calculator, datetime};
 
 const SYSTEM_PROMPT: &str = "You are a helpful assistant. Answer concisely.";
 
@@ -37,8 +37,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     let local_tools: Arc<dyn ToolRouter> = Arc::new(LocalToolRouter::new(vec![
-        Arc::new(Calculator),
-        Arc::new(DateTimeTool),
+        tool_fn(
+            "calculator",
+            "Evaluate a simple arithmetic expression. Supports +, -, *, /, and parentheses.",
+            calculator,
+        ),
+        tool_fn(
+            "datetime",
+            "Get the current date and time, optionally adjusted by a timezone offset.",
+            datetime,
+        ),
     ]));
     let skill_runtime = Arc::new(SkillRuntime::new(Arc::new(ExampleSkillStore::new(
         env::current_dir()?.join("examples/simple-cli/skills"),
