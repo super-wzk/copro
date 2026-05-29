@@ -4,8 +4,10 @@ use copro_api::message::{InputContent, ToolCall, ToolResult, ToolResultStatus};
 use copro_harness::tools::{ErasedTool, LocalToolRouter};
 use copro_workspace::tools::GrepTool;
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::Arc;
-use vfs::async_vfs::{AsyncMemoryFS, AsyncVfsPath};
+use std::time::{Duration, SystemTime};
+use vfs::async_vfs::{AsyncMemoryFS, AsyncPhysicalFS, AsyncVfsPath};
 
 #[tokio::test]
 async fn defaults_to_files_with_matches() {
@@ -132,7 +134,23 @@ async fn count_mode_counts_matching_lines_per_file() {
     .await;
 
     assert_eq!(result.status, ToolResultStatus::Success);
-    assert_eq!(tool_text(&result), "a.txt:2\nb.txt:1");
+    assert_eq!(
+        tool_text(&result),
+        "a.txt:2\nb.txt:1\n[sort: path order; modification time unavailable from VFS for matched files]"
+    );
+}
+
+#[tokio::test]
+async fn sorts_results_by_modified_time_descending() {
+    let (root, temp_dir) = physical_root("grep-sort");
+    write_file_at(&root, "older.txt", b"needle\n", 1).await;
+    write_file_at(&root, "newer.txt", b"needle\n", 2).await;
+
+    let result = execute_grep(root, json!({ "pattern": "needle" })).await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(tool_text(&result), "newer.txt\nolder.txt");
+    std::fs::remove_dir_all(temp_dir).ok();
 }
 
 #[tokio::test]
@@ -191,6 +209,30 @@ async fn write_file(root: &AsyncVfsPath, path: &str, bytes: &[u8]) {
         .await
         .unwrap()
         .write_all(bytes)
+        .await
+        .unwrap();
+}
+
+fn physical_root(prefix: &str) -> (AsyncVfsPath, PathBuf) {
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("copro-workspace-{prefix}-{unique}"));
+    std::fs::create_dir_all(&path).unwrap();
+    (AsyncPhysicalFS::new(&path).into(), path)
+}
+
+async fn write_file_at(root: &AsyncVfsPath, path: &str, bytes: &[u8], modified_secs: u64) {
+    let path = root.join(path).unwrap();
+    path.parent().create_dir_all().await.unwrap();
+    path.create_file()
+        .await
+        .unwrap()
+        .write_all(bytes)
+        .await
+        .unwrap();
+    path.set_modification_time(SystemTime::UNIX_EPOCH + Duration::from_secs(modified_secs))
         .await
         .unwrap();
 }

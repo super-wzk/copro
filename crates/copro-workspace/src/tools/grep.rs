@@ -10,30 +10,29 @@ use ignore::overrides::{Override, OverrideBuilder};
 use ignore::types::{Types, TypesBuilder};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::cmp::Ordering;
 use std::io;
 use std::path::{Path, PathBuf};
-use vfs::VfsFileType;
+use std::time::{Duration, SystemTime};
 use vfs::async_vfs::AsyncVfsPath;
+use vfs::{VfsFileType, VfsMetadata};
 
 pub const GREP_TOOL_NAME: &str = "grep";
 
 const GREP_TOOL_DESCRIPTION: &str = concat!(
-    "A powerful workspace search tool built on ripgrep. Use this for search tasks instead of ",
-    "shelling out to grep or rg. Supports ripgrep regex syntax, glob and type filters, ",
-    "content/files_with_matches/count output modes, context lines, line numbers, ",
-    "case-insensitive search, output pagination, and multiline matching."
+    "Search workspace files with ripgrep regex. Supports glob/type filters, ",
+    "content/files_with_matches/count output modes, context lines, and multiline ",
+    "matching."
 );
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrepToolConfig {
-    pub description: String,
     pub default_head_limit: usize,
 }
 
 impl Default for GrepToolConfig {
     fn default() -> Self {
         Self {
-            description: GREP_TOOL_DESCRIPTION.to_string(),
             default_head_limit: 250,
         }
     }
@@ -130,7 +129,7 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        &self.config.description
+        GREP_TOOL_DESCRIPTION
     }
 
     fn execution_policy(&self) -> ToolExecutionPolicy {
@@ -276,6 +275,11 @@ struct OutputCollector {
     seen: usize,
     lines: Vec<String>,
     truncated: bool,
+    matched_files: Vec<MatchedFileSort>,
+}
+
+struct MatchedFileSort {
+    modified: Option<SystemTime>,
 }
 
 impl OutputCollector {
@@ -286,6 +290,7 @@ impl OutputCollector {
             seen: 0,
             lines: Vec::new(),
             truncated: false,
+            matched_files: Vec::new(),
         }
     }
 
@@ -307,6 +312,10 @@ impl OutputCollector {
         }
     }
 
+    fn record_matched_file(&mut self, modified: Option<SystemTime>) {
+        self.matched_files.push(MatchedFileSort { modified });
+    }
+
     fn should_stop(&self) -> bool {
         self.truncated
     }
@@ -323,6 +332,7 @@ impl OutputCollector {
             );
         }
 
+        let sort_note = sort_note_for_matched_files(&self.matched_files);
         let mut output = self.lines.join("\n");
         if self.truncated {
             output.push_str(&format!(
@@ -330,7 +340,28 @@ impl OutputCollector {
                 self.offset + self.lines.len()
             ));
         }
+        if let Some(sort_note) = sort_note {
+            output.push('\n');
+            output.push_str(sort_note);
+        }
         output
+    }
+}
+
+fn sort_note_for_matched_files(files: &[MatchedFileSort]) -> Option<&'static str> {
+    if files.len() <= 1 {
+        return None;
+    }
+
+    let missing_modified_count = files.iter().filter(|file| file.modified.is_none()).count();
+    match missing_modified_count {
+        0 => None,
+        count if count == files.len() => {
+            Some("[sort: path order; modification time unavailable from VFS for matched files]")
+        }
+        _ => Some(
+            "[sort: modification time descending; matched files without modification time sorted by path]",
+        ),
     }
 }
 
@@ -366,18 +397,51 @@ async fn search_vfs(
         return Ok(());
     }
 
+    let mut candidates = Vec::new();
     match metadata.file_type {
         VfsFileType::File => {
             if plan.filter.matches(&start) {
-                search_one_file(&start, metadata.len, plan, output).await?;
+                candidates.push(CandidateFile::new(start, &metadata));
             }
         }
         VfsFileType::Directory => {
-            search_directory(start, inherited_gitignores, plan, output).await?;
+            collect_candidate_files(start, inherited_gitignores, plan, &mut candidates).await?;
+        }
+    }
+
+    sort_candidate_files_by_modified_desc(&mut candidates);
+    for candidate in candidates {
+        if plan.cancel.is_cancelled() {
+            return Err("grep cancelled".to_string());
+        }
+        if output.should_stop() {
+            break;
+        }
+        if search_one_file(&candidate, plan, output).await? {
+            output.record_matched_file(candidate.modified);
         }
     }
 
     Ok(())
+}
+
+struct CandidateFile {
+    path: AsyncVfsPath,
+    display_path: String,
+    byte_len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl CandidateFile {
+    fn new(path: AsyncVfsPath, metadata: &VfsMetadata) -> Self {
+        let display_path = display_path(&path);
+        Self {
+            path,
+            display_path,
+            byte_len: metadata.len,
+            modified: metadata.modified,
+        }
+    }
 }
 
 struct PendingDir {
@@ -385,65 +449,51 @@ struct PendingDir {
     gitignores: Vec<Gitignore>,
 }
 
-enum PendingEntry {
-    Directory(PendingDir),
-    File(AsyncVfsPath, u64),
-}
-
-async fn search_directory(
+async fn collect_candidate_files(
     start: AsyncVfsPath,
     inherited_gitignores: Vec<Gitignore>,
     plan: &SearchPlan<'_>,
-    output: &mut OutputCollector,
+    candidates: &mut Vec<CandidateFile>,
 ) -> Result<(), String> {
-    let mut pending = vec![PendingEntry::Directory(PendingDir {
+    let mut pending = vec![PendingDir {
         path: start,
         gitignores: inherited_gitignores,
-    })];
+    }];
 
-    while let Some(entry) = pending.pop() {
+    while let Some(PendingDir {
+        path,
+        mut gitignores,
+    }) = pending.pop()
+    {
         if plan.cancel.is_cancelled() {
             return Err("grep cancelled".to_string());
         }
-        if output.should_stop() {
-            break;
+
+        if let Some(matcher) = load_gitignore_in_dir(&path).await? {
+            gitignores.push(matcher);
         }
 
-        match entry {
-            PendingEntry::File(path, byte_len) => {
-                search_one_file(&path, byte_len, plan, output).await?;
-            }
-            PendingEntry::Directory(PendingDir {
-                path,
-                mut gitignores,
-            }) => {
-                if let Some(matcher) = load_gitignore_in_dir(&path).await? {
-                    gitignores.push(matcher);
+        let mut entries = directory_entries(&path).await?;
+        entries.sort_by_key(|(path, _)| display_path(path));
+
+        for (entry_path, metadata) in entries.into_iter().rev() {
+            match metadata.file_type {
+                VfsFileType::File => {
+                    if !is_under_git_dir(&entry_path)
+                        && !gitignore_is_ignored(&gitignores, &entry_path, false)
+                        && plan.filter.matches(&entry_path)
+                    {
+                        candidates.push(CandidateFile::new(entry_path, &metadata));
+                    }
                 }
-
-                let mut entries = directory_entries(&path).await?;
-                entries.sort_by_key(|(path, _)| display_path(path));
-
-                for (entry_path, metadata) in entries.into_iter().rev() {
-                    match metadata.file_type {
-                        VfsFileType::File => {
-                            if !is_under_git_dir(&entry_path)
-                                && !gitignore_is_ignored(&gitignores, &entry_path, false)
-                                && plan.filter.matches(&entry_path)
-                            {
-                                pending.push(PendingEntry::File(entry_path, metadata.len));
-                            }
-                        }
-                        VfsFileType::Directory => {
-                            if !is_git_dir(&entry_path)
-                                && !gitignore_is_ignored(&gitignores, &entry_path, true)
-                            {
-                                pending.push(PendingEntry::Directory(PendingDir {
-                                    path: entry_path,
-                                    gitignores: gitignores.clone(),
-                                }));
-                            }
-                        }
+                VfsFileType::Directory => {
+                    if !is_git_dir(&entry_path)
+                        && !gitignore_is_ignored(&gitignores, &entry_path, true)
+                    {
+                        pending.push(PendingDir {
+                            path: entry_path,
+                            gitignores: gitignores.clone(),
+                        });
                     }
                 }
             }
@@ -453,17 +503,48 @@ async fn search_directory(
     Ok(())
 }
 
+fn sort_candidate_files_by_modified_desc(files: &mut [CandidateFile]) {
+    files.sort_by(|left, right| {
+        compare_modified_desc_then_path(
+            left.modified.as_ref(),
+            &left.display_path,
+            right.modified.as_ref(),
+            &right.display_path,
+        )
+    });
+}
+
+fn compare_modified_desc_then_path(
+    left_modified: Option<&SystemTime>,
+    left_path: &str,
+    right_modified: Option<&SystemTime>,
+    right_path: &str,
+) -> Ordering {
+    let left_key = modified_sort_key(left_modified);
+    let right_key = modified_sort_key(right_modified);
+    right_key
+        .cmp(&left_key)
+        .then_with(|| left_path.cmp(right_path))
+}
+
+fn modified_sort_key(modified: Option<&SystemTime>) -> Option<Duration> {
+    modified.and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+}
+
 async fn search_one_file(
-    path: &AsyncVfsPath,
-    byte_len: u64,
+    candidate: &CandidateFile,
     plan: &SearchPlan<'_>,
     output: &mut OutputCollector,
-) -> Result<(), String> {
-    let bytes = read_file_bytes(path, byte_len.try_into().unwrap_or_default()).await?;
+) -> Result<bool, String> {
+    let bytes = read_file_bytes(
+        &candidate.path,
+        candidate.byte_len.try_into().unwrap_or_default(),
+    )
+    .await?;
     let mut searcher = build_searcher(plan.options);
-    let display = display_path(path);
+    let display = candidate.display_path.clone();
 
-    match plan.mode {
+    let has_match = match plan.mode {
         GrepOutputMode::FilesWithMatches => {
             let mut sink = MatchOnlySink::default();
             searcher
@@ -472,6 +553,7 @@ async fn search_one_file(
             if sink.has_match {
                 output.push(display);
             }
+            sink.has_match
         }
         GrepOutputMode::Count => {
             let mut sink = CountSink::default();
@@ -481,20 +563,23 @@ async fn search_one_file(
             if sink.match_count > 0 {
                 output.push(format!("{display}:{}", sink.match_count));
             }
+            sink.match_count > 0
         }
         GrepOutputMode::Content => {
             let mut sink = ContentSink {
                 path: display,
                 show_line_numbers: plan.options.line_numbers,
                 output,
+                has_match: false,
             };
             searcher
                 .search_slice(plan.matcher, &bytes, &mut sink)
                 .map_err(|error| error.to_string())?;
+            sink.has_match
         }
-    }
+    };
 
-    Ok(())
+    Ok(has_match)
 }
 
 #[derive(Debug, Default)]
@@ -529,12 +614,14 @@ struct ContentSink<'a> {
     path: String,
     show_line_numbers: bool,
     output: &'a mut OutputCollector,
+    has_match: bool,
 }
 
 impl Sink for ContentSink<'_> {
     type Error = io::Error;
 
     fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        self.has_match = true;
         for (index, line) in mat.lines().enumerate() {
             let line_number = mat.line_number().map(|number| number + index as u64);
             let output_line = render_grep_line(

@@ -16,45 +16,22 @@ pub const EDIT_TOOL_NAME: &str = "edit";
 const EDIT_TOOL_DESCRIPTION: &str =
     "Edit a text file. Requires the file to have been read first in this conversation.";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EditToolConfig {
-    pub description: String,
-}
-
-impl Default for EditToolConfig {
-    fn default() -> Self {
-        Self {
-            description: EDIT_TOOL_DESCRIPTION.to_string(),
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct EditTool {
     root: AsyncVfsPath,
-    config: EditToolConfig,
     cache: FileCache,
 }
 
 impl EditTool {
     pub fn new(root: AsyncVfsPath) -> Self {
-        Self::with_cache_and_config(root, None, EditToolConfig::default())
+        Self {
+            root,
+            cache: FileCache::default(),
+        }
     }
 
     pub fn with_cache(root: AsyncVfsPath, cache: FileCache) -> Self {
-        Self::with_cache_and_config(root, Some(cache), EditToolConfig::default())
-    }
-
-    fn with_cache_and_config(
-        root: AsyncVfsPath,
-        cache: Option<FileCache>,
-        config: EditToolConfig,
-    ) -> Self {
-        Self {
-            root,
-            config,
-            cache: cache.unwrap_or_default(),
-        }
+        Self { root, cache }
     }
 
     pub fn cache(&self) -> &FileCache {
@@ -85,7 +62,7 @@ impl Tool for EditTool {
     }
 
     fn description(&self) -> &str {
-        &self.config.description
+        EDIT_TOOL_DESCRIPTION
     }
 
     fn execution_policy(&self) -> ToolExecutionPolicy {
