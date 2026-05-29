@@ -7,13 +7,14 @@ use copro_harness::tools::{CompositeToolRouter, LocalToolRouter};
 use copro_provider_openai::{
     OpenAiResponsesModelConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
 };
-use copro_workspace::tools::{EditTool, GlobTool, GrepTool, LsTool, ReadTool, WriteTool};
+use copro_workspace::WorkspaceToolRouter;
 use futures_util::StreamExt;
+use futures_util::io::AsyncWriteExt;
 use std::env;
 use std::error::Error as StdError;
 use std::io::{self, Write};
 use std::sync::Arc;
-use vfs::async_vfs::AsyncPhysicalFS;
+use vfs::async_vfs::{AsyncMemoryFS, AsyncVfsPath};
 
 mod skills;
 mod tools;
@@ -41,26 +42,10 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             ..OpenAiResponsesModelConfig::default()
         },
     )?;
-    let read_tool = Arc::new(ReadTool::new(
-        AsyncPhysicalFS::new(env::current_dir()?).into(),
-    ));
-    let write_tool = Arc::new(WriteTool::with_cache(
-        AsyncPhysicalFS::new(env::current_dir()?).into(),
-        Arc::clone(read_tool.cache()),
-    ));
-    let edit_tool = Arc::new(EditTool::with_cache(
-        AsyncPhysicalFS::new(env::current_dir()?).into(),
-        Arc::clone(read_tool.cache()),
-    ));
-    let grep_tool = Arc::new(GrepTool::new(
-        AsyncPhysicalFS::new(env::current_dir()?).into(),
-    ));
-    let glob_tool = Arc::new(GlobTool::new(
-        AsyncPhysicalFS::new(env::current_dir()?).into(),
-    ));
-    let ls_tool = Arc::new(LsTool::new(
-        AsyncPhysicalFS::new(env::current_dir()?).into(),
-    ));
+
+    let root = AsyncMemoryFS::new().into();
+    setup_workspace(&root).await;
+
     let local_tools: Arc<dyn ToolRouter> = Arc::new(LocalToolRouter::new(vec![
         tool!(
             "calculator",
@@ -74,19 +59,14 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             datetime,
             policy = ToolExecutionPolicy::Parallel,
         ),
-        read_tool.clone(),
-        write_tool,
-        edit_tool,
-        grep_tool,
-        glob_tool,
-        ls_tool,
     ]));
+    let workspace_tools = Arc::new(WorkspaceToolRouter::new(root));
     let skill_runtime = Arc::new(SkillRuntime::new(Arc::new(ExampleSkillStore::new(
         env::current_dir()?.join("examples/simple-cli/skills"),
     ))));
-    let skill_tools: Arc<dyn ToolRouter> =
-        Arc::new(SkillToolRouter::new(Arc::clone(&skill_runtime)));
-    let tool_router = CompositeToolRouter::new(vec![local_tools, skill_tools]);
+    let skill_tools = Arc::new(SkillToolRouter::new(Arc::clone(&skill_runtime)));
+    let tool_router =
+        CompositeToolRouter::new(vec![local_tools, workspace_tools.clone(), skill_tools]);
     let mut agent = Agent::new(model, Arc::new(tool_router));
     agent.hooks.push(Arc::new(SkillHook::new(skill_runtime)));
 
@@ -112,7 +92,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         }
         if input == "/clear" {
             agent.messages.clear();
-            read_tool.clear_cache();
+            workspace_tools.clear_cache();
             agent
                 .messages
                 .push(Message::System(vec![text(SYSTEM_PROMPT)]));
@@ -212,6 +192,33 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     }
 
     Ok(())
+}
+
+async fn setup_workspace(root: &AsyncVfsPath) {
+    write_file(root, "README.md", b"# Demo\n\nA simple CLI demo.\n").await;
+    write_file(root, "src/main.rs", b"fn main() {}\n").await;
+    write_file(root, "tests/lib.rs", b"#[test]\nfn ok() {}\n").await;
+    write_file(root, ".gitignore", b"*.log\n").await;
+
+    let png = &[
+        0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc,
+        0xcf, 0xc0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x05, 0xfe, 0xd8, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+    write_file(root, "assets/logo.png", png).await;
+}
+
+async fn write_file(root: &AsyncVfsPath, path: &str, bytes: &[u8]) {
+    let path = root.join(path).unwrap();
+    path.parent().create_dir_all().await.unwrap();
+    path.create_file()
+        .await
+        .unwrap()
+        .write_all(bytes)
+        .await
+        .unwrap();
 }
 
 fn text(t: impl Into<String>) -> InputContent {
