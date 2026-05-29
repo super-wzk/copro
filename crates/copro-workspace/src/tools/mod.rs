@@ -3,6 +3,7 @@ mod glob;
 mod grep;
 mod read;
 mod utils;
+mod vfs_walk;
 mod write;
 
 pub use edit::{EditTool, EditToolInput};
