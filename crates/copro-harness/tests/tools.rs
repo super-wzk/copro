@@ -10,6 +10,7 @@ use copro_harness::tools::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
+use std::result::Result as StdResult;
 use std::sync::Arc;
 
 #[tokio::test]
@@ -104,7 +105,7 @@ struct EchoInput {
     message: String,
 }
 
-async fn echo(input: EchoInput, _cancel: CancellationToken) -> std::result::Result<String, String> {
+async fn echo(input: EchoInput, _cancel: CancellationToken) -> StdResult<String, String> {
     Ok(format!("echo: {}", input.message))
 }
 

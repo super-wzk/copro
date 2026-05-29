@@ -68,7 +68,7 @@ macro_rules! impl_json_tool_output {
     ($($ty:ty),* $(,)?) => {
         $(
             impl ToolOutput for $ty {
-                fn into_tool_result_content(self) -> std::result::Result<Vec<InputContent>, String> {
+                fn into_tool_result_content(self) -> Result<Vec<InputContent>, String> {
                     json_output_content(self)
                 }
             }

@@ -9,6 +9,7 @@ use copro_provider_openai::{
 };
 use futures_util::StreamExt;
 use std::env;
+use std::error::Error as StdError;
 use std::io::{self, Write};
 use std::sync::Arc;
 
@@ -21,7 +22,7 @@ use tools::{calculator, datetime};
 const SYSTEM_PROMPT: &str = "You are a helpful assistant. Answer concisely.";
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn StdError>> {
     let provider = OpenAiResponsesProvider::new(OpenAiResponsesProviderConfig {
         api_key: env_var("OPENAI_API_KEY"),
         api_base: env_var("OPENAI_API_BASE"),

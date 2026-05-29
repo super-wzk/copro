@@ -9,8 +9,12 @@ use copro_api::message::{
 use copro_api::request::{GenerateRequest, GenerateRequestOptions};
 use copro_api::stream::{Model, ModelStream, OutputStreamEvent, OutputStreamState};
 use futures_util::{StreamExt, stream::FuturesUnordered};
+use std::any::Any;
+use std::mem;
+use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -264,13 +268,18 @@ impl Agent {
 
         let tools = Arc::clone(&self.tools);
         let cancel = self.stop_signal.token();
-        let calls = std::mem::take(batch);
+        let calls = mem::take(batch);
         let mut futures: FuturesUnordered<_> = calls
             .into_iter()
-            .map(|tool| {
+            .enumerate()
+            .map(|(index, tool)| {
                 let tools = Arc::clone(&tools);
                 let cancel = cancel.child_token();
-                async move { Self::execute_tool_call_with_router(tools, tool, cancel).await }
+                async move {
+                    Self::execute_tool_call_with_router(tools, tool, cancel)
+                        .await
+                        .map(|completed| (index, completed))
+                }
             })
             .collect();
 
@@ -293,7 +302,11 @@ impl Agent {
                 }
             }
         }
-        Ok(completed)
+        completed.sort_unstable_by_key(|(index, _)| *index);
+        Ok(completed
+            .into_iter()
+            .map(|(_, completed)| completed)
+            .collect())
     }
 
     async fn execute_tool_call_with_router(
@@ -308,26 +321,11 @@ impl Agent {
         }));
         tokio::select! {
             biased;
-            result = &mut handle => {
-                match result {
-                    Ok(Ok(result)) => Ok((tool_for_abort, result)),
-                    Ok(Err(error)) => Err(error),
-                    Err(join_error) if join_error.is_cancelled() => {
-                        Ok((tool_for_abort.clone(), aborted_tool_result(&tool_for_abort)))
-                    }
-                    Err(join_error) => Err(Error::client(format!("tool task panicked: {join_error}"))),
-                }
-            }
+            result = &mut handle => join_tool_task_result(tool_for_abort, result),
             _ = cancel.cancelled() => {
                 tokio::select! {
                     biased;
-                    result = &mut handle => {
-                        match result {
-                            Ok(Ok(result)) => Ok((tool_for_abort, result)),
-                            Ok(Err(error)) => Err(error),
-                            Err(_) => Ok((tool_for_abort.clone(), aborted_tool_result(&tool_for_abort))),
-                        }
-                    }
+                    result = &mut handle => join_tool_task_result(tool_for_abort, result),
                     _ = tokio::time::sleep(Duration::from_millis(100)) => {
                         handle.abort();
                         Ok((tool_for_abort.clone(), aborted_tool_result(&tool_for_abort)))
@@ -374,6 +372,51 @@ fn aborted_tool_result(tool: &ToolCall) -> ToolResult {
         name: tool.name.clone(),
         status: ToolResultStatus::Error,
         content: vec![InputContent::Text("aborted by user".to_string())],
+    }
+}
+
+fn join_tool_task_result(
+    tool: ToolCall,
+    result: StdResult<Result<ToolResult>, JoinError>,
+) -> Result<(ToolCall, ToolResult)> {
+    match result {
+        Ok(Ok(result)) => Ok((tool, result)),
+        Ok(Err(error)) => Err(error),
+        Err(join_error) if join_error.is_cancelled() => {
+            let result = aborted_tool_result(&tool);
+            Ok((tool, result))
+        }
+        Err(join_error) => {
+            let result = panicked_tool_result(&tool, join_error);
+            Ok((tool, result))
+        }
+    }
+}
+
+fn panicked_tool_result(tool: &ToolCall, join_error: JoinError) -> ToolResult {
+    let panic_message = if join_error.is_panic() {
+        panic_payload_to_string(join_error.into_panic())
+    } else {
+        join_error.to_string()
+    };
+
+    ToolResult {
+        call_id: tool.id.clone(),
+        name: tool.name.clone(),
+        status: ToolResultStatus::Error,
+        content: vec![InputContent::Text(format!(
+            "tool task panicked: {panic_message}"
+        ))],
+    }
+}
+
+fn panic_payload_to_string(payload: Box<dyn Any + Send + 'static>) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
     }
 }
 

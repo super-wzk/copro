@@ -1,6 +1,7 @@
 use copro_agent::CancellationToken;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---- Calculator ------------------------------------------------------------
 
@@ -155,9 +156,9 @@ pub struct DateTimeInput {
 }
 
 pub async fn datetime(input: DateTimeInput, _cancel: CancellationToken) -> Result<String, String> {
-    let now = std::time::SystemTime::now();
+    let now = SystemTime::now();
     let total_secs = now
-        .duration_since(std::time::UNIX_EPOCH)
+        .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?
         .as_secs() as i64;
     let adjusted = total_secs + input.timezone_offset as i64 * 3600;

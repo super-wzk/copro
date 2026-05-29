@@ -373,6 +373,62 @@ async fn run_stream_awaits_async_tool_router() {
 }
 
 #[tokio::test]
+async fn tool_task_panic_is_committed_as_error_tool_result() {
+    let mut agent = Agent::new(
+        Arc::new(ToolThenDoneModel {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(PanicToolRouter),
+    );
+
+    let events = agent
+        .run_stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolResult(ToolResult {
+            call_id,
+            name,
+            status: ToolResultStatus::Error,
+            content,
+        }) if call_id == "call-1"
+            && name == "double"
+            && content == &vec![InputContent::Text("tool task panicked: boom".to_string())]
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::OutputFinished {
+            content,
+            reason: FinishReason::Stop,
+            usage: None,
+        }) if content == &vec![OutputContent::Text("done".to_string())]
+    ));
+    assert!(matches!(
+        agent.messages.as_slice(),
+        [
+            Message::Assistant(assistant_content),
+            Message::Tool(ToolResult {
+                call_id,
+                name,
+                status: ToolResultStatus::Error,
+                content,
+            }),
+            Message::Assistant(done_content),
+        ] if matches!(assistant_content.as_slice(), [OutputContent::ToolCall(ToolCall { id, name, .. })]
+            if id == "call-1" && name == "double")
+            && call_id == "call-1"
+            && name == "double"
+            && content == &vec![InputContent::Text("tool task panicked: boom".to_string())]
+            && done_content == &vec![OutputContent::Text("done".to_string())]
+    ));
+}
+
+#[tokio::test]
 async fn run_stream_batches_parallel_tools_behind_serial_barriers() {
     let router = Arc::new(ConcurrentToolRouter::default());
     let tool_router: Arc<dyn ToolRouter> = router.clone();
@@ -495,6 +551,19 @@ impl ToolRouter for DoubleToolRouter {
     }
 }
 
+struct PanicToolRouter;
+
+#[async_trait]
+impl ToolRouter for PanicToolRouter {
+    async fn definitions(&self) -> Result<Vec<ToolDefinition>> {
+        DoubleToolRouter.definitions().await
+    }
+
+    async fn execute(&self, _call: ToolCall, _cancel: CancellationToken) -> Result<ToolResult> {
+        panic!("boom")
+    }
+}
+
 struct StopDuringToolRouter {
     stop_signal: StopSignal,
 }
@@ -561,7 +630,12 @@ impl ToolRouter for ConcurrentToolRouter {
             }
             let active = self.active_parallel.fetch_add(1, Ordering::SeqCst) + 1;
             update_max(&self.max_parallel, active);
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            let delay = match call.name.as_str() {
+                "p1" | "p3" => Duration::from_millis(30),
+                "p2" | "p4" => Duration::from_millis(1),
+                _ => Duration::from_millis(10),
+            };
+            tokio::time::sleep(delay).await;
             self.active_parallel.fetch_sub(1, Ordering::SeqCst);
         }
 

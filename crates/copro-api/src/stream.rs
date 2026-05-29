@@ -5,6 +5,7 @@ use crate::response::*;
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::mem;
 use std::pin::Pin;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,7 +67,7 @@ impl OutputStreamState {
             OutputStreamEvent::Finished { reason, usage } => {
                 self.finished = true;
                 Ok(Some(GenerateResponse {
-                    message: Message::Assistant(finish_output_content(std::mem::take(
+                    message: Message::Assistant(finish_output_content(mem::take(
                         &mut self.content,
                     ))?),
                     reason,

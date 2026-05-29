@@ -8,6 +8,7 @@ use copro_api::message::{InputContent, ToolCall, ToolResult, ToolResultStatus};
 use copro_api::tool::ToolDefinition;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::result::Result as StdResult;
 use std::sync::Arc;
 
 pub(crate) const LOAD_SKILL_TOOL_NAME: &str = "load_skill";
@@ -48,7 +49,7 @@ impl Tool for LoadSkillTool {
         &self,
         input: Self::Input,
         _cancel: CancellationToken,
-    ) -> std::result::Result<Self::Output, String> {
+    ) -> StdResult<Self::Output, String> {
         self.runtime
             .load(&input.name)
             .await
