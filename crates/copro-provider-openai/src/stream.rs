@@ -270,14 +270,19 @@ impl OpenAiEventMapper {
         if let Some(item_id) = event
             .get("item_id")
             .or_else(|| event.pointer("/item/id"))
+            .or_else(|| event.pointer("/item/call_id"))
             .and_then(Value::as_str)
         {
             return Ok(self.synthetic_output_index(item_id));
         }
 
-        Err(Error::protocol(format!(
-            "OpenAI stream event `{event_type}` is missing output_index"
-        )))
+        Ok(self.next_anonymous_output_index())
+    }
+
+    fn next_anonymous_output_index(&mut self) -> u32 {
+        let index = self.next_synthetic_output_index;
+        self.next_synthetic_output_index = self.next_synthetic_output_index.saturating_add(1);
+        index
     }
 
     fn synthetic_output_index(&mut self, item_id: &str) -> u32 {
