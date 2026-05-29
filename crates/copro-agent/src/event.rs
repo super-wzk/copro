@@ -1,5 +1,5 @@
 use copro_api::error::Result;
-use copro_api::message::{OutputContent, ToolResult};
+use copro_api::message::{OutputContent, ToolCall, ToolResult};
 use copro_api::response::{FinishReason, Usage};
 use copro_api::stream::OutputContentDelta;
 use std::pin::Pin;
@@ -15,6 +15,8 @@ pub enum AgentEvent {
         reason: FinishReason,
         usage: Option<Usage>,
     },
+    /// A tool call is about to execute.
+    ToolCallStarted(ToolCall),
     /// A tool execution result committed as a tool message.
     ToolResult(ToolResult),
 }

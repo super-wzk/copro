@@ -142,6 +142,13 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                             }
                         }
                     }
+                    AgentEvent::ToolCallStarted(tool_call) => {
+                        if streaming_thinking {
+                            eprintln!();
+                            streaming_thinking = false;
+                        }
+                        eprintln!("[tool started] {}", tool_call.name);
+                    }
                     AgentEvent::ToolResult(result) => {
                         if streaming_thinking {
                             eprintln!();

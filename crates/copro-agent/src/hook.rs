@@ -59,13 +59,13 @@ impl AgentHooks {
         Ok(ToolCallDecision::Allow)
     }
 
-    pub(crate) async fn after_tool_call(
+    pub(crate) async fn before_tool_result_commit(
         &self,
         tool: &ToolCall,
         result: &mut ToolResult,
     ) -> Result<()> {
         for hook in &self.hooks {
-            hook.after_tool_call(tool, result).await?;
+            hook.before_tool_result_commit(tool, result).await?;
         }
         Ok(())
     }
@@ -161,18 +161,45 @@ pub trait AgentHook: Send + Sync {
         Ok(())
     }
 
+    /// Inspect or rewrite the full batch of tool calls during planning, before
+    /// any of them are authorized or executed.
     async fn before_tool_plan(&self, _tool_calls: &mut Vec<ToolCall>) -> Result<()> {
         Ok(())
     }
 
+    /// Authorize a single tool call during the planning stage.
+    ///
+    /// This is an approval gate, not an execution-time hook: it runs while the
+    /// turn is building its execution plan, before any tool runs and possibly
+    /// well before this specific tool is dispatched. Returning
+    /// [`ToolCallDecision::Reject`] short-circuits the tool with an error
+    /// result instead of executing it. The actual start of execution is
+    /// observable via the `ToolCallStarted` agent event.
     async fn before_tool_call(&self, _tool: &mut ToolCall) -> Result<ToolCallDecision> {
         Ok(ToolCallDecision::Allow)
     }
 
-    async fn after_tool_call(&self, _tool: &ToolCall, _result: &mut ToolResult) -> Result<()> {
+    /// Rewrite a tool result just before it is committed to conversation
+    /// history.
+    ///
+    /// This runs during the commit stage in deterministic plan order, after the
+    /// tool has finished executing but before the result is pushed onto the
+    /// message history. For parallel batches it does not fire the instant an
+    /// individual tool resolves; results are committed together once the batch
+    /// completes. Mirror of [`AgentHook::before_output_commit`] for tool
+    /// results. The read-only counterpart is
+    /// [`AgentHook::after_tool_result_commit`].
+    async fn before_tool_result_commit(
+        &self,
+        _tool: &ToolCall,
+        _result: &mut ToolResult,
+    ) -> Result<()> {
         Ok(())
     }
 
+    /// Observe a tool result after it has been committed to conversation
+    /// history. Read-only counterpart of
+    /// [`AgentHook::before_tool_result_commit`].
     async fn after_tool_result_commit(&self, _tool: &ToolCall, _result: &ToolResult) -> Result<()> {
         Ok(())
     }

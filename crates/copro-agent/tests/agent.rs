@@ -352,16 +352,32 @@ async fn run_stream_awaits_async_tool_router() {
         .collect::<Result<Vec<_>>>()
         .unwrap();
 
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::ToolResult(ToolResult {
-            name,
-            status: ToolResultStatus::Success,
-            content,
-            ..
-        }) if name == "double"
-            && content == &vec![InputContent::Text("42".to_string())]
-    )));
+    let started_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolCallStarted(ToolCall { id, name, .. })
+                    if id == "call-1" && name == "double"
+            )
+        })
+        .unwrap();
+    let result_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolResult(ToolResult {
+                    name,
+                    status: ToolResultStatus::Success,
+                    content,
+                    ..
+                }) if name == "double"
+                    && content == &vec![InputContent::Text("42".to_string())]
+            )
+        })
+        .unwrap();
+    assert!(started_index < result_index);
     assert!(matches!(
         events.last(),
         Some(AgentEvent::OutputFinished {
@@ -447,6 +463,13 @@ async fn run_stream_batches_parallel_tools_behind_serial_barriers() {
         .collect::<Result<Vec<_>>>()
         .unwrap();
 
+    let started_names = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolCallStarted(tool) => Some(tool.name.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     let tool_names = events
         .iter()
         .filter_map(|event| match event {
@@ -455,6 +478,7 @@ async fn run_stream_batches_parallel_tools_behind_serial_barriers() {
         })
         .collect::<Vec<_>>();
 
+    assert_eq!(started_names, vec!["p1", "p2", "serial", "p3", "p4"]);
     assert_eq!(tool_names, vec!["p1", "p2", "serial", "p3", "p4"]);
     assert_eq!(router.max_parallel.load(Ordering::SeqCst), 2);
     assert_eq!(router.barrier_violations.load(Ordering::SeqCst), 0);

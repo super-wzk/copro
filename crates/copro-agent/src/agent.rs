@@ -158,7 +158,40 @@ impl Agent {
                                 finish_after_commit: true,
                             }
                         } else {
-                            let completed_tools = self.execute_tool_plan(plan).await?;
+                            let mut completed_tools: Vec<(ToolCall, ToolResult)> = Vec::new();
+                            let mut parallel_batch: Vec<ToolCall> = Vec::new();
+
+                            for (tool, policy, completed_result) in plan {
+                                if let Some(result) = completed_result {
+                                    for tool in &parallel_batch {
+                                        yield AgentEvent::ToolCallStarted(tool.clone());
+                                    }
+                                    completed_tools.extend(
+                                        self.execute_parallel_batch(&mut parallel_batch).await?,
+                                    );
+                                    completed_tools.push((tool, result));
+                                } else if policy == ToolExecutionPolicy::Parallel {
+                                    parallel_batch.push(tool);
+                                } else {
+                                    for tool in &parallel_batch {
+                                        yield AgentEvent::ToolCallStarted(tool.clone());
+                                    }
+                                    completed_tools.extend(
+                                        self.execute_parallel_batch(&mut parallel_batch).await?,
+                                    );
+                                    yield AgentEvent::ToolCallStarted(tool.clone());
+                                    completed_tools.push(
+                                        self.execute_tool_call(tool, self.stop_signal.token())
+                                            .await?,
+                                    );
+                                }
+                            }
+
+                            for tool in &parallel_batch {
+                                yield AgentEvent::ToolCallStarted(tool.clone());
+                            }
+                            completed_tools
+                                .extend(self.execute_parallel_batch(&mut parallel_batch).await?);
                             TurnState::ToolResultCommit {
                                 completed_tools,
                                 finish_after_commit: self.stop_signal.is_requested(),
@@ -170,7 +203,7 @@ impl Agent {
                         finish_after_commit,
                     } => {
                         for (tool, mut result) in completed_tools {
-                            self.hooks.after_tool_call(&tool, &mut result).await?;
+                            self.hooks.before_tool_result_commit(&tool, &mut result).await?;
                             self.messages.push(Message::Tool(result.clone()));
                             self.hooks.after_tool_result_commit(&tool, &result).await?;
                             yield AgentEvent::ToolResult(result);
@@ -222,32 +255,6 @@ impl Agent {
         }
 
         Ok(plan)
-    }
-
-    async fn execute_tool_plan(
-        &self,
-        plan: Vec<(ToolCall, ToolExecutionPolicy, Option<ToolResult>)>,
-    ) -> Result<Vec<(ToolCall, ToolResult)>> {
-        let mut completed_tools = Vec::new();
-        let mut parallel_batch = Vec::new();
-
-        for (tool, policy, completed_result) in plan {
-            if let Some(result) = completed_result {
-                completed_tools.extend(self.execute_parallel_batch(&mut parallel_batch).await?);
-                completed_tools.push((tool, result));
-            } else if policy == ToolExecutionPolicy::Parallel {
-                parallel_batch.push(tool);
-            } else {
-                completed_tools.extend(self.execute_parallel_batch(&mut parallel_batch).await?);
-                completed_tools.push(
-                    self.execute_tool_call(tool, self.stop_signal.token())
-                        .await?,
-                );
-            }
-        }
-
-        completed_tools.extend(self.execute_parallel_batch(&mut parallel_batch).await?);
-        Ok(completed_tools)
     }
 
     async fn execute_tool_call(
