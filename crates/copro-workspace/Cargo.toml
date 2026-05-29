@@ -10,6 +10,7 @@ copro-api.workspace = true
 copro-harness.workspace = true
 schemars.workspace = true
 serde.workspace = true
+similar.workspace = true
 vfs.workspace = true
 
 [dev-dependencies]

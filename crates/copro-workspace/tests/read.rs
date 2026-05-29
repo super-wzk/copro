@@ -15,7 +15,7 @@ async fn reads_text_file_with_line_numbers() {
     let result = execute_read(root, json!({ "path": "hello.txt" })).await;
 
     assert_eq!(result.status, ToolResultStatus::Success);
-    assert_eq!(tool_text(&result), "[read] hello.txt\n1\thello\n2\tworld");
+    assert_eq!(tool_text(&result), "hello.txt\n1\thello\n2\tworld");
 }
 
 #[tokio::test]
@@ -32,7 +32,7 @@ async fn reads_text_file_with_offset_and_limit() {
     assert_eq!(result.status, ToolResultStatus::Success);
     assert_eq!(
         tool_text(&result),
-        "[read] hello.txt\n2\ttwo\n3\tthree\n[truncated: reached line limit; continue with offset=4]"
+        "hello.txt\n2\ttwo\n3\tthree\n[truncated: reached line limit; continue with offset=4]"
     );
 }
 
@@ -49,28 +49,10 @@ async fn truncates_after_default_line_limit() {
 
     assert_eq!(result.status, ToolResultStatus::Success);
     let text = tool_text(&result);
-    assert!(text.starts_with("[read] large.txt\n"));
+    assert!(text.starts_with("large.txt\n"));
     assert!(text.contains("   1\tline 1"));
     assert!(text.contains("2000\tline 2000"));
     assert!(text.ends_with("[truncated: reached line limit; continue with offset=2001]"));
-}
-
-#[tokio::test]
-async fn truncates_after_default_byte_limit() {
-    let root = memory_root().await;
-    let mut text = String::new();
-    for index in 1..=1000 {
-        text.push_str(&format!("line {index:04} {}\n", "x".repeat(100)));
-    }
-    write_file(&root, "wide.txt", text.as_bytes()).await;
-
-    let result = execute_read(root, json!({ "path": "wide.txt" })).await;
-
-    assert_eq!(result.status, ToolResultStatus::Success);
-    let text = tool_text(&result);
-    assert!(text.starts_with("[read] wide.txt\n"));
-    assert!(text.contains("   1\tline 0001"));
-    assert!(text.contains("[truncated: reached byte limit; continue with offset="));
 }
 
 #[tokio::test]
@@ -82,7 +64,6 @@ async fn respects_configured_line_limits() {
         root,
         ReadToolConfig {
             max_line_limit: 1,
-            max_text_bytes: 50 * 1024,
             line_numbers: true,
         },
     ));
@@ -99,7 +80,7 @@ async fn respects_configured_line_limits() {
     assert_eq!(result.status, ToolResultStatus::Success);
     assert_eq!(
         tool_text(&result),
-        "[read] hello.txt\n1\ta\n[truncated: reached line limit; continue with offset=2]"
+        "hello.txt\n1\ta\n[truncated: reached line limit; continue with offset=2]"
     );
 }
 
@@ -149,6 +130,38 @@ async fn rejects_paths_that_escape_root() {
 
     assert_eq!(result.status, ToolResultStatus::Error);
     assert!(tool_text(&result).contains("Could not get metadata"));
+}
+
+#[tokio::test]
+async fn dedups_unchanged_file_content() {
+    let root = memory_root().await;
+    write_file(&root, "notes.txt", b"hello\nworld\n").await;
+
+    let tool: Arc<dyn ErasedTool> = Arc::new(ReadTool::new(root));
+    let router = LocalToolRouter::new(vec![tool]);
+
+    // First read: full content
+    let first = router
+        .execute(
+            call(json!({ "path": "notes.txt" })),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status, ToolResultStatus::Success);
+    assert!(tool_text(&first).contains("hello"));
+    assert!(tool_text(&first).contains("world"));
+
+    // Second read: same content → placeholder
+    let second = router
+        .execute(
+            call(json!({ "path": "notes.txt" })),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status, ToolResultStatus::Success);
+    assert_eq!(tool_text(&second), "notes.txt — unchanged since last read");
 }
 
 async fn memory_root() -> AsyncVfsPath {

@@ -40,6 +40,7 @@ futures-util = "0.3"
 proc-macro2 = "1"
 quote = "1"
 schemars = "1.2.1"
+similar = "3"
 syn = { version = "2", features = ["derive", "parsing", "printing"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "time"] }

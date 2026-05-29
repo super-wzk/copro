@@ -3,11 +3,11 @@ use copro_api::message::{InputContent, Message, OutputContent, ToolResultStatus}
 use copro_api::stream::OutputContentDelta;
 use copro_harness::skills::{SkillHook, SkillRuntime, SkillToolRouter};
 use copro_harness::tool;
-use copro_harness::tools::{CompositeToolRouter, LocalToolRouter};
+use copro_harness::tools::{CompositeToolRouter, ErasedTool, LocalToolRouter};
 use copro_provider_openai::{
     OpenAiResponsesModelConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
 };
-use copro_workspace::tools::ReadTool;
+use copro_workspace::tools::{EditTool, ReadTool};
 use futures_util::StreamExt;
 use std::env;
 use std::error::Error as StdError;
@@ -41,6 +41,13 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             ..OpenAiResponsesModelConfig::default()
         },
     )?;
+    let read_tool = Arc::new(ReadTool::new(
+        AsyncPhysicalFS::new(env::current_dir()?).into(),
+    ));
+    let edit_tool: Arc<dyn ErasedTool> = Arc::new(EditTool::with_cache(
+        AsyncPhysicalFS::new(env::current_dir()?).into(),
+        Arc::clone(read_tool.cache()),
+    ));
     let local_tools: Arc<dyn ToolRouter> = Arc::new(LocalToolRouter::new(vec![
         tool!(
             "calculator",
@@ -54,9 +61,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             datetime,
             policy = ToolExecutionPolicy::Parallel,
         ),
-        Arc::new(ReadTool::new(
-            AsyncPhysicalFS::new(env::current_dir()?).into(),
-        )),
+        read_tool.clone(),
+        edit_tool,
     ]));
     let skill_runtime = Arc::new(SkillRuntime::new(Arc::new(ExampleSkillStore::new(
         env::current_dir()?.join("examples/simple-cli/skills"),
@@ -89,6 +95,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         }
         if input == "/clear" {
             agent.messages.clear();
+            read_tool.clear_cache();
             agent
                 .messages
                 .push(Message::System(vec![text(SYSTEM_PROMPT)]));

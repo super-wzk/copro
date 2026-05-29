@@ -5,16 +5,26 @@ use copro_api::message::{ImageContent, InputContent};
 use copro_harness::tools::{Tool, ToolOutput};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use vfs::VfsFileType;
 use vfs::async_vfs::AsyncVfsPath;
 
 pub const READ_TOOL_NAME: &str = "read";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheEntry {
+    pub bytes: Vec<u8>,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+pub type FileCache = Arc<Mutex<HashMap<String, CacheEntry>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadToolConfig {
     pub max_line_limit: usize,
-    pub max_text_bytes: usize,
     pub line_numbers: bool,
 }
 
@@ -22,7 +32,6 @@ impl Default for ReadToolConfig {
     fn default() -> Self {
         Self {
             max_line_limit: 2000,
-            max_text_bytes: 50 * 1024,
             line_numbers: true,
         }
     }
@@ -33,6 +42,7 @@ pub struct ReadTool {
     root: AsyncVfsPath,
     config: ReadToolConfig,
     description: String,
+    cache: FileCache,
 }
 
 impl ReadTool {
@@ -41,6 +51,11 @@ impl ReadTool {
     }
 
     pub fn with_config(root: AsyncVfsPath, config: ReadToolConfig) -> Self {
+        Self::with_cache(root, config, Arc::default())
+    }
+
+    /// Share a cache with other tools (e.g. WriteTool for read-before-write gating).
+    pub fn with_cache(root: AsyncVfsPath, config: ReadToolConfig, cache: FileCache) -> Self {
         let description = format!(
             "Read a text or image file. Supports 1-based offset/limit pagination (max {max_lines} lines per call){lines_hint}.",
             max_lines = config.max_line_limit,
@@ -54,6 +69,7 @@ impl ReadTool {
             root,
             config,
             description,
+            cache,
         }
     }
 
@@ -63,6 +79,20 @@ impl ReadTool {
 
     pub fn config(&self) -> &ReadToolConfig {
         &self.config
+    }
+
+    pub fn cache(&self) -> &FileCache {
+        &self.cache
+    }
+
+    /// Clear the deduplication cache (e.g. at conversation boundaries).
+    pub fn clear_cache(&self) {
+        self.cache.lock().unwrap().clear();
+    }
+
+    /// Invalidate a single path in the cache (e.g. after a WriteTool modifies it).
+    pub fn invalidate(&self, path: &str) {
+        self.cache.lock().unwrap().remove(path);
     }
 }
 
@@ -130,6 +160,23 @@ impl Tool for ReadTool {
             .await
             .map_err(|error| error.to_string())?;
 
+        // Dedup: same path, bytes, offset, and limit → placeholder
+        {
+            let expected = CacheEntry {
+                bytes: bytes.clone(),
+                offset: input.offset,
+                limit: input.limit,
+            };
+            let mut cache = self.cache.lock().unwrap();
+            if cache.get(&input.path) == Some(&expected) {
+                return Ok(ReadOutput::Text(format!(
+                    "{} — unchanged since last read",
+                    input.path
+                )));
+            }
+            cache.insert(input.path.clone(), expected);
+        }
+
         if let Some(mime_type) = image_mime_type(&input.path) {
             return Ok(ReadOutput::Image(ImageContent::Data {
                 mime_type,
@@ -166,71 +213,41 @@ fn render_text(text: &str, input: &ReadInput, config: &ReadToolConfig) -> Result
         return Err("limit must be greater than or equal to 1".to_string());
     }
 
-    let max_line_limit = config.max_line_limit.max(1);
-    let line_limit = requested_limit.min(max_line_limit);
-    let max_text_bytes = config.max_text_bytes.max(1);
+    let line_limit = requested_limit.min(config.max_line_limit.max(1));
     let lines: Vec<&str> = text.lines().collect();
 
     if lines.is_empty() {
-        return Ok(format!("[read] {} — no content: file is empty", input.path));
+        return Ok(format!("{} — no content: file is empty", input.path));
     }
 
     if offset > lines.len() {
         return Ok(format!(
-            "[read] {} — no content: offset {offset} is past end ({} lines)",
+            "{} — no content: offset {offset} is past end ({} lines)",
             input.path,
             lines.len()
         ));
     }
 
-    let mut output = format!("[read] {}\n", input.path);
+    let mut output = format!("{}\n", input.path);
     let number_width = digit_count(lines.len()).max(1);
-    let mut truncation = None;
 
     for (emitted, (index, line)) in lines.iter().enumerate().skip(offset - 1).enumerate() {
         let line_number = index + 1;
         if emitted >= line_limit {
-            truncation = Some(Truncation {
-                reason: "reached line limit",
-                next_offset: line_number,
-            });
-            break;
-        }
-
-        let rendered_line = render_line(line_number, number_width, line, config.line_numbers);
-        let separator_bytes = usize::from(emitted > 0);
-        let required_bytes = separator_bytes + rendered_line.len();
-
-        if output.len() + required_bytes > max_text_bytes {
-            if emitted == 0 {
-                let remaining = max_text_bytes.saturating_sub(output.len());
-                output.push_str(truncate_to_char_boundary(&rendered_line, remaining));
-                truncation = Some(Truncation {
-                    reason: "reached byte limit; current line was partially shown",
-                    next_offset: line_number + 1,
-                });
-            } else {
-                truncation = Some(Truncation {
-                    reason: "reached byte limit",
-                    next_offset: line_number,
-                });
-            }
-            break;
+            output.push_str(&format!(
+                "\n[truncated: reached line limit; continue with offset={line_number}]"
+            ));
+            return Ok(output);
         }
 
         if emitted > 0 {
             output.push('\n');
         }
-        output.push_str(&rendered_line);
-    }
-
-    if let Some(truncation) = truncation {
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        output.push_str(&format!(
-            "[truncated: {}; continue with offset={}]",
-            truncation.reason, truncation.next_offset
+        output.push_str(&render_line(
+            line_number,
+            number_width,
+            line,
+            config.line_numbers,
         ));
     }
 
@@ -246,7 +263,7 @@ fn render_line(line_number: usize, width: usize, line: &str, line_numbers: bool)
 }
 
 /// Number of decimal digits needed to represent `n`.
-fn digit_count(n: usize) -> usize {
+pub(crate) fn digit_count(n: usize) -> usize {
     if n == 0 {
         return 1;
     }
@@ -257,21 +274,4 @@ fn digit_count(n: usize) -> usize {
         count += 1;
     }
     count
-}
-
-fn truncate_to_char_boundary(value: &str, max_bytes: usize) -> &str {
-    if value.len() <= max_bytes {
-        return value;
-    }
-
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
-}
-
-struct Truncation {
-    reason: &'static str,
-    next_offset: usize,
 }
