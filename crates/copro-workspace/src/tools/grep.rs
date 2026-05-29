@@ -3,7 +3,7 @@ use copro_agent::{CancellationToken, ToolExecutionPolicy};
 use copro_api::async_trait;
 use copro_harness::tools::Tool;
 use futures_util::StreamExt;
-use grep::regex::RegexMatcherBuilder;
+use grep::regex::{RegexMatcher, RegexMatcherBuilder};
 use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::{Override, OverrideBuilder};
@@ -12,12 +12,17 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use std::io;
 use std::path::{Path, PathBuf};
-use vfs::async_vfs::AsyncVfsPath;
 use vfs::VfsFileType;
+use vfs::async_vfs::AsyncVfsPath;
 
 pub const GREP_TOOL_NAME: &str = "grep";
 
-const GREP_TOOL_DESCRIPTION: &str = "Search files recursively with ripgrep-compatible regular expressions. Supports glob/type filters, context lines, line numbers, case-insensitive search, count/files/content output modes, and multiline matching.";
+const GREP_TOOL_DESCRIPTION: &str = concat!(
+    "A powerful workspace search tool built on ripgrep. Use this for search tasks instead of ",
+    "shelling out to grep or rg. Supports ripgrep regex syntax, glob and type filters, ",
+    "content/files_with_matches/count output modes, context lines, line numbers, ",
+    "case-insensitive search, output pagination, and multiline matching."
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrepToolConfig {
@@ -143,39 +148,28 @@ impl Tool for GrepTool {
 
         let matcher = build_matcher(&input)?;
         let filter = GrepFilter::new(&input)?;
-        let gitignore = GitignoreSet::load(&self.root).await?;
         let search_path = input.path.as_deref().unwrap_or("");
-        let candidates = candidate_files(&self.root, search_path, &filter, &gitignore).await?;
         let search_options = SearchOptions::from_input(&input);
-        let mut results = Vec::new();
+        let mut output = OutputCollector::new(
+            input.offset.unwrap_or(0),
+            input.head_limit.unwrap_or(self.config.default_head_limit),
+        );
 
-        for path in candidates {
-            if cancel.is_cancelled() {
-                return Err("grep cancelled".to_string());
-            }
+        let plan = SearchPlan {
+            matcher: &matcher,
+            filter: &filter,
+            options: &search_options,
+            mode: input.output_mode,
+            cancel,
+        };
 
-            let metadata = path.metadata().await.map_err(|error| error.to_string())?;
-            let bytes = read_file_bytes(&path, metadata.len.try_into().unwrap_or_default()).await?;
-            let mut searcher = build_searcher(&search_options);
-            let mut sink = GrepSink::default();
-            searcher
-                .search_slice(&matcher, &bytes, &mut sink)
-                .map_err(|error| error.to_string())?;
+        search_vfs(&self.root, search_path, &plan, &mut output).await?;
 
-            if sink.match_count > 0 {
-                results.push(FileSearchResult {
-                    path: display_path(&path),
-                    match_count: sink.match_count,
-                    lines: sink.lines,
-                });
-            }
-        }
-
-        render_results(&results, &input, &self.config)
+        Ok(output.finish())
     }
 }
 
-fn build_matcher(input: &GrepInput) -> Result<grep::regex::RegexMatcher, String> {
+fn build_matcher(input: &GrepInput) -> Result<RegexMatcher, String> {
     let mut builder = RegexMatcherBuilder::new();
     builder.case_insensitive(input.case_insensitive);
     if input.multiline {
@@ -276,66 +270,398 @@ impl GrepFilter {
     }
 }
 
-#[derive(Debug, Default)]
-struct GitignoreSet {
-    matchers: Vec<Gitignore>,
+struct OutputCollector {
+    offset: usize,
+    limit: usize,
+    seen: usize,
+    lines: Vec<String>,
+    truncated: bool,
 }
 
-impl GitignoreSet {
-    async fn load(root: &AsyncVfsPath) -> Result<Self, String> {
-        let mut matchers = Vec::new();
-        let mut dirs = vec![root.clone()];
+impl OutputCollector {
+    fn new(offset: usize, limit: usize) -> Self {
+        Self {
+            offset,
+            limit,
+            seen: 0,
+            lines: Vec::new(),
+            truncated: false,
+        }
+    }
 
-        while let Some(dir) = dirs.pop() {
-            let mut entries = Vec::new();
-            let mut stream = dir.read_dir().await.map_err(|error| error.to_string())?;
-            while let Some(entry) = stream.next().await {
-                entries.push(entry);
+    /// Push one logical output line. Returns false once the caller can stop searching.
+    fn push(&mut self, line: String) -> bool {
+        let index = self.seen;
+        self.seen += 1;
+
+        if index < self.offset {
+            return true;
+        }
+
+        if self.limit == 0 || self.lines.len() < self.limit {
+            self.lines.push(line);
+            true
+        } else {
+            self.truncated = true;
+            false
+        }
+    }
+
+    fn should_stop(&self) -> bool {
+        self.truncated
+    }
+
+    fn finish(self) -> String {
+        if self.seen == 0 {
+            return "No matches".to_string();
+        }
+
+        if self.lines.is_empty() {
+            return format!(
+                "No output: offset {} is past end ({} line(s))",
+                self.offset, self.seen
+            );
+        }
+
+        let mut output = self.lines.join("\n");
+        if self.truncated {
+            output.push_str(&format!(
+                "\n[truncated: reached head_limit; continue with offset={}]",
+                self.offset + self.lines.len()
+            ));
+        }
+        output
+    }
+}
+
+struct SearchPlan<'a> {
+    matcher: &'a RegexMatcher,
+    filter: &'a GrepFilter,
+    options: &'a SearchOptions,
+    mode: GrepOutputMode,
+    cancel: CancellationToken,
+}
+
+async fn search_vfs(
+    root: &AsyncVfsPath,
+    input_path: &str,
+    plan: &SearchPlan<'_>,
+    output: &mut OutputCollector,
+) -> Result<(), String> {
+    let start = if input_path.is_empty() {
+        root.clone()
+    } else {
+        resolve_path(root, input_path)?
+    };
+
+    if is_under_git_dir(&start) {
+        return Ok(());
+    }
+
+    let metadata = start.metadata().await.map_err(|error| error.to_string())?;
+    let is_dir = metadata.file_type == VfsFileType::Directory;
+    let inherited_gitignores = load_ancestor_gitignores(root, &start).await?;
+
+    if gitignore_is_ignored(&inherited_gitignores, &start, is_dir) {
+        return Ok(());
+    }
+
+    match metadata.file_type {
+        VfsFileType::File => {
+            if plan.filter.matches(&start) {
+                search_one_file(&start, metadata.len, plan, output).await?;
             }
-            entries.sort_by_key(display_path);
+        }
+        VfsFileType::Directory => {
+            search_directory(start, inherited_gitignores, plan, output).await?;
+        }
+    }
 
-            for path in entries {
-                let metadata = path.metadata().await.map_err(|error| error.to_string())?;
-                match metadata.file_type {
-                    VfsFileType::Directory => {
-                        if !is_git_dir(&path) {
-                            dirs.push(path);
+    Ok(())
+}
+
+struct PendingDir {
+    path: AsyncVfsPath,
+    gitignores: Vec<Gitignore>,
+}
+
+enum PendingEntry {
+    Directory(PendingDir),
+    File(AsyncVfsPath, u64),
+}
+
+async fn search_directory(
+    start: AsyncVfsPath,
+    inherited_gitignores: Vec<Gitignore>,
+    plan: &SearchPlan<'_>,
+    output: &mut OutputCollector,
+) -> Result<(), String> {
+    let mut pending = vec![PendingEntry::Directory(PendingDir {
+        path: start,
+        gitignores: inherited_gitignores,
+    })];
+
+    while let Some(entry) = pending.pop() {
+        if plan.cancel.is_cancelled() {
+            return Err("grep cancelled".to_string());
+        }
+        if output.should_stop() {
+            break;
+        }
+
+        match entry {
+            PendingEntry::File(path, byte_len) => {
+                search_one_file(&path, byte_len, plan, output).await?;
+            }
+            PendingEntry::Directory(PendingDir {
+                path,
+                mut gitignores,
+            }) => {
+                if let Some(matcher) = load_gitignore_in_dir(&path).await? {
+                    gitignores.push(matcher);
+                }
+
+                let mut entries = directory_entries(&path).await?;
+                entries.sort_by_key(|(path, _)| display_path(path));
+
+                for (entry_path, metadata) in entries.into_iter().rev() {
+                    match metadata.file_type {
+                        VfsFileType::File => {
+                            if !is_under_git_dir(&entry_path)
+                                && !gitignore_is_ignored(&gitignores, &entry_path, false)
+                                && plan.filter.matches(&entry_path)
+                            {
+                                pending.push(PendingEntry::File(entry_path, metadata.len));
+                            }
                         }
-                    }
-                    VfsFileType::File => {
-                        if path.filename() == ".gitignore"
-                            && let Some(matcher) = load_gitignore_file(&path, metadata.len).await?
-                        {
-                            matchers.push(matcher);
+                        VfsFileType::Directory => {
+                            if !is_git_dir(&entry_path)
+                                && !gitignore_is_ignored(&gitignores, &entry_path, true)
+                            {
+                                pending.push(PendingEntry::Directory(PendingDir {
+                                    path: entry_path,
+                                    gitignores: gitignores.clone(),
+                                }));
+                            }
                         }
                     }
                 }
             }
         }
-
-        matchers.sort_by_key(|matcher| path_depth(matcher.path()));
-        Ok(Self { matchers })
     }
 
-    fn is_ignored(&self, path: &AsyncVfsPath, is_dir: bool) -> bool {
-        let display = display_path(path);
-        let candidate = Path::new(&display);
-        let mut ignored = false;
+    Ok(())
+}
 
-        for matcher in &self.matchers {
-            if !path_is_under(candidate, matcher.path()) {
-                continue;
-            }
+async fn search_one_file(
+    path: &AsyncVfsPath,
+    byte_len: u64,
+    plan: &SearchPlan<'_>,
+    output: &mut OutputCollector,
+) -> Result<(), String> {
+    let bytes = read_file_bytes(path, byte_len.try_into().unwrap_or_default()).await?;
+    let mut searcher = build_searcher(plan.options);
+    let display = display_path(path);
 
-            match matcher.matched_path_or_any_parents(candidate, is_dir) {
-                ignore::Match::None => {}
-                ignore::Match::Ignore(_) => ignored = true,
-                ignore::Match::Whitelist(_) => ignored = false,
+    match plan.mode {
+        GrepOutputMode::FilesWithMatches => {
+            let mut sink = MatchOnlySink::default();
+            searcher
+                .search_slice(plan.matcher, &bytes, &mut sink)
+                .map_err(|error| error.to_string())?;
+            if sink.has_match {
+                output.push(display);
             }
         }
-
-        ignored
+        GrepOutputMode::Count => {
+            let mut sink = CountSink::default();
+            searcher
+                .search_slice(plan.matcher, &bytes, &mut sink)
+                .map_err(|error| error.to_string())?;
+            if sink.match_count > 0 {
+                output.push(format!("{display}:{}", sink.match_count));
+            }
+        }
+        GrepOutputMode::Content => {
+            let mut sink = ContentSink {
+                path: display,
+                show_line_numbers: plan.options.line_numbers,
+                output,
+            };
+            searcher
+                .search_slice(plan.matcher, &bytes, &mut sink)
+                .map_err(|error| error.to_string())?;
+        }
     }
+
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct MatchOnlySink {
+    has_match: bool,
+}
+
+impl Sink for MatchOnlySink {
+    type Error = io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, _mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        self.has_match = true;
+        Ok(false)
+    }
+}
+
+#[derive(Debug, Default)]
+struct CountSink {
+    match_count: usize,
+}
+
+impl Sink for CountSink {
+    type Error = io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        self.match_count += mat.lines().count().max(1);
+        Ok(true)
+    }
+}
+
+struct ContentSink<'a> {
+    path: String,
+    show_line_numbers: bool,
+    output: &'a mut OutputCollector,
+}
+
+impl Sink for ContentSink<'_> {
+    type Error = io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        for (index, line) in mat.lines().enumerate() {
+            let line_number = mat.line_number().map(|number| number + index as u64);
+            let output_line = render_grep_line(
+                &self.path,
+                GrepLineKind::Match,
+                line_number,
+                &bytes_to_line(line),
+                self.show_line_numbers,
+            );
+            if !self.output.push(output_line) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn context(
+        &mut self,
+        _searcher: &Searcher,
+        context: &SinkContext<'_>,
+    ) -> Result<bool, Self::Error> {
+        let output_line = render_grep_line(
+            &self.path,
+            GrepLineKind::Context,
+            context.line_number(),
+            &bytes_to_line(context.bytes()),
+            self.show_line_numbers,
+        );
+        Ok(self.output.push(output_line))
+    }
+
+    fn context_break(&mut self, _searcher: &Searcher) -> Result<bool, Self::Error> {
+        Ok(self.output.push("--".to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrepLineKind {
+    Match,
+    Context,
+}
+
+fn render_grep_line(
+    path: &str,
+    kind: GrepLineKind,
+    line_number: Option<u64>,
+    text: &str,
+    show_line_numbers: bool,
+) -> String {
+    let separator = match kind {
+        GrepLineKind::Match => ':',
+        GrepLineKind::Context => '-',
+    };
+    if show_line_numbers && let Some(line_number) = line_number {
+        return format!("{path}{separator}{line_number}{separator}{text}");
+    }
+    format!("{path}{separator}{text}")
+}
+
+async fn directory_entries(
+    path: &AsyncVfsPath,
+) -> Result<Vec<(AsyncVfsPath, vfs::VfsMetadata)>, String> {
+    let mut entries = Vec::new();
+    let mut stream = path.read_dir().await.map_err(|error| error.to_string())?;
+    while let Some(entry) = stream.next().await {
+        let metadata = entry.metadata().await.map_err(|error| error.to_string())?;
+        entries.push((entry, metadata));
+    }
+    Ok(entries)
+}
+
+async fn load_ancestor_gitignores(
+    root: &AsyncVfsPath,
+    path: &AsyncVfsPath,
+) -> Result<Vec<Gitignore>, String> {
+    let mut matchers = Vec::new();
+    for directory in ancestor_directory_strings(path) {
+        let dir = if directory.is_empty() {
+            root.clone()
+        } else {
+            resolve_path(root, &directory)?
+        };
+        if let Some(matcher) = load_gitignore_in_dir(&dir).await? {
+            matchers.push(matcher);
+        }
+    }
+    Ok(matchers)
+}
+
+fn ancestor_directory_strings(path: &AsyncVfsPath) -> Vec<String> {
+    let display = display_path(path);
+    if display == "." {
+        return Vec::new();
+    }
+
+    let Some(parent) = Path::new(&display).parent() else {
+        return Vec::new();
+    };
+
+    let mut directories = vec![String::new()];
+    let mut current = String::new();
+    for component in parent.components() {
+        let component = component.as_os_str().to_string_lossy();
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if !current.is_empty() {
+            current.push('/');
+        }
+        current.push_str(&component);
+        directories.push(current.clone());
+    }
+    directories
+}
+
+async fn load_gitignore_in_dir(dir: &AsyncVfsPath) -> Result<Option<Gitignore>, String> {
+    let path = dir.join(".gitignore").map_err(|error| error.to_string())?;
+    if !path.exists().await.map_err(|error| error.to_string())? {
+        return Ok(None);
+    }
+
+    let metadata = path.metadata().await.map_err(|error| error.to_string())?;
+    if metadata.file_type != VfsFileType::File {
+        return Ok(None);
+    }
+
+    load_gitignore_file(&path, metadata.len).await
 }
 
 async fn load_gitignore_file(
@@ -370,20 +696,32 @@ async fn load_gitignore_file(
     Ok((!matcher.is_empty()).then_some(matcher))
 }
 
+fn gitignore_is_ignored(matchers: &[Gitignore], path: &AsyncVfsPath, is_dir: bool) -> bool {
+    let display = display_path(path);
+    let candidate = Path::new(&display);
+    let mut ignored = false;
+
+    for matcher in matchers {
+        if !path_is_under(candidate, matcher.path()) {
+            continue;
+        }
+
+        match matcher.matched_path_or_any_parents(candidate, is_dir) {
+            ignore::Match::None => {}
+            ignore::Match::Ignore(_) => ignored = true,
+            ignore::Match::Whitelist(_) => ignored = false,
+        }
+    }
+
+    ignored
+}
+
 fn gitignore_root(path: &AsyncVfsPath) -> PathBuf {
     let parent = display_path(&path.parent());
     if parent == "." {
         PathBuf::from(".")
     } else {
         PathBuf::from(parent)
-    }
-}
-
-fn path_depth(path: &Path) -> usize {
-    if path == Path::new(".") || path.as_os_str().is_empty() {
-        0
-    } else {
-        path.components().count()
     }
 }
 
@@ -399,210 +737,6 @@ fn is_under_git_dir(path: &AsyncVfsPath) -> bool {
     Path::new(&display_path(path))
         .components()
         .any(|component| component.as_os_str() == ".git")
-}
-
-async fn candidate_files(
-    root: &AsyncVfsPath,
-    input_path: &str,
-    filter: &GrepFilter,
-    gitignore: &GitignoreSet,
-) -> Result<Vec<AsyncVfsPath>, String> {
-    let start = if input_path.is_empty() {
-        root.clone()
-    } else {
-        resolve_path(root, input_path)?
-    };
-    if is_under_git_dir(&start) {
-        return Ok(Vec::new());
-    }
-
-    let metadata = start.metadata().await.map_err(|error| error.to_string())?;
-
-    let mut files = Vec::new();
-    match metadata.file_type {
-        VfsFileType::File => {
-            if !gitignore.is_ignored(&start, false) && filter.matches(&start) {
-                files.push(start);
-            }
-        }
-        VfsFileType::Directory => {
-            let mut dirs = vec![start];
-            while let Some(dir) = dirs.pop() {
-                let mut entries = Vec::new();
-                let mut stream = dir.read_dir().await.map_err(|error| error.to_string())?;
-                while let Some(entry) = stream.next().await {
-                    entries.push(entry);
-                }
-                entries.sort_by_key(display_path);
-
-                for path in entries {
-                    let metadata = path.metadata().await.map_err(|error| error.to_string())?;
-                    match metadata.file_type {
-                        VfsFileType::File => {
-                            if !is_under_git_dir(&path)
-                                && !gitignore.is_ignored(&path, false)
-                                && filter.matches(&path)
-                            {
-                                files.push(path);
-                            }
-                        }
-                        VfsFileType::Directory => {
-                            if !is_git_dir(&path) && !gitignore.is_ignored(&path, true) {
-                                dirs.push(path);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    files.sort_by_key(display_path);
-    Ok(files)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FileSearchResult {
-    path: String,
-    match_count: usize,
-    lines: Vec<GrepLine>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GrepLine {
-    kind: GrepLineKind,
-    line_number: Option<u64>,
-    text: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GrepLineKind {
-    Match,
-    Context,
-    Break,
-}
-
-#[derive(Debug, Default)]
-struct GrepSink {
-    lines: Vec<GrepLine>,
-    match_count: usize,
-}
-
-impl Sink for GrepSink {
-    type Error = io::Error;
-
-    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
-        let mut line_count = 0usize;
-        for (index, line) in mat.lines().enumerate() {
-            let line_number = mat.line_number().map(|number| number + index as u64);
-            self.lines.push(GrepLine {
-                kind: GrepLineKind::Match,
-                line_number,
-                text: bytes_to_line(line),
-            });
-            line_count += 1;
-        }
-        self.match_count += line_count.max(1);
-        Ok(true)
-    }
-
-    fn context(
-        &mut self,
-        _searcher: &Searcher,
-        context: &SinkContext<'_>,
-    ) -> Result<bool, Self::Error> {
-        self.lines.push(GrepLine {
-            kind: GrepLineKind::Context,
-            line_number: context.line_number(),
-            text: bytes_to_line(context.bytes()),
-        });
-        Ok(true)
-    }
-
-    fn context_break(&mut self, _searcher: &Searcher) -> Result<bool, Self::Error> {
-        self.lines.push(GrepLine {
-            kind: GrepLineKind::Break,
-            line_number: None,
-            text: String::new(),
-        });
-        Ok(true)
-    }
-}
-
-fn render_results(
-    results: &[FileSearchResult],
-    input: &GrepInput,
-    config: &GrepToolConfig,
-) -> Result<String, String> {
-    let show_line_numbers = SearchOptions::from_input(input).line_numbers;
-    let lines = match input.output_mode {
-        GrepOutputMode::FilesWithMatches => results
-            .iter()
-            .map(|result| result.path.clone())
-            .collect::<Vec<_>>(),
-        GrepOutputMode::Count => results
-            .iter()
-            .map(|result| format!("{}:{}", result.path, result.match_count))
-            .collect::<Vec<_>>(),
-        GrepOutputMode::Content => results
-            .iter()
-            .flat_map(|result| {
-                result
-                    .lines
-                    .iter()
-                    .map(|line| render_grep_line(&result.path, line, show_line_numbers))
-            })
-            .collect::<Vec<_>>(),
-    };
-
-    Ok(render_limited_lines(
-        lines,
-        input.offset.unwrap_or(0),
-        input.head_limit.unwrap_or(config.default_head_limit),
-    ))
-}
-
-fn render_grep_line(path: &str, line: &GrepLine, show_line_numbers: bool) -> String {
-    match line.kind {
-        GrepLineKind::Break => "--".to_string(),
-        GrepLineKind::Match | GrepLineKind::Context => {
-            let separator = match line.kind {
-                GrepLineKind::Match => ':',
-                GrepLineKind::Context => '-',
-                GrepLineKind::Break => unreachable!(),
-            };
-            if show_line_numbers && let Some(line_number) = line.line_number {
-                return format!("{path}{separator}{line_number}{separator}{}", line.text);
-            }
-            format!("{path}{separator}{}", line.text)
-        }
-    }
-}
-
-fn render_limited_lines(lines: Vec<String>, offset: usize, head_limit: usize) -> String {
-    if lines.is_empty() {
-        return "No matches".to_string();
-    }
-
-    if offset >= lines.len() {
-        return format!(
-            "No output: offset {offset} is past end ({} line(s))",
-            lines.len()
-        );
-    }
-
-    let end = if head_limit == 0 {
-        lines.len()
-    } else {
-        (offset + head_limit).min(lines.len())
-    };
-    let mut output = lines[offset..end].join("\n");
-    if head_limit > 0 && end < lines.len() {
-        output.push_str(&format!(
-            "\n[truncated: reached head_limit; continue with offset={end}]"
-        ));
-    }
-    output
 }
 
 fn bytes_to_line(bytes: &[u8]) -> String {
