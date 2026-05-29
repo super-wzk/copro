@@ -7,11 +7,13 @@ use copro_harness::tools::{CompositeToolRouter, LocalToolRouter};
 use copro_provider_openai::{
     OpenAiResponsesModelConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
 };
+use copro_workspace::tools::ReadTool;
 use futures_util::StreamExt;
 use std::env;
 use std::error::Error as StdError;
 use std::io::{self, Write};
 use std::sync::Arc;
+use vfs::async_vfs::AsyncPhysicalFS;
 
 mod skills;
 mod tools;
@@ -52,6 +54,9 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             datetime,
             policy = ToolExecutionPolicy::Parallel,
         ),
+        Arc::new(ReadTool::new(
+            AsyncPhysicalFS::new(env::current_dir()?).into(),
+        )),
     ]));
     let skill_runtime = Arc::new(SkillRuntime::new(Arc::new(ExampleSkillStore::new(
         env::current_dir()?.join("examples/simple-cli/skills"),

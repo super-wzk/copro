@@ -6,6 +6,7 @@ members = [
   "crates/copro-derive",
   "crates/copro-provider-openai",
   "crates/copro-harness",
+  "crates/copro-workspace",
   "examples/*",
 ]
 resolver = "3"
@@ -21,12 +22,14 @@ copro-api = { path = "crates/copro-api" }
 copro-derive = { path = "crates/copro-derive" }
 copro-provider-openai = { path = "crates/copro-provider-openai" }
 copro-harness = { path = "crates/copro-harness" }
+copro-workspace = { path = "crates/copro-workspace" }
 
 async-openai = { version = "0.40.2", default-features = false, features = [
   "byot",
   "responses",
   "rustls",
 ] }
+async-std = "1"
 async-stream = "0.3"
 async-trait = "0.1"
 base64 = "0.22"
@@ -41,3 +44,4 @@ syn = { version = "2", features = ["derive", "parsing", "printing"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+vfs = { version = "0.13", features = ["async-vfs"] }
