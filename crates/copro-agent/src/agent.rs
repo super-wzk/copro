@@ -8,6 +8,7 @@ use copro_api::message::{
 };
 use copro_api::request::{GenerateRequest, GenerateRequestOptions};
 use copro_api::stream::{Model, ModelStream, OutputStreamEvent, OutputStreamState};
+use copro_api::tool::{HostedToolSpec, ToolChoice};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::any::Any;
 use std::mem;
@@ -25,6 +26,9 @@ pub struct Agent {
     pub hooks: AgentHooks,
     pub stop_signal: StopSignal,
     pub messages: Vec<Message>,
+    pub tool_choice: Option<ToolChoice>,
+    pub hosted_tools: Vec<HostedToolSpec>,
+    pub options: GenerateRequestOptions,
 }
 
 impl Agent {
@@ -35,6 +39,9 @@ impl Agent {
             hooks: AgentHooks::new(),
             stop_signal: StopSignal::new(),
             messages: Vec::new(),
+            tool_choice: None,
+            hosted_tools: Vec::new(),
+            options: GenerateRequestOptions::default(),
         }
     }
 
@@ -226,9 +233,9 @@ impl Agent {
         Ok(GenerateRequest {
             messages,
             tools: self.tools.definitions().await?,
-            hosted_tools: Vec::new(),
-            tool_choice: None,
-            options: GenerateRequestOptions::default(),
+            hosted_tools: self.hosted_tools.clone(),
+            tool_choice: self.tool_choice.clone(),
+            options: self.options.clone(),
         })
     }
 

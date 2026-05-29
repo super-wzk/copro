@@ -6,13 +6,14 @@ use copro_api::error::Result;
 use copro_api::message::{
     InputContent, Message, OutputContent, ToolCall, ToolResult, ToolResultStatus,
 };
-use copro_api::request::GenerateRequest;
+use copro_api::request::{GenerateRequest, GenerateRequestOptions};
 use copro_api::response::FinishReason;
 use copro_api::stream::{Model, ModelStream, OutputContentDelta, OutputStreamEvent};
-use copro_api::tool::ToolDefinition;
+use copro_api::tool::{HostedToolSpec, ToolChoice, ToolDefinition};
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -486,6 +487,91 @@ async fn run_stream_batches_parallel_tools_behind_serial_barriers() {
 
 fn test_agent(events: Vec<OutputStreamEvent>) -> Agent {
     Agent::new(Arc::new(TestModel { events }), Arc::new(EmptyToolRouter))
+}
+
+#[tokio::test]
+async fn build_request_carries_agent_baseline_config() {
+    let captured = Arc::new(Mutex::new(None));
+    let model = Arc::new(CapturingModel {
+        captured: Arc::clone(&captured),
+    });
+    let mut agent = Agent::new(model, Arc::new(EmptyToolRouter));
+    agent.messages = vec![Message::User(vec![InputContent::Text("hi".to_string())])];
+    agent.options = GenerateRequestOptions {
+        temperature: Some(0.5),
+        max_tokens: Some(256),
+        ..GenerateRequestOptions::default()
+    };
+    agent.tool_choice = Some(ToolChoice::Required);
+    agent.hosted_tools = vec![HostedToolSpec::new("web_search")];
+
+    agent
+        .run_stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+
+    let request = captured.lock().unwrap().take().expect("request captured");
+    assert_eq!(request.options.temperature, Some(0.5));
+    assert_eq!(request.options.max_tokens, Some(256));
+    assert_eq!(request.tool_choice, Some(ToolChoice::Required));
+    assert_eq!(
+        request.hosted_tools,
+        vec![HostedToolSpec::new("web_search")]
+    );
+}
+
+#[tokio::test]
+async fn before_request_hook_overrides_agent_baseline_config() {
+    let captured = Arc::new(Mutex::new(None));
+    let model = Arc::new(CapturingModel {
+        captured: Arc::clone(&captured),
+    });
+    let mut agent = Agent::new(model, Arc::new(EmptyToolRouter));
+    agent.messages = vec![Message::User(vec![InputContent::Text("hi".to_string())])];
+    agent.tool_choice = Some(ToolChoice::Required);
+    agent.hooks.push(Arc::new(ToolChoiceOverrideHook));
+
+    agent
+        .run_stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+
+    let request = captured.lock().unwrap().take().expect("request captured");
+    assert_eq!(request.tool_choice, Some(ToolChoice::None));
+}
+
+struct CapturingModel {
+    captured: Arc<Mutex<Option<GenerateRequest>>>,
+}
+
+impl Model for CapturingModel {
+    fn stream(&self, request: GenerateRequest) -> ModelStream<'_> {
+        *self.captured.lock().unwrap() = Some(request);
+        Box::pin(futures_util::stream::iter(
+            vec![OutputStreamEvent::Finished {
+                reason: FinishReason::Stop,
+                usage: None,
+            }]
+            .into_iter()
+            .map(Ok),
+        ))
+    }
+}
+
+struct ToolChoiceOverrideHook;
+
+#[async_trait]
+impl AgentHook for ToolChoiceOverrideHook {
+    async fn before_request(&self, request: &mut GenerateRequest) -> Result<()> {
+        request.tool_choice = Some(ToolChoice::None);
+        Ok(())
+    }
 }
 
 struct RedactHook;
