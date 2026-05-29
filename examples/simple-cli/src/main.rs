@@ -7,7 +7,7 @@ use copro_harness::tools::{CompositeToolRouter, LocalToolRouter};
 use copro_provider_openai::{
     OpenAiResponsesModelConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
 };
-use copro_workspace::tools::{EditTool, GlobTool, GrepTool, LsTool, ReadTool, WriteTool};
+use copro_workspace::WorkspaceToolRouter;
 use futures_util::StreamExt;
 use std::env;
 use std::error::Error as StdError;
@@ -41,26 +41,6 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             ..OpenAiResponsesModelConfig::default()
         },
     )?;
-    let read_tool = Arc::new(ReadTool::new(
-        AsyncPhysicalFS::new(env::current_dir()?).into(),
-    ));
-    let write_tool = Arc::new(WriteTool::with_cache(
-        AsyncPhysicalFS::new(env::current_dir()?).into(),
-        Arc::clone(read_tool.cache()),
-    ));
-    let edit_tool = Arc::new(EditTool::with_cache(
-        AsyncPhysicalFS::new(env::current_dir()?).into(),
-        Arc::clone(read_tool.cache()),
-    ));
-    let grep_tool = Arc::new(GrepTool::new(
-        AsyncPhysicalFS::new(env::current_dir()?).into(),
-    ));
-    let glob_tool = Arc::new(GlobTool::new(
-        AsyncPhysicalFS::new(env::current_dir()?).into(),
-    ));
-    let ls_tool = Arc::new(LsTool::new(
-        AsyncPhysicalFS::new(env::current_dir()?).into(),
-    ));
     let local_tools: Arc<dyn ToolRouter> = Arc::new(LocalToolRouter::new(vec![
         tool!(
             "calculator",
@@ -74,19 +54,16 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             datetime,
             policy = ToolExecutionPolicy::Parallel,
         ),
-        read_tool.clone(),
-        write_tool,
-        edit_tool,
-        grep_tool,
-        glob_tool,
-        ls_tool,
     ]));
+    let workspace_tools = Arc::new(WorkspaceToolRouter::new(
+        AsyncPhysicalFS::new(env::current_dir()?).into(),
+    ));
     let skill_runtime = Arc::new(SkillRuntime::new(Arc::new(ExampleSkillStore::new(
         env::current_dir()?.join("examples/simple-cli/skills"),
     ))));
-    let skill_tools: Arc<dyn ToolRouter> =
-        Arc::new(SkillToolRouter::new(Arc::clone(&skill_runtime)));
-    let tool_router = CompositeToolRouter::new(vec![local_tools, skill_tools]);
+    let skill_tools = Arc::new(SkillToolRouter::new(Arc::clone(&skill_runtime)));
+    let tool_router =
+        CompositeToolRouter::new(vec![local_tools, workspace_tools.clone(), skill_tools]);
     let mut agent = Agent::new(model, Arc::new(tool_router));
     agent.hooks.push(Arc::new(SkillHook::new(skill_runtime)));
 
@@ -112,7 +89,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         }
         if input == "/clear" {
             agent.messages.clear();
-            read_tool.clear_cache();
+            workspace_tools.clear_cache();
             agent
                 .messages
                 .push(Message::System(vec![text(SYSTEM_PROMPT)]));
