@@ -1,0 +1,224 @@
+use async_std::io::WriteExt;
+use copro_agent::{CancellationToken, ToolRouter};
+use copro_api::message::{InputContent, ToolCall, ToolResult, ToolResultStatus};
+use copro_harness::tools::{ErasedTool, LocalToolRouter};
+use copro_workspace::tools::GrepTool;
+use serde_json::json;
+use std::sync::Arc;
+use vfs::async_vfs::{AsyncMemoryFS, AsyncVfsPath};
+
+#[tokio::test]
+async fn defaults_to_files_with_matches() {
+    let root = memory_root().await;
+    write_file(&root, "src/main.rs", b"fn main() { println!(\"hi\"); }\n").await;
+    write_file(&root, "README.md", b"hello\n").await;
+
+    let result = execute_grep(root, json!({ "pattern": "println" })).await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(tool_text(&result), "src/main.rs");
+}
+
+#[tokio::test]
+async fn content_mode_supports_line_numbers_and_case_insensitive_search() {
+    let root = memory_root().await;
+    write_file(&root, "notes.txt", b"Alpha\nbeta\nALPINE\n").await;
+
+    let result = execute_grep(
+        root,
+        json!({
+            "pattern": "alp",
+            "output_mode": "content",
+            "-i": true
+        }),
+    )
+    .await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(tool_text(&result), "notes.txt:1:Alpha\nnotes.txt:3:ALPINE");
+}
+
+#[tokio::test]
+async fn filters_by_glob() {
+    let root = memory_root().await;
+    write_file(&root, "src/app.ts", b"const needle = 1;\n").await;
+    write_file(&root, "src/app.py", b"needle = 1\n").await;
+
+    let result = execute_grep(
+        root,
+        json!({
+            "pattern": "needle",
+            "glob": "*.ts"
+        }),
+    )
+    .await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(tool_text(&result), "src/app.ts");
+}
+
+#[tokio::test]
+async fn filters_by_type() {
+    let root = memory_root().await;
+    write_file(&root, "src/app.js", b"const needle = 1;\n").await;
+    write_file(&root, "src/app.py", b"needle = 1\n").await;
+
+    let result = execute_grep(
+        root,
+        json!({
+            "pattern": "needle",
+            "type": "js"
+        }),
+    )
+    .await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(tool_text(&result), "src/app.js");
+}
+
+#[tokio::test]
+async fn respects_root_gitignore_rules() {
+    let root = memory_root().await;
+    write_file(&root, ".gitignore", b"ignored.txt\ntarget/\n").await;
+    write_file(&root, "visible.txt", b"needle\n").await;
+    write_file(&root, "ignored.txt", b"needle\n").await;
+    write_file(&root, "target/output.txt", b"needle\n").await;
+
+    let result = execute_grep(root, json!({ "pattern": "needle" })).await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(tool_text(&result), "visible.txt");
+}
+
+#[tokio::test]
+async fn respects_nested_gitignore_rules() {
+    let root = memory_root().await;
+    write_file(&root, "src/.gitignore", b"generated/\n").await;
+    write_file(&root, "src/lib.rs", b"let needle = true;\n").await;
+    write_file(&root, "src/generated/lib.rs", b"let needle = true;\n").await;
+
+    let result = execute_grep(root, json!({ "pattern": "needle" })).await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(tool_text(&result), "src/lib.rs");
+}
+
+#[tokio::test]
+async fn excludes_git_directory_by_default() {
+    let root = memory_root().await;
+    write_file(&root, ".git/config", b"needle\n").await;
+    write_file(&root, ".git/objects/pack/data", b"needle\n").await;
+    write_file(&root, "visible.txt", b"needle\n").await;
+
+    let result = execute_grep(root, json!({ "pattern": "needle" })).await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(tool_text(&result), "visible.txt");
+}
+
+#[tokio::test]
+async fn count_mode_counts_matching_lines_per_file() {
+    let root = memory_root().await;
+    write_file(&root, "a.txt", b"needle\nneedle again\nnope\n").await;
+    write_file(&root, "b.txt", b"needle\n").await;
+
+    let result = execute_grep(
+        root,
+        json!({
+            "pattern": "needle",
+            "output_mode": "count"
+        }),
+    )
+    .await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(tool_text(&result), "a.txt:2\nb.txt:1");
+}
+
+#[tokio::test]
+async fn context_and_head_limit_are_applied_to_content_output() {
+    let root = memory_root().await;
+    write_file(&root, "notes.txt", b"before\nneedle\nafter\nneedle two\n").await;
+
+    let result = execute_grep(
+        root,
+        json!({
+            "pattern": "needle",
+            "output_mode": "content",
+            "context": 1,
+            "head_limit": 3
+        }),
+    )
+    .await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(
+        tool_text(&result),
+        "notes.txt-1-before\nnotes.txt:2:needle\nnotes.txt-3-after\n[truncated: reached head_limit; continue with offset=3]"
+    );
+}
+
+#[tokio::test]
+async fn multiline_search_crosses_line_boundaries() {
+    let root = memory_root().await;
+    write_file(&root, "notes.txt", b"begin\nmiddle\nend\n").await;
+
+    let result = execute_grep(
+        root,
+        json!({
+            "pattern": "begin.*end",
+            "output_mode": "content",
+            "multiline": true
+        }),
+    )
+    .await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(
+        tool_text(&result),
+        "notes.txt:1:begin\nnotes.txt:2:middle\nnotes.txt:3:end"
+    );
+}
+
+async fn memory_root() -> AsyncVfsPath {
+    AsyncMemoryFS::new().into()
+}
+
+async fn write_file(root: &AsyncVfsPath, path: &str, bytes: &[u8]) {
+    let path = root.join(path).unwrap();
+    path.parent().create_dir_all().await.unwrap();
+    path.create_file()
+        .await
+        .unwrap()
+        .write_all(bytes)
+        .await
+        .unwrap();
+}
+
+async fn execute_grep(root: AsyncVfsPath, args: serde_json::Value) -> ToolResult {
+    let tool: Arc<dyn ErasedTool> = Arc::new(GrepTool::new(root));
+    let router = LocalToolRouter::new(vec![tool]);
+    router
+        .execute(call(args), CancellationToken::new())
+        .await
+        .unwrap()
+}
+
+fn call(args: serde_json::Value) -> ToolCall {
+    let serde_json::Value::Object(arguments) = args else {
+        panic!("tool args must be an object");
+    };
+
+    ToolCall {
+        id: "call-grep".to_string(),
+        name: "grep".to_string(),
+        arguments,
+    }
+}
+
+fn tool_text(result: &ToolResult) -> &str {
+    let Some(InputContent::Text(text)) = result.content.first() else {
+        panic!("expected text output");
+    };
+    text
+}

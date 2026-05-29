@@ -7,7 +7,7 @@ use copro_harness::tools::{CompositeToolRouter, LocalToolRouter};
 use copro_provider_openai::{
     OpenAiResponsesModelConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
 };
-use copro_workspace::tools::{EditTool, ReadTool, WriteTool};
+use copro_workspace::tools::{EditTool, GrepTool, ReadTool, WriteTool};
 use futures_util::StreamExt;
 use std::env;
 use std::error::Error as StdError;
@@ -52,6 +52,9 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         AsyncPhysicalFS::new(env::current_dir()?).into(),
         Arc::clone(read_tool.cache()),
     ));
+    let grep_tool = Arc::new(GrepTool::new(
+        AsyncPhysicalFS::new(env::current_dir()?).into(),
+    ));
     let local_tools: Arc<dyn ToolRouter> = Arc::new(LocalToolRouter::new(vec![
         tool!(
             "calculator",
@@ -68,6 +71,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         read_tool.clone(),
         write_tool,
         edit_tool,
+        grep_tool,
     ]));
     let skill_runtime = Arc::new(SkillRuntime::new(Arc::new(ExampleSkillStore::new(
         env::current_dir()?.join("examples/simple-cli/skills"),
