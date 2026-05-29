@@ -3,11 +3,11 @@ use copro_api::message::{InputContent, Message, OutputContent, ToolResultStatus}
 use copro_api::stream::OutputContentDelta;
 use copro_harness::skills::{SkillHook, SkillRuntime, SkillToolRouter};
 use copro_harness::tool;
-use copro_harness::tools::{CompositeToolRouter, ErasedTool, LocalToolRouter};
+use copro_harness::tools::{CompositeToolRouter, LocalToolRouter};
 use copro_provider_openai::{
     OpenAiResponsesModelConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
 };
-use copro_workspace::tools::{EditTool, ReadTool};
+use copro_workspace::tools::{EditTool, ReadTool, WriteTool};
 use futures_util::StreamExt;
 use std::env;
 use std::error::Error as StdError;
@@ -44,7 +44,11 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let read_tool = Arc::new(ReadTool::new(
         AsyncPhysicalFS::new(env::current_dir()?).into(),
     ));
-    let edit_tool: Arc<dyn ErasedTool> = Arc::new(EditTool::with_cache(
+    let write_tool = Arc::new(WriteTool::with_cache(
+        AsyncPhysicalFS::new(env::current_dir()?).into(),
+        Arc::clone(read_tool.cache()),
+    ));
+    let edit_tool = Arc::new(EditTool::with_cache(
         AsyncPhysicalFS::new(env::current_dir()?).into(),
         Arc::clone(read_tool.cache()),
     ));
@@ -62,6 +66,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             policy = ToolExecutionPolicy::Parallel,
         ),
         read_tool.clone(),
+        write_tool,
         edit_tool,
     ]));
     let skill_runtime = Arc::new(SkillRuntime::new(Arc::new(ExampleSkillStore::new(

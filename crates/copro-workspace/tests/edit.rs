@@ -2,7 +2,7 @@ use async_std::io::WriteExt;
 use copro_agent::{CancellationToken, ToolRouter};
 use copro_api::message::{InputContent, ToolCall, ToolResultStatus};
 use copro_harness::tools::{ErasedTool, LocalToolRouter};
-use copro_workspace::tools::{EditTool, FileCache};
+use copro_workspace::tools::{CacheEntry, EditTool, FileCache, FileSnapshot};
 use serde_json::json;
 use std::sync::Arc;
 use vfs::async_vfs::{AsyncMemoryFS, AsyncVfsPath};
@@ -13,14 +13,10 @@ async fn edits_single_occurrence() {
 
     // Populate cache (simulate read-before-write)
     let cache: FileCache = Arc::default();
-    cache.lock().unwrap().insert(
-        "notes.txt".to_string(),
-        copro_workspace::tools::CacheEntry {
-            bytes: b"hello\nworld\n".to_vec(),
-            offset: None,
-            limit: None,
-        },
-    );
+    cache
+        .lock()
+        .unwrap()
+        .insert("notes.txt".to_string(), cache_entry(b"hello\nworld\n"));
 
     let tool: Arc<dyn ErasedTool> = Arc::new(EditTool::with_cache(root, cache));
     let router = LocalToolRouter::new(vec![tool]);
@@ -47,14 +43,10 @@ async fn replaces_all_occurrences() {
     let root = memory_root_with("notes.txt", "foo bar foo\n").await;
 
     let cache: FileCache = Arc::default();
-    cache.lock().unwrap().insert(
-        "notes.txt".to_string(),
-        copro_workspace::tools::CacheEntry {
-            bytes: b"foo bar foo\n".to_vec(),
-            offset: None,
-            limit: None,
-        },
-    );
+    cache
+        .lock()
+        .unwrap()
+        .insert("notes.txt".to_string(), cache_entry(b"foo bar foo\n"));
 
     let tool: Arc<dyn ErasedTool> = Arc::new(EditTool::with_cache(root, cache));
     let router = LocalToolRouter::new(vec![tool]);
@@ -81,14 +73,10 @@ async fn with_empty_new_string_deletes_text() {
     let root = memory_root_with("notes.txt", "keep this remove\n").await;
 
     let cache: FileCache = Arc::default();
-    cache.lock().unwrap().insert(
-        "notes.txt".to_string(),
-        copro_workspace::tools::CacheEntry {
-            bytes: b"keep this remove\n".to_vec(),
-            offset: None,
-            limit: None,
-        },
-    );
+    cache
+        .lock()
+        .unwrap()
+        .insert("notes.txt".to_string(), cache_entry(b"keep this remove\n"));
 
     let tool: Arc<dyn ErasedTool> = Arc::new(EditTool::with_cache(root, cache));
     let router = LocalToolRouter::new(vec![tool]);
@@ -137,14 +125,10 @@ async fn rejects_nonexistent_old_string() {
     let root = memory_root_with("notes.txt", "hello\n").await;
 
     let cache: FileCache = Arc::default();
-    cache.lock().unwrap().insert(
-        "notes.txt".to_string(),
-        copro_workspace::tools::CacheEntry {
-            bytes: b"hello\n".to_vec(),
-            offset: None,
-            limit: None,
-        },
-    );
+    cache
+        .lock()
+        .unwrap()
+        .insert("notes.txt".to_string(), cache_entry(b"hello\n"));
 
     let tool: Arc<dyn ErasedTool> = Arc::new(EditTool::with_cache(root, cache));
     let router = LocalToolRouter::new(vec![tool]);
@@ -169,14 +153,10 @@ async fn rejects_multiple_matches_without_replace_all() {
     let root = memory_root_with("notes.txt", "foo bar foo baz\n").await;
 
     let cache: FileCache = Arc::default();
-    cache.lock().unwrap().insert(
-        "notes.txt".to_string(),
-        copro_workspace::tools::CacheEntry {
-            bytes: b"foo bar foo baz\n".to_vec(),
-            offset: None,
-            limit: None,
-        },
-    );
+    cache
+        .lock()
+        .unwrap()
+        .insert("notes.txt".to_string(), cache_entry(b"foo bar foo baz\n"));
 
     let tool: Arc<dyn ErasedTool> = Arc::new(EditTool::with_cache(root, cache));
     let router = LocalToolRouter::new(vec![tool]);
@@ -194,6 +174,14 @@ async fn rejects_multiple_matches_without_replace_all() {
 
     assert_eq!(result.status, ToolResultStatus::Error);
     assert!(tool_text(&result).contains("include more surrounding context"));
+}
+
+fn cache_entry(bytes: &[u8]) -> CacheEntry {
+    CacheEntry {
+        offset: None,
+        limit: None,
+        snapshot: FileSnapshot::from_bytes(bytes),
+    }
 }
 
 async fn memory_root_with(path: &str, content: &str) -> AsyncVfsPath {

@@ -1,6 +1,7 @@
+use crate::tools::read::READ_TOOL_NAME;
 use crate::tools::read::digit_count;
-use crate::tools::read::{FileCache, READ_TOOL_NAME};
-use async_std::io::{ReadExt, WriteExt};
+use crate::tools::utils::{FileCache, read_file_bytes, resolve_path, validate_utf8};
+use async_std::io::WriteExt;
 use copro_agent::{CancellationToken, ToolExecutionPolicy};
 use copro_api::async_trait;
 use copro_harness::tools::Tool;
@@ -107,20 +108,12 @@ impl Tool for EditTool {
             }
         }
 
-        let path = self
-            .root
-            .join(&input.path)
-            .map_err(|error| error.to_string())?;
+        let path = resolve_path(&self.root, &input.path)?;
 
         // Read current file content
-        let mut file = path.open_file().await.map_err(|error| error.to_string())?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .await
-            .map_err(|error| error.to_string())?;
+        let bytes = read_file_bytes(&path, 0).await?;
 
-        let content =
-            String::from_utf8(bytes).map_err(|_| format!("{} is not valid UTF-8", input.path))?;
+        let content = validate_utf8(bytes, &input.path)?;
 
         let occurrence_count = count_matches(&content, &input.old_string);
         if occurrence_count == 0 {

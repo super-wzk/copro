@@ -1,26 +1,17 @@
-use async_std::io::ReadExt;
+pub use crate::tools::utils::{CacheEntry, FileCache, FileSnapshot};
+use crate::tools::utils::{read_file_bytes, resolve_path, validate_utf8};
 use copro_agent::{CancellationToken, ToolExecutionPolicy};
 use copro_api::async_trait;
 use copro_api::message::{ImageContent, InputContent};
 use copro_harness::tools::{Tool, ToolOutput};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use vfs::VfsFileType;
 use vfs::async_vfs::AsyncVfsPath;
 
 pub const READ_TOOL_NAME: &str = "read";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CacheEntry {
-    pub bytes: Vec<u8>,
-    pub offset: Option<usize>,
-    pub limit: Option<usize>,
-}
-
-pub type FileCache = Arc<Mutex<HashMap<String, CacheEntry>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadToolConfig {
@@ -145,27 +136,21 @@ impl Tool for ReadTool {
         input: Self::Input,
         _cancel: CancellationToken,
     ) -> Result<Self::Output, String> {
-        let path = self
-            .root
-            .join(&input.path)
-            .map_err(|error| error.to_string())?;
+        let path = resolve_path(&self.root, &input.path)?;
         let metadata = path.metadata().await.map_err(|error| error.to_string())?;
         if metadata.file_type == VfsFileType::Directory {
             return Err(format!("cannot read directory: {}", input.path));
         }
 
-        let mut file = path.open_file().await.map_err(|error| error.to_string())?;
-        let mut bytes = Vec::with_capacity(metadata.len.try_into().unwrap_or_default());
-        file.read_to_end(&mut bytes)
-            .await
-            .map_err(|error| error.to_string())?;
+        let bytes = read_file_bytes(&path, metadata.len.try_into().unwrap_or_default()).await?;
 
         // Dedup: same path, bytes, offset, and limit → placeholder
         {
+            let snapshot = FileSnapshot::from_metadata_and_bytes(&metadata, &bytes);
             let expected = CacheEntry {
-                bytes: bytes.clone(),
                 offset: input.offset,
                 limit: input.limit,
+                snapshot,
             };
             let mut cache = self.cache.lock().unwrap();
             if cache.get(&input.path) == Some(&expected) {
@@ -184,8 +169,7 @@ impl Tool for ReadTool {
             }));
         }
 
-        let text = String::from_utf8(bytes)
-            .map_err(|_| format!("file is not valid UTF-8 text: {}", input.path))?;
+        let text = validate_utf8(bytes, &input.path)?;
         render_text(&text, &input, &self.config).map(ReadOutput::Text)
     }
 }

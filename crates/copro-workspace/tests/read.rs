@@ -108,7 +108,7 @@ async fn rejects_non_utf8_text_file() {
     let result = execute_read(root, json!({ "path": "data.bin" })).await;
 
     assert_eq!(result.status, ToolResultStatus::Error);
-    assert_eq!(tool_text(&result), "file is not valid UTF-8 text: data.bin");
+    assert_eq!(tool_text(&result), "data.bin is not valid UTF-8");
 }
 
 #[tokio::test]
