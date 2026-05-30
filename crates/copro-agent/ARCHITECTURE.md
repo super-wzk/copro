@@ -198,7 +198,7 @@ pub enum AgentTurnState {
 
 - 以 command 形式驱动一个 active `AgentTurn`。
 - 暴露单步推进、运行到 control point、应用 control、pause/resume/preempt、读取 state。
-- 保证所有外部控制都经过当前 `AgentStepId` 校验。
+- 通过一次性 `AgentControlPoint` 隐藏内部 `AgentStepId` control token，并保证 stale control 不能从应用层构造。
 - 保证外部调度器只能在 step boundary 控制 turn，不能直接改 `AgentTurnMachine` 或 history。
 - 可以被不同上层调度策略复用。
 
@@ -215,14 +215,22 @@ pub enum AgentTurnState {
 let turn = start_turn(history, config, model, tools);
 
 impl AgentTurnHandle {
-    pub async fn step(&self) -> Result<AgentStepReport>;
-    pub async fn step_until_control(&self) -> Result<AgentCheckpoint>;
-    pub async fn control(&self, step_id: AgentStepId, control: AgentControl) -> Result<AgentStepReport>;
+    pub async fn step_until_control(&self) -> Result<AgentControlPoint>;
     pub async fn pause(&self) -> Result<()>;
     pub async fn resume(&self) -> Result<()>;
     pub async fn preempt(&self) -> Result<()>;
     pub async fn state(&self) -> Result<AgentTurnState>;
     pub fn events(self) -> AgentStream;
+}
+
+pub struct AgentControlPoint { /* private control token */ }
+
+impl AgentControlPoint {
+    pub fn checkpoint(&self) -> &AgentCheckpoint;
+    pub fn report(&self) -> &AgentStepReport;
+    pub fn pending_outcome(&self) -> &AgentOutcome;
+    pub async fn control(self, control: AgentControl) -> Result<AgentStepReport>;
+    pub async fn continue_turn(self) -> Result<AgentStepReport>;
 }
 
 pub struct AgentStepReport {
@@ -314,7 +322,7 @@ clock 规则：
 - 如果 pause request 发生在 in-flight action 期间，当前 action 不会被取消；turn 会在下一次 boundary 发出 `TurnPaused`，直到收到 resume 后发出 `TurnResumed` 并继续。
 - `FinishTurn` 结束当前 turn，`AbortTurn` 直接产生 turn aborted。
 - `Preempt` 可以中断 in-flight step，并必须产生 `TurnPreempted` 和明确 interrupted outcome 或 recovery action。
-- 外部控制必须携带当前 `AgentStepId`，过期 step id 必须被拒绝。
+- 外部控制通过一次性 `AgentControlPoint` 提交；`AgentStepId` 只作为 core 内部 stale-control token，不要求应用层传入。
 
 ## RISC-like AgentAction 指令集
 
@@ -489,8 +497,8 @@ pub enum AgentControl {
 
 control 规则：
 
-- `AgentControl` 只作用于当前 `AgentStepId`。
-- stale control 必须返回错误，不能修改 turn state。
+- `AgentControl` 只通过当前 `AgentControlPoint` 生效。
+- stale control token 由 core 内部校验；应用层不能手写或复用 `AgentStepId` 来提交 control。
 - `Continue` 使用当前 pending outcome。
 - `Pause` 先完成当前 step，再让 turn 停在下一步之前。
 - `FinishTurn` 结束当前 turn，必要时进入 recovery。
@@ -601,13 +609,13 @@ event 规则：
 
 调度器边界：
 
-- 调度器可以决定何时调用 `step()`、`step_until_control()`、`control()`、`pause()`、`resume()`、`preempt()`。
-- 调度器可以监听 `AgentEvent`，也可以在 `AgentCheckpoint` 上 match pending outcome 并提交 `AgentControl`。
+- 调度器可以决定何时调用 `step_until_control()`、`AgentControlPoint::control()`、`pause()`、`resume()`、`preempt()`。
+- 调度器可以监听 `AgentEvent`，也可以在 `AgentControlPoint::checkpoint()` 上 match pending outcome 并提交 `AgentControl`。
 - 调度器不能直接修改 `AgentTurnMachine`、`AgentTurnState`、in-flight handle 或 `AgentHistory`。
-- 调度器不能提交 stale `AgentControl`；每次 control 必须携带当前 `AgentStepId`。
-- `AgentCheckpoint` variant 保留细粒度切入点；`control()` 会立即拒绝非法 control kind 和非法 replacement invariant。
+- 调度器不能提交 stale `AgentControl`；control token 被封装在不可 clone 的 `AgentControlPoint` 内。
+- `AgentCheckpoint` variant 保留细粒度切入点；`AgentControlPoint::control()` 会立即拒绝非法 control kind 和非法 replacement invariant。
 - `AgentEvent` 不是 hidden ack 协议；观察事件不会暂停执行，checkpoint/control boundary 才是执行同步点。
-- 同一个 `AgentTurnHandle` 同一时间只能有一个 active driver；`events()` 持有 stream lease，`step()` 持有单次调用 lease。
+- 同一个 `AgentTurnHandle` 同一时间只能有一个 active driver；`events()` 持有 stream lease，`step_until_control()` 持有 control point lease。
 - 调度器 trait 如果需要，放在上层 crate，例如 `AgentTurnDriver` / `AgentOrchestrator`，不进入底层核心。
 
 示例 API：
@@ -618,9 +626,7 @@ pub trait AgentTurnDriver: Send + Sync {
 }
 
 impl AgentTurnHandle {
-    pub async fn step(&self) -> Result<AgentStepReport>; // auto-continue one step
-    pub async fn step_until_control(&self) -> Result<AgentCheckpoint>;
-    pub async fn control(&self, step_id: AgentStepId, control: AgentControl) -> Result<AgentStepReport>;
+    pub async fn step_until_control(&self) -> Result<AgentControlPoint>;
     pub async fn pause(&self) -> Result<()>;
     pub async fn resume(&self) -> Result<()>;
     pub async fn preempt(&self) -> Result<()>;
@@ -709,10 +715,10 @@ explicit context mutation API when no active mutable turn exists
 外部 orchestrator 可以做：
 
 ```text
-agent_a_turn.step_until_control()
-agent_b_turn.step_until_control()
-agent_a_turn.control(step_id, AgentControl::Pause)
-agent_c_turn.step()
+let agent_a_point = agent_a_turn.step_until_control()
+let agent_b_point = agent_b_turn.step_until_control()
+agent_a_point.control(AgentControl::Pause)
+drop(agent_c_turn.step_until_control())
 ```
 
 框架保证：
@@ -789,8 +795,8 @@ AgentStrategy   // 对 model/tool/memory 使用策略进行配置
 
 - 新增 `AgentTurnHandle`。
 - 新增 `start_turn(history, config, model, tools)`。
-- 实现 `step()`，一次推进一个 `AgentAction` 并返回 `AgentStepReport`。
-- 实现 `step_until_control()`，在 configured control gate 处返回 `AgentCheckpoint`。
+- 实现 `step_until_control()`，在 configured control gate 处返回一次性 `AgentControlPoint`，应用通过 `checkpoint()` 读取 `AgentCheckpoint` 并提交 control。
+- `AgentControlPoint` drop 时 best-effort `Continue`，但需要处理错误时应显式调用 `continue_turn()`。
 - `events()` 基于 `AgentTurnHandle` auto mode 自动驱动 turn。
 - 不引入核心 `AgentScheduler` trait；可替换调度器作为外部 `AgentTurnHandle` driver 实现。
 
@@ -798,8 +804,8 @@ AgentStrategy   // 对 model/tool/memory 使用策略进行配置
 
 - 从 `copro-agent` 核心移除传统 `AgentHook`。
 - 在 step boundary 支持 `AgentControl`。
-- request/output/tool/result 改写逻辑通过 `AgentTurnHandle` control 实现。
-- stale control 和非法 control 必须有测试。
+- request/output/tool/result 改写逻辑通过 `AgentControlPoint::control()` 实现。
+- control point 单次消费、单 driver 保护和非法 control 必须有测试。
 
 ### Phase 7: Pause / Resume / Preempt / Recovery
 

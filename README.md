@@ -72,7 +72,7 @@ fn print_delta(delta: copro_api::stream::OutputContentDelta) {
 }
 ```
 
-Every execution starts with `start_turn(history, config, model, tools)`. The application owns `AgentHistory` between turns; each turn consumes a history value and `AgentTurnHandle::into_history().await` returns the updated history after the turn completes. Use `AgentTurnHandle::events()` for automatic streaming, or drive `AgentTurnHandle::step_until_control()` manually, inspect the returned `AgentCheckpoint`, and resume with `AgentTurnHandle::control(step_id, AgentControl::Continue)` or a replacement control.
+Every execution starts with `start_turn(history, config, model, tools)`. The application owns `AgentHistory` between turns; each turn consumes a history value and `AgentTurnHandle::into_history().await` returns the updated history after the turn completes. Use `AgentTurnHandle::events()` for automatic streaming, or drive `AgentTurnHandle::step_until_control()` manually, inspect `point.checkpoint()`, and resume with `point.continue_turn().await` or `point.control(...)`.
 
 ## Pause And Resume
 
@@ -120,7 +120,7 @@ use copro_agent::{AgentControl, AgentTurnHandle};
 
 async fn pause_at_checkpoint(turn: &AgentTurnHandle) -> copro_api::error::Result<()> {
     let point = turn.step_until_control().await?;
-    turn.control(point.step_id(), AgentControl::Pause).await?;
+    point.control(AgentControl::Pause).await?;
 
     // Later, after user or scheduler approval:
     turn.resume().await?;

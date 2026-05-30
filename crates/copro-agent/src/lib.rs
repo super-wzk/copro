@@ -12,7 +12,7 @@ pub use event::{AgentEvent, AgentStream};
 pub use history::AgentHistory;
 pub use tools::{ToolExecutionPolicy, ToolRouter};
 pub use turn::{
-    AgentAction, AgentCheckpoint, AgentControl, AgentControlKind, AgentInterruptReason,
-    AgentOutcome, AgentStep, AgentStepId, AgentStepReport, AgentTurnConfig, AgentTurnHandle,
-    AgentTurnState, ToolResultReplacement, start_turn,
+    AgentAction, AgentCheckpoint, AgentControl, AgentControlKind, AgentControlPoint,
+    AgentInterruptReason, AgentOutcome, AgentStep, AgentStepId, AgentStepReport, AgentTurnConfig,
+    AgentTurnHandle, AgentTurnState, ToolResultReplacement, start_turn,
 };

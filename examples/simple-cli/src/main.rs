@@ -145,18 +145,16 @@ async fn drive_turn(
         }
 
         let finished = matches!(point.pending_outcome(), AgentOutcome::TurnFinished);
-        match point {
+        match point.checkpoint() {
             AgentCheckpoint::RequestBuilt(report) => {
-                let step_id = report.step_id();
-                let AgentOutcome::RequestBuilt(mut request) = report.outcome else {
+                let AgentOutcome::RequestBuilt(mut request) = report.outcome.clone() else {
                     unreachable!("request checkpoint must carry a request outcome")
                 };
                 skill_request.prepare_request(&mut request).await?;
-                run.control(step_id, AgentControl::ReplaceRequest(request))
-                    .await?;
+                point.control(AgentControl::ReplaceRequest(request)).await?;
             }
-            point => {
-                run.control(point.step_id(), AgentControl::Continue).await?;
+            _ => {
+                point.continue_turn().await?;
             }
         }
 

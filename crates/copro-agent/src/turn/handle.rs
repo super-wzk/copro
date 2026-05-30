@@ -9,9 +9,20 @@ use copro_api::error::{Error, Result};
 use copro_api::message::{OutputContent, ToolCall, ToolCallId, ToolResult};
 use copro_api::response::FinishReason;
 use std::collections::HashSet;
+use std::fmt;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+
+#[must_use = "agent control points must be continued, controlled, paused, finished, or aborted"]
+pub struct AgentControlPoint {
+    turn: AgentTurnHandle,
+    checkpoint: AgentCheckpoint,
+    step_id: AgentStepId,
+    _driver: AgentTurnDriverLease,
+    controlled: bool,
+}
 
 #[derive(Clone)]
 pub struct AgentTurnHandle {
@@ -88,8 +99,8 @@ impl AgentTurnHandle {
         self.into_stream()
     }
 
-    pub async fn step(&self) -> Result<AgentStepReport> {
-        let _lease = self.try_acquire_driver()?;
+    pub async fn step_until_control(&self) -> Result<AgentControlPoint> {
+        let lease = self.try_acquire_driver()?;
         self.state.lock().await.continue_pending_control();
 
         let mut events = Vec::new();
@@ -128,7 +139,7 @@ impl AgentTurnHandle {
                         events,
                     };
                     state_inner.last_report = Some(report.clone());
-                    return Ok(report);
+                    return Ok(AgentControlPoint::new(self.clone(), report, lease));
                 }
                 AgentStreamItem::Error(error) => {
                     self.state.lock().await.state = Some(AgentTurnState::Aborted);
@@ -138,12 +149,7 @@ impl AgentTurnHandle {
         }
     }
 
-    pub async fn step_until_control(&self) -> Result<AgentCheckpoint> {
-        let report = self.step().await?;
-        Ok(AgentCheckpoint::from_report(report))
-    }
-
-    pub async fn control(
+    async fn control_step(
         &self,
         step_id: AgentStepId,
         control: AgentControl,
@@ -284,6 +290,93 @@ impl AgentTurnHandle {
                 Err(error)
             }
             None => Ok(None),
+        }
+    }
+}
+
+impl AgentControlPoint {
+    fn new(turn: AgentTurnHandle, report: AgentStepReport, driver: AgentTurnDriverLease) -> Self {
+        let step_id = report.step.id;
+        Self {
+            turn,
+            checkpoint: AgentCheckpoint::from_report(report),
+            step_id,
+            _driver: driver,
+            controlled: false,
+        }
+    }
+
+    pub fn checkpoint(&self) -> &AgentCheckpoint {
+        &self.checkpoint
+    }
+
+    pub fn report(&self) -> &AgentStepReport {
+        self.checkpoint.report()
+    }
+
+    pub fn step(&self) -> &AgentStep {
+        self.checkpoint.step()
+    }
+
+    pub fn state(&self) -> &AgentTurnState {
+        self.checkpoint.state()
+    }
+
+    pub fn events(&self) -> &[AgentEvent] {
+        self.checkpoint.events()
+    }
+
+    pub fn pending_outcome(&self) -> &AgentOutcome {
+        self.checkpoint.pending_outcome()
+    }
+
+    pub async fn control(mut self, control: AgentControl) -> Result<AgentStepReport> {
+        let result = self.turn.control_step(self.step_id, control).await;
+        if result.is_ok() {
+            self.controlled = true;
+        }
+        result
+    }
+
+    pub async fn continue_turn(self) -> Result<AgentStepReport> {
+        self.control(AgentControl::Continue).await
+    }
+}
+
+impl fmt::Debug for AgentControlPoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentControlPoint")
+            .field("checkpoint", &self.checkpoint)
+            .field("controlled", &self.controlled)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Deref for AgentControlPoint {
+    type Target = AgentStepReport;
+
+    fn deref(&self) -> &Self::Target {
+        self.report()
+    }
+}
+
+impl Drop for AgentControlPoint {
+    fn drop(&mut self) {
+        if self.controlled {
+            return;
+        }
+
+        if let Ok(mut state) = self.turn.state.try_lock() {
+            state.continue_pending_control();
+            return;
+        }
+
+        let turn = self.turn.clone();
+        let step_id = self.step_id;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = turn.control_step(step_id, AgentControl::Continue).await;
+            });
         }
     }
 }

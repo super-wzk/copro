@@ -14,7 +14,7 @@ pub use config::AgentTurnConfig;
 pub(crate) use control::AgentControlSignal;
 pub use control::{AgentControl, AgentControlKind, ToolResultReplacement};
 pub(crate) use execution::AgentTurn;
-pub use handle::AgentTurnHandle;
+pub use handle::{AgentControlPoint, AgentTurnHandle};
 pub(crate) use resources::AgentTurnResources;
 pub use start::start_turn;
 pub(crate) use stream_item::AgentStreamItem;

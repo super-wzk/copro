@@ -8,18 +8,18 @@
 
 已完成：
 
-- `AgentTurnHandle` 已提供 `step()`、`step_until_control()`、`control()`、`events()`、`pause()`、`resume()`、`preempt()`。
+- `AgentTurnHandle` 已提供 `step_until_control()`、`events()`、`pause()`、`resume()`、`preempt()`；boundary control 通过一次性 `AgentControlPoint::control()` 提交。
 - `AgentEvent` 已切换为核心 step-level 事件。
 - `ControlRequired` / `StepCompleted` 已分离：前者表示 pending boundary，后者只表示 control 应用后的 final outcome。
-- typed control point façade 已收敛为单个 `AgentCheckpoint` enum，variant 保留细粒度切入点。
-- `control()` 已对非法 control kind 和 replacement invariant 做即时校验。
+- typed control point façade 已收敛为 `AgentControlPoint` + `AgentCheckpoint` enum，variant 保留细粒度切入点。
+- `AgentControlPoint::control()` 已对非法 control kind 和 replacement invariant 做即时校验。
 - 普通 `AgentEvent` 内部投递已移除 ack；只有 `ControlRequired` 携带 reply 并阻塞 turn 等待 `AgentControl`。
 - `ToolResultReplacement` 已用于 typed tool result replacement，由运行层自动填充 `call_id` / `name`。
 - `Pause` / `Resume` 已形成 boundary 和 in-flight pause request 的 `TurnPaused` -> `TurnResumed` 事件链。
 - `FinishTurn` / `AbortTurn` 已在事件层区分，in-flight `preempt()` 已产生 `TurnPreempted`。
 - `Ready` 已通过 `StepReady` 成为真实可观察状态，`Recovering` 已通过 `TurnRecovering` 成为真实 recovery 状态。
 - abort/preempt/stop 遇到已提交 tool call 或 tool execution boundary 时，会通过 recovery step 补齐 tool result。
-- `AgentTurnHandle` 已加入单 driver lease，避免 `events()` / `step()` 并发抢同一 receiver。
+- `AgentTurnHandle` 已加入单 driver lease，避免 `events()` / `step_until_control()` 并发抢同一 receiver。
 - `AgentTurnMachine` 已收敛为 `next_action()` / `apply_outcome()` 纯同步状态机；`AgentTurn` 统一按 action step loop 执行 async IO、control boundary、commit 和 event emission。
 - turn 执行模块已拆为 `turn/{types,control,checkpoint,handle,execution}.rs`，`turn/mod.rs` 只保留声明和 re-export。
 - `runtime` public namespace 已移除；`StopSignal` public API 已移除，取消能力收拢为每个 turn 内部的 cancellation source，由 `AgentTurnHandle` 的 `AbortTurn` / `preempt()` 驱动。
@@ -53,35 +53,35 @@
 
 - 替换 request/delta/output/tool call/tool result 后，`StepCompleted` 中只出现最终 outcome。
 - `events()` auto mode 仍能自动 `Continue`。
-- `step()` 返回 control point 时不再把 pending outcome 伪装成 completed。
+- `step_until_control()` 返回 control point 时不再把 pending outcome 伪装成 completed；默认继续由 `AgentControlPoint` drop 兜底或显式 `continue_turn()` 完成。
 - 新增测试覆盖 `ControlRequired -> control -> StepCompleted` 顺序。
 
 ### 2. control() 合法性校验滞后（已完成）
 
 原问题：
 
-- stale `AgentStepId` 已能立即拒绝。
-- 非法 `AgentControl` 仍可能在 `control()` 返回 `Ok` 后，由下一次 `step()` 暴露错误。
+- stale `AgentStepId` 不再暴露给应用层作为 control 参数。
+- 旧 API 下非法 `AgentControl` 仍可能在 `control()` 返回 `Ok` 后，由下一次驱动暴露错误。
 - 当前 API 允许外部组合“任意 `AgentControl` + 任意 step”，control kind 和 step outcome 的非法组合只能靠运行时发现。
 
 目标：
 
 - 优先通过 Rust 类型系统防止 control kind 和 step outcome 的非法组合。
-- `AgentTurnHandle::control()` 仍基于当前 pending outcome 的 allowed controls 立即拒绝绕过 typed API 的非法 control。
+- `AgentControlPoint::control()` 基于当前 pending outcome 的 allowed controls 立即拒绝非法 control。
 - 运行层仍保留防御性校验，避免绕过 handle 时进入非法状态。
 
 方向：
 
 - 使用单个 `AgentCheckpoint` enum 表达 typed checkpoint，例如 `RequestBuilt(report)`、`ModelDelta(report)`、`ToolResult(report)`。
-- 外部通过 match checkpoint variant 获取对应 pending 数据，再提交 `AgentControl`。
+- 外部通过 `point.checkpoint()` match variant 获取对应 pending 数据，再用同一个 `AgentControlPoint` 提交 `AgentControl`。
 - 不再为每个 checkpoint 维护单独 wrapper struct，避免 API 和 runner 代码膨胀。
 - 保留低层 escape hatch 时必须走 immediate runtime validation。
 
 验收：
 
-- 非法 control 在 `control()` 返回 `Err`。
+- 非法 control 在 `AgentControlPoint::control()` 返回 `Err`。
 - 旧的“下一次 step 才报错”测试改为 immediate error。
-- stale control 和非法 control 错误信息保持可区分。
+- stale control token 不暴露给应用层；单个 `AgentControlPoint` 不可 clone 且持有 driver lease。
 - 新增 `AgentCheckpoint` enum 路径，常规调用围绕 checkpoint variant match 写控制逻辑。
 - 测试覆盖 checkpoint 合法路径，以及低层 API 的非法 control immediate error。
 
@@ -102,7 +102,7 @@
 
 验收：
 
-- `control(Pause)` 产生 `TurnPaused`，turn 停在当前 boundary 后。
+- `AgentControlPoint::control(Pause)` 产生 `TurnPaused`，turn 停在当前 boundary 后。
 - `resume()` 产生 `TurnResumed`，随后继续下一个 step。
 - in-flight model stream/tool execution 场景下 pause 不取消当前 action，只在 boundary 停住。
 
@@ -131,19 +131,19 @@
 原问题：
 
 - `AgentTurnHandle` 可 clone。
-- `events()` / `step()` 共享同一个 receiver，多个消费者可能抢事件。
+- `events()` / `step_until_control()` 共享同一个 receiver，多个消费者可能抢事件。
 - mutex 避免数据竞争，但不保证执行语义正确。
 
 目标：
 
 - 一个 turn 同时只能有一个 active driver。
-- `events()` 和 `step()` 不能并发消费同一个 turn。
+- `events()` 和 `step_until_control()` 不能并发消费同一个 turn。
 
 验收：
 
 - 第二个 active consumer 会立即返回清晰错误。
 - dropped consumer 能释放 driver lease。
-- 测试覆盖 `events()` 与 `step()` 并发/交替误用。
+- 测试覆盖 `events()` 与 `step_until_control()` 并发/交替误用。
 
 ### 6. 替换 control 缺少一致性校验（已完成）
 
@@ -233,7 +233,7 @@
 
 - 修改事件发送 helper。
 - `emit_step_completed` 改为先发 `ControlRequired`，应用 control 后再发 `StepCompleted(final)`。
-- 调整 `AgentTurnHandle::step()` 以 `ControlRequired` 作为 control point。
+- 调整 `AgentTurnHandle::step_until_control()` 以 `ControlRequired` 作为 control point；移除 `step()`，避免和 control point drop 默认继续语义重复。
 - `events()` auto mode 对 `ControlRequired` 自动 `Continue`。
 
 验收：
@@ -246,14 +246,14 @@
 内容：
 
 - 引入 `AgentCheckpoint` enum，让常规控制逻辑围绕 typed checkpoint variant 编写。
-- `control()` 直接基于 allowed controls 校验，作为低层/防御性路径。
+- `AgentControlPoint::control()` 直接基于 allowed controls 校验。
 - 增加 request/output/tool replacement validator 和专用 replacement 类型。
 - 保留运行层防御性校验。
 
 验收：
 
-- 非法 control 和非法 replacement 都在 `control()` 返回 `Err`。
-- 常规 checkpoint API 通过 variant match 降低非法 control 组合风险，低层 `control()` 继续即时拒绝非法组合。
+- 非法 control 和非法 replacement 都在 `AgentControlPoint::control()` 返回 `Err`。
+- 常规 checkpoint API 通过 variant match 降低非法 control 组合风险，control point 继续即时拒绝非法组合。
 - `ToolResultReplacement` 等专用类型避免外部传入不一致 identity 字段。
 - 测试覆盖每种非法替换。
 
@@ -286,7 +286,7 @@
 内容：
 
 - 在 `AgentTurnHandle` 中加入 driver lease。
-- `step()` / `events()` 进入消费前获取 lease。
+- `step_until_control()` / `events()` 进入消费前获取 lease。
 - lease drop 后释放。
 
 验收：
