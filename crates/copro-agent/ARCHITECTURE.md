@@ -561,6 +561,7 @@ event 规则：
 - `ModelDelta` 必须是 `DropModelDelta` / `ReplaceModelDelta` 应用后的最终 delta。
 - `AssistantCommitted` 必须在 assistant message 已写入 context history 后发出。
 - `ToolResultCommitted` 必须在 tool result message 已写入 context history 后发出。
+- 普通观察事件只做投递，不需要 ack；只有 `ControlRequired` 内部携带 reply 并阻塞 run 等待 `AgentControl`。
 - 上层 UI 可以自行过滤 step-level event，但框架不再提供旧式 streaming event 兼容层。
 
 ## 驱动模式
@@ -597,6 +598,7 @@ event 规则：
 - 调度器不能直接修改 `AgentTurn`、`AgentRunState`、in-flight handle 或 `AgentContext` history。
 - 调度器不能提交 stale `AgentControl`；每次 control 必须携带当前 `AgentStepId`。
 - `AgentCheckpoint` variant 保留细粒度切入点；`control()` 会立即拒绝非法 control kind 和非法 replacement invariant。
+- `AgentEvent` 不是 hidden ack 协议；观察事件不会暂停执行，checkpoint/control boundary 才是执行同步点。
 - 同一个 `AgentRunHandle` 同一时间只能有一个 active driver；`events()` 持有 stream lease，`step()` 持有单次调用 lease。
 - 调度器 trait 如果需要，放在上层 crate，例如 `AgentRunDriver` / `AgentOrchestrator`，不进入底层核心。
 

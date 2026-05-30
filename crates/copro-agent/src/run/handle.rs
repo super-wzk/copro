@@ -90,40 +90,49 @@ impl AgentRunHandle {
                 .ok_or_else(|| Error::client("agent run finished"))?;
 
             match item {
-                AgentStreamItem::Event(event, ack) => {
+                AgentStreamItem::Event(event) => {
                     let event = *event;
                     events.push(event.clone());
-                    if let AgentEvent::ControlRequired { step, outcome } = event {
-                        let mut state_inner = self.state.lock().await;
-                        let mut state = AgentRunState::WaitingControl {
-                            step: step.clone(),
-                            outcome: outcome.clone(),
-                        };
-                        state_inner.state = Some(state.clone());
-                        if state_inner.preempt_requested {
-                            state_inner.preempt_requested = false;
-                            state = AgentRunState::Preempting { step_id: step.id };
-                            state_inner.state = Some(state.clone());
-                            let _ = ack.send(AgentControlSignal::preempt());
-                        } else if state_inner.pause_requested {
-                            state_inner.pause_requested = false;
-                            state = AgentRunState::Paused { at: step.id };
-                            state_inner.state = Some(state.clone());
-                            let _ = ack.send(state_inner.make_pause_signal(step.id));
-                        } else {
-                            state_inner.pending_control = Some((step.id, ack));
-                        }
-                        let report = AgentStepReport {
-                            step,
-                            outcome,
-                            state,
-                            events,
-                        };
-                        state_inner.last_report = Some(report.clone());
-                        return Ok(report);
-                    }
                     self.state.lock().await.observe_event(&event);
-                    let _ = ack.send(AgentControlSignal::continue_run());
+                }
+                AgentStreamItem::ControlRequired {
+                    step,
+                    outcome,
+                    reply,
+                } => {
+                    let step = *step;
+                    let outcome = *outcome;
+                    events.push(AgentEvent::ControlRequired {
+                        step: step.clone(),
+                        outcome: outcome.clone(),
+                    });
+                    let mut state_inner = self.state.lock().await;
+                    let mut state = AgentRunState::WaitingControl {
+                        step: step.clone(),
+                        outcome: outcome.clone(),
+                    };
+                    state_inner.state = Some(state.clone());
+                    if state_inner.preempt_requested {
+                        state_inner.preempt_requested = false;
+                        state = AgentRunState::Preempting { step_id: step.id };
+                        state_inner.state = Some(state.clone());
+                        let _ = reply.send(AgentControlSignal::preempt());
+                    } else if state_inner.pause_requested {
+                        state_inner.pause_requested = false;
+                        state = AgentRunState::Paused { at: step.id };
+                        state_inner.state = Some(state.clone());
+                        let _ = reply.send(state_inner.make_pause_signal(step.id));
+                    } else {
+                        state_inner.pending_control = Some((step.id, reply));
+                    }
+                    let report = AgentStepReport {
+                        step,
+                        outcome,
+                        state,
+                        events,
+                    };
+                    state_inner.last_report = Some(report.clone());
+                    return Ok(report);
                 }
                 AgentStreamItem::Error(error) => {
                     self.state.lock().await.state = Some(AgentRunState::Aborted);
@@ -249,26 +258,37 @@ impl AgentRunHandle {
         self.state.lock().await.continue_pending_control();
 
         match self.events.lock().await.recv().await {
-            Some(AgentStreamItem::Event(event, ack)) => {
+            Some(AgentStreamItem::Event(event)) => {
                 let event = *event;
                 let mut state = self.state.lock().await;
                 state.observe_event(&event);
-                let signal = if let AgentEvent::ControlRequired { step, .. } = &event {
-                    if state.preempt_requested {
-                        state.preempt_requested = false;
-                        state.state = Some(AgentRunState::Preempting { step_id: step.id });
-                        AgentControlSignal::preempt()
-                    } else if state.pause_requested {
-                        state.pause_requested = false;
-                        state.state = Some(AgentRunState::Paused { at: step.id });
-                        state.make_pause_signal(step.id)
-                    } else {
-                        AgentControlSignal::continue_run()
-                    }
+                Ok(Some(event))
+            }
+            Some(AgentStreamItem::ControlRequired {
+                step,
+                outcome,
+                reply,
+            }) => {
+                let step = *step;
+                let outcome = *outcome;
+                let event = AgentEvent::ControlRequired {
+                    step: step.clone(),
+                    outcome,
+                };
+                let mut state = self.state.lock().await;
+                state.observe_event(&event);
+                let signal = if state.preempt_requested {
+                    state.preempt_requested = false;
+                    state.state = Some(AgentRunState::Preempting { step_id: step.id });
+                    AgentControlSignal::preempt()
+                } else if state.pause_requested {
+                    state.pause_requested = false;
+                    state.state = Some(AgentRunState::Paused { at: step.id });
+                    state.make_pause_signal(step.id)
                 } else {
                     AgentControlSignal::continue_run()
                 };
-                let _ = ack.send(signal);
+                let _ = reply.send(signal);
                 Ok(Some(event))
             }
             Some(AgentStreamItem::Error(error)) => {

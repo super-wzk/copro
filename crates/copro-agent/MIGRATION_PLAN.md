@@ -13,6 +13,7 @@
 - `ControlRequired` / `StepCompleted` 已分离：前者表示 pending boundary，后者只表示 control 应用后的 final outcome。
 - typed control point façade 已收敛为单个 `AgentCheckpoint` enum，variant 保留细粒度切入点。
 - `control()` 已对非法 control kind 和 replacement invariant 做即时校验。
+- 普通 `AgentEvent` 内部投递已移除 ack；只有 `ControlRequired` 携带 reply 并阻塞 run 等待 `AgentControl`。
 - `ToolResultReplacement` 已用于 typed tool result replacement，由运行层自动填充 `call_id` / `name`。
 - `Pause` / `Resume` 已形成 boundary 和 in-flight pause request 的 `RunPaused` -> `RunResumed` 事件链。
 - `FinishRun` / `AbortRun` 已在事件层区分，in-flight `preempt()` 已产生 `RunPreempted`。

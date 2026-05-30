@@ -1177,12 +1177,13 @@ async fn emit_control_required(
     step: AgentStep,
     outcome: AgentOutcome,
 ) -> Option<AgentControlSignal> {
-    let (ack, rx) = oneshot::channel();
+    let (reply, rx) = oneshot::channel();
     if events
-        .send(AgentStreamItem::Event(
-            Box::new(AgentEvent::ControlRequired { step, outcome }),
-            ack,
-        ))
+        .send(AgentStreamItem::ControlRequired {
+            step: Box::new(step),
+            outcome: Box::new(outcome),
+            reply,
+        })
         .await
         .is_err()
     {
@@ -1397,13 +1398,8 @@ async fn emit_tool_finished(
 }
 
 async fn emit(events: &mpsc::Sender<AgentStreamItem>, event: AgentEvent) -> bool {
-    let (ack, rx) = oneshot::channel();
-    if events
-        .send(AgentStreamItem::Event(Box::new(event), ack))
+    events
+        .send(AgentStreamItem::Event(Box::new(event)))
         .await
-        .is_err()
-    {
-        return false;
-    }
-    rx.await.is_ok()
+        .is_ok()
 }
