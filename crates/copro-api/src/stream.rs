@@ -40,7 +40,7 @@ pub trait Model: Send + Sync {
     fn stream(&self, request: GenerateRequest) -> ModelStream;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct OutputStreamState {
     content: Vec<Option<OutputContentState>>,
     finished: bool,

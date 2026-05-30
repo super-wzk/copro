@@ -20,7 +20,7 @@
 - `Ready` 已通过 `StepReady` 成为真实可观察状态，`Recovering` 已通过 `RunRecovering` 成为真实 recovery 状态。
 - abort/preempt/stop 遇到已提交 tool call 或 tool execution boundary 时，会通过 recovery step 补齐 tool result。
 - `AgentRunHandle` 已加入单 driver lease，避免 `events()` / `step()` 并发抢同一 receiver。
-- `AgentTurn` 纯状态机化已评估：当前已无 async/IO/cancellation token；进一步 `next_action()` / `apply_outcome()` 拆分暂缓为后续机械重构。
+- `AgentTurn` 已收敛为 `next_action()` / `apply_outcome()` 纯同步状态机；`AgentRun` 统一按 action step loop 执行 async IO、control boundary、commit 和 event emission。
 - `run.rs` 已拆为 `run/{types,control,checkpoint,handle,execution}.rs`，`run/mod.rs` 只保留声明和 re-export。
 - `runtime` public namespace 已移除；`StopSignal` public API 已移除，取消能力收拢为每个 run 内部的 cancellation source，由 `AgentRunHandle` 的 `Abort*` / `preempt()` 驱动。
 - `AgentContext` 已作为 public 可序列化值对象加入 API，用于保存/恢复长期 context 状态；字段私有且只提供 getter，不包含 model/tools 或 in-flight run/runtime 对象。
@@ -172,11 +172,11 @@
 - 测试覆盖合法和非法替换。
 - 常规 typed API 下无法构造 `call_id` / `name` 不匹配的 `ToolResult` replacement。
 
-### 7. AgentTurn 仍未完全纯状态机化（评估完成，暂缓大重构）
+### 7. AgentTurn 仍未完全纯状态机化（已完成）
 
 原问题：
 
-- `AgentRun` 仍直接驱动较多 phase 和执行编排逻辑。
+- 旧实现中 `AgentRun` 直接按 phase 驱动请求、模型流、工具规划、工具执行和结果提交。
 - 文档中的 `next_action()` / `apply_outcome()` 尚未成为实际实现。
 
 目标：
@@ -188,7 +188,7 @@
 验收：
 
 - `AgentTurn` 无 async、无 IO handle、无 cancellation token。
-- `AgentRun` 中 phase-specific 分支减少，更多通过 `next_action()` / `apply_outcome()` 推进。
+- `AgentRun` 不再按 `AgentTurnPhase` dispatch；统一循环为 `next_action()` -> execute -> control -> commit/apply outcome。
 - 现有行为测试继续通过。
 
 ### 8. run_stream() 暴露 step-level event 的产品语义
@@ -296,7 +296,7 @@
 内容：
 
 - 引入 `next_action()` / `apply_outcome()`。
-- 分阶段减少 `AgentRun` 中的 phase 分支。
+- 移除 `AgentRun` 中的 phase dispatch，改为统一 action step loop。
 
 验收：
 

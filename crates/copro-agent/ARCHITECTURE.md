@@ -239,7 +239,7 @@ pub enum AgentCheckpoint {
 
 `AgentTurn` 是单 turn 的纯状态机。
 
-当前实现保持同步、无 IO、无 cancellation token；完整 `next_action()` / `apply_outcome()` 拆分属于后续机械重构，不和本轮 control 语义迁移混在一起。
+当前实现通过 `next_action()` / `apply_outcome()` 推进；`AgentTurn` 只做同步状态转移，不持有 IO handle 或 cancellation token。`AgentRun` 负责执行 action、应用 control boundary、提交 history 并产出 event。
 
 职责：
 
@@ -264,8 +264,8 @@ pub enum AgentCheckpoint {
 
 ```rust
 impl AgentTurn {
-    pub fn next_action(&self) -> Result<AgentAction>;
-    pub fn apply_outcome(&mut self, outcome: AgentOutcome) -> Result<()>;
+    pub fn next_action(&mut self) -> Result<AgentAction>;
+    pub fn apply_outcome(&mut self, action: &AgentAction, outcome: AgentOutcome) -> Result<()>;
     pub fn is_finished(&self) -> bool;
 }
 ```

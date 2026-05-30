@@ -1,3 +1,4 @@
+use crate::run::{AgentAction, AgentOutcome};
 use crate::tools::ToolExecutionPolicy;
 use copro_api::error::{Error, Result};
 use copro_api::message::{
@@ -5,8 +6,9 @@ use copro_api::message::{
 };
 use copro_api::request::{GenerateRequest, GenerateRequestOptions};
 use copro_api::response::{FinishReason, Usage};
-use copro_api::stream::{OutputContentDelta, OutputStreamEvent, OutputStreamState};
+use copro_api::stream::{OutputStreamEvent, OutputStreamState};
 use copro_api::tool::{HostedToolSpec, ToolChoice, ToolDefinition};
+use std::collections::VecDeque;
 use std::mem;
 
 pub(crate) struct AgentTurn {
@@ -16,41 +18,215 @@ pub(crate) struct AgentTurn {
 impl AgentTurn {
     pub(crate) fn new() -> Self {
         Self {
-            state: AgentTurnState::ModelRequest,
+            state: AgentTurnState::LoadingTools,
         }
     }
 
-    pub(crate) fn phase(&self) -> AgentTurnPhase {
-        match self.state {
-            AgentTurnState::ModelRequest => AgentTurnPhase::ModelRequest,
-            AgentTurnState::ModelStreaming { .. } => AgentTurnPhase::ModelStreaming,
-            AgentTurnState::ToolPlanning { .. } => AgentTurnPhase::ToolPlanning,
-            AgentTurnState::ToolExecution { .. } | AgentTurnState::ToolExecutionInProgress => {
-                AgentTurnPhase::ToolExecution
+    pub(crate) fn next_action(&mut self) -> Result<AgentAction> {
+        self.normalize_tool_execution();
+
+        match &self.state {
+            AgentTurnState::LoadingTools => Ok(AgentAction::LoadTools),
+            AgentTurnState::BuildingRequest { tools } => Ok(AgentAction::BuildRequest {
+                tools: tools.clone(),
+            }),
+            AgentTurnState::OpeningModelStream { request } => Ok(AgentAction::OpenModelStream {
+                request: request.clone(),
+            }),
+            AgentTurnState::ReadingModel { .. } => Ok(AgentAction::ReadModelStream),
+            AgentTurnState::CommittingAssistant { output } => Ok(AgentAction::CommitAssistant {
+                content: output.content.clone(),
+                reason: output.reason,
+                usage: output.usage.clone(),
+            }),
+            AgentTurnState::PlanningTools { pending, .. } => {
+                let tool = pending
+                    .front()
+                    .cloned()
+                    .ok_or_else(|| unexpected_state("tool planning"))?;
+                Ok(AgentAction::PlanTool { tool })
             }
-            AgentTurnState::ToolResultCommit { .. }
-            | AgentTurnState::ToolResultCommitInProgress => AgentTurnPhase::ToolResultCommit,
-            AgentTurnState::Finished => AgentTurnPhase::Finished,
+            AgentTurnState::ToolExecution {
+                pending,
+                active,
+                active_policy,
+                ..
+            } if should_start_next_tool(pending, active, *active_policy) => {
+                let item = pending
+                    .front()
+                    .ok_or_else(|| unexpected_state("tool execution"))?;
+                Ok(AgentAction::StartTool {
+                    tool: item.tool.clone(),
+                    policy: item.policy,
+                })
+            }
+            AgentTurnState::ToolExecution { active, .. } => {
+                let tool = active
+                    .front()
+                    .cloned()
+                    .ok_or_else(|| unexpected_state("tool execution"))?;
+                Ok(AgentAction::ReadTool { tool })
+            }
+            AgentTurnState::CommittingToolResults { pending, .. } => {
+                let (tool, result) = pending
+                    .front()
+                    .cloned()
+                    .ok_or_else(|| unexpected_state("tool result commit"))?;
+                Ok(AgentAction::CommitToolResult { tool, result })
+            }
+            AgentTurnState::Finishing => Ok(AgentAction::FinishRun),
+            AgentTurnState::Finished => Err(unexpected_state("unfinished turn")),
         }
+    }
+
+    pub(crate) fn apply_outcome(
+        &mut self,
+        action: &AgentAction,
+        outcome: AgentOutcome,
+    ) -> Result<()> {
+        match (action, outcome) {
+            (AgentAction::LoadTools, AgentOutcome::ToolsLoaded(tools)) => {
+                self.state = AgentTurnState::BuildingRequest { tools };
+            }
+            (AgentAction::BuildRequest { .. }, AgentOutcome::RequestBuilt(request)) => {
+                self.state = AgentTurnState::OpeningModelStream { request };
+            }
+            (AgentAction::OpenModelStream { .. }, AgentOutcome::ModelStreamOpened) => {
+                self.state = AgentTurnState::ReadingModel {
+                    output_state: OutputStreamState::new(),
+                };
+            }
+            (
+                AgentAction::ReadModelStream,
+                AgentOutcome::ModelDelta {
+                    content_index,
+                    delta,
+                },
+            ) => {
+                let AgentTurnState::ReadingModel { output_state } = &mut self.state else {
+                    return Err(unexpected_state("model streaming"));
+                };
+                output_state.apply(OutputStreamEvent::Delta {
+                    content_index,
+                    delta,
+                })?;
+            }
+            (AgentAction::ReadModelStream, AgentOutcome::ModelDeltaDropped { .. }) => {}
+            (
+                AgentAction::ReadModelStream,
+                AgentOutcome::ModelOutputFinished {
+                    content,
+                    reason,
+                    usage,
+                },
+            ) => {
+                ensure_reading_model(&self.state)?;
+                self.state = AgentTurnState::CommittingAssistant {
+                    output: PendingOutput {
+                        content,
+                        reason,
+                        usage,
+                    },
+                };
+            }
+            (AgentAction::ReadModelStream, AgentOutcome::ActionInterrupted { .. }) => {
+                self.state = AgentTurnState::Finishing;
+            }
+            (
+                AgentAction::CommitAssistant { .. },
+                AgentOutcome::AssistantCommitted { content, .. },
+            ) => {
+                let tool_calls = content
+                    .iter()
+                    .filter_map(|content| match content {
+                        OutputContent::ToolCall(tool) => Some(tool.clone()),
+                        _ => None,
+                    })
+                    .collect::<VecDeque<_>>();
+                self.state = if tool_calls.is_empty() {
+                    AgentTurnState::Finishing
+                } else {
+                    AgentTurnState::PlanningTools {
+                        pending: tool_calls,
+                        plan: Vec::new(),
+                    }
+                };
+            }
+            (AgentAction::PlanTool { .. }, AgentOutcome::ToolPlanned { tool, policy }) => {
+                self.record_tool_plan(ToolPlanItem::pending(tool, policy))?;
+            }
+            (AgentAction::PlanTool { .. }, AgentOutcome::ToolRejected { tool, result }) => {
+                self.record_tool_plan(ToolPlanItem::completed(tool, result))?;
+            }
+            (
+                AgentAction::StartTool { tool, policy },
+                AgentOutcome::ToolStarted { tool: started },
+            ) => {
+                if tool.id != started.id {
+                    return Err(Error::protocol("started tool does not match action"));
+                }
+                self.record_tool_started(started, *policy)?;
+            }
+            (
+                AgentAction::ReadTool { tool },
+                AgentOutcome::ToolFinished {
+                    tool: finished,
+                    result,
+                },
+            ) => {
+                if tool.id != finished.id {
+                    return Err(Error::protocol("finished tool does not match action"));
+                }
+                self.record_tool_finished(finished, result)?;
+            }
+            (
+                AgentAction::CommitToolResult { tool, .. },
+                AgentOutcome::ToolResultCommitted {
+                    tool: committed, ..
+                },
+            ) => {
+                if tool.id != committed.id {
+                    return Err(Error::protocol(
+                        "committed tool result does not match action",
+                    ));
+                }
+                self.record_tool_result_committed()?;
+            }
+            (AgentAction::FinishRun, AgentOutcome::RunFinished) => {
+                self.state = AgentTurnState::Finished;
+            }
+            (action, outcome) => {
+                return Err(Error::protocol(format!(
+                    "outcome {outcome:?} is not valid for action {action:?}"
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     pub(crate) fn is_finished(&self) -> bool {
         matches!(self.state, AgentTurnState::Finished)
     }
 
+    pub(crate) fn is_finishing(&self) -> bool {
+        matches!(
+            self.state,
+            AgentTurnState::Finishing | AgentTurnState::Finished
+        )
+    }
+
     pub(crate) fn needs_tool_result_commit(&self) -> bool {
         matches!(
             self.state,
-            AgentTurnState::ToolPlanning { .. }
+            AgentTurnState::PlanningTools { .. }
                 | AgentTurnState::ToolExecution { .. }
-                | AgentTurnState::ToolExecutionInProgress
-                | AgentTurnState::ToolResultCommit { .. }
-                | AgentTurnState::ToolResultCommitInProgress
+                | AgentTurnState::CommittingToolResults { .. }
         )
     }
 
     pub(crate) fn finish(&mut self) {
-        self.state = AgentTurnState::Finished;
+        self.state = AgentTurnState::Finishing;
     }
 
     pub(crate) fn build_request(
@@ -70,107 +246,57 @@ impl AgentTurn {
         }
     }
 
-    pub(crate) fn open_model_stream(&mut self) -> Result<()> {
-        ensure_phase(self.phase(), AgentTurnPhase::ModelRequest)?;
-        self.state = AgentTurnState::ModelStreaming {
-            output_state: OutputStreamState::new(),
-        };
-        Ok(())
-    }
-
-    pub(crate) fn apply_output_delta(
-        &mut self,
-        content_index: usize,
-        delta: OutputContentDelta,
-    ) -> Result<()> {
-        let AgentTurnState::ModelStreaming { output_state } = &mut self.state else {
+    pub(crate) fn model_stream_outcome(&self, event: OutputStreamEvent) -> Result<AgentOutcome> {
+        let AgentTurnState::ReadingModel { output_state } = &self.state else {
             return Err(unexpected_state("model streaming"));
         };
 
-        output_state.apply(OutputStreamEvent::Delta {
-            content_index,
-            delta,
-        })?;
-        Ok(())
-    }
+        match event {
+            OutputStreamEvent::Delta {
+                content_index,
+                delta,
+            } => Ok(AgentOutcome::ModelDelta {
+                content_index,
+                delta,
+            }),
+            OutputStreamEvent::Finished { reason, usage } => {
+                let mut output_state = output_state.clone();
+                let response = output_state
+                    .apply(OutputStreamEvent::Finished { reason, usage })?
+                    .ok_or_else(|| Error::protocol("stream ended before finished event"))?;
 
-    pub(crate) fn finish_output(
-        &mut self,
-        reason: FinishReason,
-        usage: Option<Usage>,
-    ) -> Result<PendingOutput> {
-        let AgentTurnState::ModelStreaming { output_state } = &mut self.state else {
-            return Err(unexpected_state("model streaming"));
-        };
-
-        let response = output_state
-            .apply(OutputStreamEvent::Finished { reason, usage })?
-            .ok_or_else(|| Error::protocol("stream ended before finished event"))?;
-
-        Ok(PendingOutput {
-            content: into_assistant_content(response.message)?,
-            reason: response.reason,
-            usage: response.usage,
-        })
-    }
-
-    pub(crate) fn commit_output(&mut self, output: PendingOutput) -> Result<CommittedOutput> {
-        let tool_calls = output
-            .content
-            .iter()
-            .filter_map(|content| match content {
-                OutputContent::ToolCall(tool) => Some(tool.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let ends_turn = tool_calls.is_empty();
-
-        self.state = if ends_turn {
-            AgentTurnState::Finished
-        } else {
-            AgentTurnState::ToolPlanning { tool_calls }
-        };
-
-        Ok(CommittedOutput {
-            content: output.content,
-            reason: output.reason,
-            usage: output.usage,
-        })
-    }
-
-    pub(crate) fn tool_calls(&self) -> Result<Vec<ToolCall>> {
-        match &self.state {
-            AgentTurnState::ToolPlanning { tool_calls } => Ok(tool_calls.clone()),
-            _ => Err(unexpected_state("tool planning")),
-        }
-    }
-
-    pub(crate) fn set_tool_plan(&mut self, plan: Vec<ToolPlanItem>) -> Result<()> {
-        ensure_phase(self.phase(), AgentTurnPhase::ToolPlanning)?;
-        self.state = AgentTurnState::ToolExecution { plan };
-        Ok(())
-    }
-
-    pub(crate) fn take_tool_plan(&mut self) -> Result<Vec<ToolPlanItem>> {
-        match mem::replace(&mut self.state, AgentTurnState::ToolExecutionInProgress) {
-            AgentTurnState::ToolExecution { plan } => Ok(plan),
-            state => {
-                self.state = state;
-                Err(unexpected_state("tool execution"))
+                Ok(AgentOutcome::ModelOutputFinished {
+                    content: into_assistant_content(response.message)?,
+                    reason: response.reason,
+                    usage: response.usage,
+                })
             }
         }
     }
 
-    pub(crate) fn abort_pending_tools(&mut self) -> Result<()> {
+    pub(crate) fn recover_pending_tools(&mut self) -> Result<()> {
         self.state = match mem::replace(&mut self.state, AgentTurnState::Finished) {
-            AgentTurnState::ToolPlanning { tool_calls } => AgentTurnState::ToolResultCommit {
-                completed_tools: aborted_tool_calls(tool_calls),
+            AgentTurnState::PlanningTools { pending, plan } => {
+                AgentTurnState::CommittingToolResults {
+                    pending: recover_tool_planning(pending, plan).into(),
+                    finish_after_commit: true,
+                }
+            }
+            AgentTurnState::ToolExecution {
+                pending,
+                active,
+                completed,
+                ..
+            } => AgentTurnState::CommittingToolResults {
+                pending: recover_tool_execution(pending, active, completed).into(),
                 finish_after_commit: true,
             },
-            AgentTurnState::ToolExecution { plan } => AgentTurnState::ToolResultCommit {
-                completed_tools: abort_tool_plan(plan),
-                finish_after_commit: true,
-            },
+            AgentTurnState::CommittingToolResults { pending, .. } => {
+                AgentTurnState::CommittingToolResults {
+                    pending,
+                    finish_after_commit: true,
+                }
+            }
             state => {
                 self.state = state;
                 return Err(unexpected_state("pending tools"));
@@ -179,69 +305,138 @@ impl AgentTurn {
         Ok(())
     }
 
-    pub(crate) fn set_completed_tools(
-        &mut self,
-        completed_tools: Vec<(ToolCall, ToolResult)>,
-        finish_after_commit: bool,
-    ) -> Result<()> {
-        ensure_phase(self.phase(), AgentTurnPhase::ToolExecution)?;
-        self.state = AgentTurnState::ToolResultCommit {
-            completed_tools,
-            finish_after_commit,
+    fn record_tool_plan(&mut self, item: ToolPlanItem) -> Result<()> {
+        let AgentTurnState::PlanningTools { pending, plan } = &mut self.state else {
+            return Err(unexpected_state("tool planning"));
         };
+        let _planned = pending
+            .pop_front()
+            .ok_or_else(|| unexpected_state("tool planning"))?;
+        plan.push(item);
+        if pending.is_empty() {
+            let pending = VecDeque::from(mem::take(plan));
+            self.state = AgentTurnState::ToolExecution {
+                pending,
+                active: VecDeque::new(),
+                active_policy: None,
+                completed: Vec::new(),
+            };
+        }
         Ok(())
     }
 
-    pub(crate) fn take_tool_results_for_commit(&mut self) -> Result<PendingToolResults> {
-        match mem::replace(&mut self.state, AgentTurnState::ToolResultCommitInProgress) {
-            AgentTurnState::ToolResultCommit {
-                completed_tools,
-                finish_after_commit,
-            } => Ok(PendingToolResults {
-                completed_tools,
-                finish_after_commit,
-            }),
-            state => {
-                self.state = state;
-                Err(unexpected_state("tool result commit"))
+    fn record_tool_started(&mut self, tool: ToolCall, policy: ToolExecutionPolicy) -> Result<()> {
+        let AgentTurnState::ToolExecution {
+            pending,
+            active,
+            active_policy,
+            ..
+        } = &mut self.state
+        else {
+            return Err(unexpected_state("tool execution"));
+        };
+        let item = pending
+            .pop_front()
+            .ok_or_else(|| unexpected_state("tool execution"))?;
+        if item.tool.id != tool.id || item.policy != policy || item.completed_result.is_some() {
+            return Err(Error::protocol("started tool does not match pending plan"));
+        }
+        if active.is_empty() {
+            *active_policy = Some(policy);
+        }
+        active.push_back(tool);
+        Ok(())
+    }
+
+    fn record_tool_finished(&mut self, tool: ToolCall, result: ToolResult) -> Result<()> {
+        let AgentTurnState::ToolExecution {
+            active,
+            active_policy,
+            completed,
+            ..
+        } = &mut self.state
+        else {
+            return Err(unexpected_state("tool execution"));
+        };
+        let expected = active
+            .pop_front()
+            .ok_or_else(|| unexpected_state("tool execution"))?;
+        if expected.id != tool.id {
+            return Err(Error::protocol("finished tool does not match active tool"));
+        }
+        completed.push((tool, result));
+        if active.is_empty() {
+            *active_policy = None;
+        }
+        Ok(())
+    }
+
+    fn record_tool_result_committed(&mut self) -> Result<()> {
+        let AgentTurnState::CommittingToolResults {
+            pending,
+            finish_after_commit,
+        } = &mut self.state
+        else {
+            return Err(unexpected_state("tool result commit"));
+        };
+        pending
+            .pop_front()
+            .ok_or_else(|| unexpected_state("tool result commit"))?;
+        if pending.is_empty() {
+            self.state = if *finish_after_commit {
+                AgentTurnState::Finished
+            } else {
+                AgentTurnState::LoadingTools
+            };
+        }
+        Ok(())
+    }
+
+    fn normalize_tool_execution(&mut self) {
+        let state = mem::replace(&mut self.state, AgentTurnState::Finished);
+        let AgentTurnState::ToolExecution {
+            mut pending,
+            active,
+            active_policy,
+            mut completed,
+        } = state
+        else {
+            self.state = state;
+            return;
+        };
+
+        if active.is_empty() {
+            while matches!(pending.front(), Some(item) if item.completed_result.is_some()) {
+                let item = pending
+                    .pop_front()
+                    .expect("completed tool plan item must exist");
+                let result = item
+                    .completed_result
+                    .expect("completed tool plan item must have result");
+                completed.push((item.tool, result));
             }
         }
-    }
 
-    pub(crate) fn finish_tool_result_commit(&mut self, finish_turn: bool) {
-        self.state = if finish_turn {
-            AgentTurnState::Finished
+        self.state = if pending.is_empty() && active.is_empty() {
+            AgentTurnState::CommittingToolResults {
+                pending: completed.into(),
+                finish_after_commit: false,
+            }
         } else {
-            AgentTurnState::ModelRequest
+            AgentTurnState::ToolExecution {
+                pending,
+                active,
+                active_policy,
+                completed,
+            }
         };
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AgentTurnPhase {
-    ModelRequest,
-    ModelStreaming,
-    ToolPlanning,
-    ToolExecution,
-    ToolResultCommit,
-    Finished,
 }
 
 pub(crate) struct PendingOutput {
     pub(crate) content: Vec<OutputContent>,
     pub(crate) reason: FinishReason,
     pub(crate) usage: Option<Usage>,
-}
-
-pub(crate) struct CommittedOutput {
-    pub(crate) content: Vec<OutputContent>,
-    pub(crate) reason: FinishReason,
-    pub(crate) usage: Option<Usage>,
-}
-
-pub(crate) struct PendingToolResults {
-    pub(crate) completed_tools: Vec<(ToolCall, ToolResult)>,
-    pub(crate) finish_after_commit: bool,
 }
 
 pub(crate) struct ToolPlanItem {
@@ -269,22 +464,34 @@ impl ToolPlanItem {
 }
 
 enum AgentTurnState {
-    ModelRequest,
-    ModelStreaming {
+    LoadingTools,
+    BuildingRequest {
+        tools: Vec<ToolDefinition>,
+    },
+    OpeningModelStream {
+        request: GenerateRequest,
+    },
+    ReadingModel {
         output_state: OutputStreamState,
     },
-    ToolPlanning {
-        tool_calls: Vec<ToolCall>,
+    CommittingAssistant {
+        output: PendingOutput,
     },
-    ToolExecution {
+    PlanningTools {
+        pending: VecDeque<ToolCall>,
         plan: Vec<ToolPlanItem>,
     },
-    ToolExecutionInProgress,
-    ToolResultCommit {
-        completed_tools: Vec<(ToolCall, ToolResult)>,
+    ToolExecution {
+        pending: VecDeque<ToolPlanItem>,
+        active: VecDeque<ToolCall>,
+        active_policy: Option<ToolExecutionPolicy>,
+        completed: Vec<(ToolCall, ToolResult)>,
+    },
+    CommittingToolResults {
+        pending: VecDeque<(ToolCall, ToolResult)>,
         finish_after_commit: bool,
     },
-    ToolResultCommitInProgress,
+    Finishing,
     Finished,
 }
 
@@ -318,7 +525,9 @@ pub(crate) fn normalize_for_history(message: Message) -> Message {
     }
 }
 
-fn aborted_tool_calls(tool_calls: Vec<ToolCall>) -> Vec<(ToolCall, ToolResult)> {
+fn aborted_tool_calls(
+    tool_calls: impl IntoIterator<Item = ToolCall>,
+) -> Vec<(ToolCall, ToolResult)> {
     tool_calls
         .into_iter()
         .map(|tool| {
@@ -328,7 +537,7 @@ fn aborted_tool_calls(tool_calls: Vec<ToolCall>) -> Vec<(ToolCall, ToolResult)> 
         .collect()
 }
 
-fn abort_tool_plan(plan: Vec<ToolPlanItem>) -> Vec<(ToolCall, ToolResult)> {
+fn abort_tool_plan(plan: impl IntoIterator<Item = ToolPlanItem>) -> Vec<(ToolCall, ToolResult)> {
     plan.into_iter()
         .map(|item| {
             let result = item
@@ -337,6 +546,25 @@ fn abort_tool_plan(plan: Vec<ToolPlanItem>) -> Vec<(ToolCall, ToolResult)> {
             (item.tool, result)
         })
         .collect()
+}
+
+fn recover_tool_planning(
+    pending: VecDeque<ToolCall>,
+    plan: Vec<ToolPlanItem>,
+) -> Vec<(ToolCall, ToolResult)> {
+    let mut completed = abort_tool_plan(plan);
+    completed.extend(aborted_tool_calls(pending));
+    completed
+}
+
+fn recover_tool_execution(
+    pending: VecDeque<ToolPlanItem>,
+    active: VecDeque<ToolCall>,
+    mut completed: Vec<(ToolCall, ToolResult)>,
+) -> Vec<(ToolCall, ToolResult)> {
+    completed.extend(aborted_tool_calls(active));
+    completed.extend(abort_tool_plan(pending));
+    completed
 }
 
 fn into_assistant_content(message: Message) -> Result<Vec<OutputContent>> {
@@ -348,19 +576,28 @@ fn into_assistant_content(message: Message) -> Result<Vec<OutputContent>> {
     }
 }
 
-fn ensure_phase(actual: AgentTurnPhase, expected: AgentTurnPhase) -> Result<()> {
-    if actual == expected {
+fn ensure_reading_model(state: &AgentTurnState) -> Result<()> {
+    if matches!(state, AgentTurnState::ReadingModel { .. }) {
         Ok(())
     } else {
-        Err(unexpected_state(match expected {
-            AgentTurnPhase::ModelRequest => "model request",
-            AgentTurnPhase::ModelStreaming => "model streaming",
-            AgentTurnPhase::ToolPlanning => "tool planning",
-            AgentTurnPhase::ToolExecution => "tool execution",
-            AgentTurnPhase::ToolResultCommit => "tool result commit",
-            AgentTurnPhase::Finished => "finished",
-        }))
+        Err(unexpected_state("model streaming"))
     }
+}
+
+fn should_start_next_tool(
+    pending: &VecDeque<ToolPlanItem>,
+    active: &VecDeque<ToolCall>,
+    active_policy: Option<ToolExecutionPolicy>,
+) -> bool {
+    let Some(item) = pending.front() else {
+        return false;
+    };
+    if item.completed_result.is_some() {
+        return false;
+    }
+    active.is_empty()
+        || (active_policy == Some(ToolExecutionPolicy::Parallel)
+            && item.policy == ToolExecutionPolicy::Parallel)
 }
 
 fn unexpected_state(expected: &str) -> Error {
