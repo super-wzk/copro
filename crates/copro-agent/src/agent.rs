@@ -1,7 +1,7 @@
+use crate::cancel::RunCancellation;
 use crate::context::{AgentCommand, AgentContext};
 use crate::event::AgentStream;
 use crate::run::AgentRunHandle;
-use crate::runtime::StopSignal;
 use crate::tools::ToolRouter;
 use copro_api::error::{Error, Result};
 use copro_api::message::Message;
@@ -19,33 +19,28 @@ const EVENT_BUFFER: usize = 16;
 #[derive(Clone)]
 pub struct Agent {
     tx: mpsc::Sender<AgentCommand>,
-    stop_signal: StopSignal,
 }
 
 impl Agent {
     pub fn new(model: Arc<dyn Model>, tools: Arc<dyn ToolRouter>) -> Self {
-        Self::with_stop_signal(model, tools, StopSignal::new())
-    }
-
-    pub fn with_stop_signal(
-        model: Arc<dyn Model>,
-        tools: Arc<dyn ToolRouter>,
-        stop_signal: StopSignal,
-    ) -> Self {
         let (tx, rx) = mpsc::channel(COMMAND_BUFFER);
-        let context = AgentContext::new(model, tools, stop_signal.clone());
+        let context = AgentContext::new(model, tools);
         AgentContext::spawn(context, rx);
 
-        Self { tx, stop_signal }
+        Self { tx }
     }
 
     pub async fn start_run(&self) -> Result<AgentRunHandle> {
         let (events, rx) = mpsc::channel(EVENT_BUFFER);
+        let cancellation = RunCancellation::new();
         self.tx
-            .send(AgentCommand::RunTurn { events })
+            .send(AgentCommand::RunTurn {
+                events,
+                cancellation: cancellation.clone(),
+            })
             .await
             .map_err(|_| agent_closed())?;
-        Ok(AgentRunHandle::new(rx, self.stop_signal.clone()))
+        Ok(AgentRunHandle::new(rx, cancellation))
     }
 
     /// Run one turn and stream core agent events.
@@ -59,18 +54,6 @@ impl Agent {
                 yield event?;
             }
         })
-    }
-
-    pub fn stop_signal(&self) -> StopSignal {
-        self.stop_signal.clone()
-    }
-
-    pub fn request_stop(&self) {
-        self.stop_signal.request_stop();
-    }
-
-    pub fn clear_stop(&self) {
-        self.stop_signal.clear();
     }
 
     pub async fn push_message(&self, message: Message) -> Result<()> {

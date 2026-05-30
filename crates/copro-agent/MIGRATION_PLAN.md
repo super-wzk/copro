@@ -11,13 +11,17 @@
 - `AgentRunHandle` 已提供 `step()`、`step_until_control()`、`control()`、`events()`、`pause()`、`resume()`、`preempt()`。
 - `AgentEvent` 已切换为核心 step-level 事件。
 - `ControlRequired` / `StepCompleted` 已分离：前者表示 pending boundary，后者只表示 control 应用后的 final outcome。
-- `AgentControlPoint` 已拆为 typed enum，并提供 `AgentControlDecision` / `apply_control()` 常规路径。
+- typed control point façade 已收敛为单个 `AgentCheckpoint` enum，variant 保留细粒度切入点。
 - `control()` 已对非法 control kind 和 replacement invariant 做即时校验。
 - `ToolResultReplacement` 已用于 typed tool result replacement，由运行层自动填充 `call_id` / `name`。
 - `Pause` / `Resume` 已形成 boundary 和 in-flight pause request 的 `RunPaused` -> `RunResumed` 事件链。
 - `AbortTurn` / `AbortRun` 已在事件层区分，in-flight `preempt()` 已产生 `RunPreempted`。
+- `Ready` 已通过 `StepReady` 成为真实可观察状态，`Recovering` 已通过 `RunRecovering` 成为真实 recovery 状态。
+- abort/preempt/stop 遇到已提交 tool call 或 tool execution boundary 时，会通过 recovery step 补齐 tool result。
 - `AgentRunHandle` 已加入单 driver lease，避免 `events()` / `step()` 并发抢同一 receiver。
 - `AgentTurn` 纯状态机化已评估：当前已无 async/IO/cancellation token；进一步 `next_action()` / `apply_outcome()` 拆分暂缓为后续机械重构。
+- `run.rs` 已拆为 `run/{types,control,checkpoint,handle,execution}.rs`，`run/mod.rs` 只保留声明和 re-export。
+- `runtime` public namespace 已移除；`StopSignal` public API 已移除，取消能力收拢为每个 run 内部的 cancellation source，由 `AgentRunHandle` 的 `Abort*` / `preempt()` 驱动。
 - `run_stream()` 已基于 `AgentRunHandle` auto mode 实现。
 - `AgentControl` 已支持 request、model delta、assistant output、tool call、tool result 的改写/拒绝。
 - `AgentHook` / `AgentHooks` / `ToolCallDecision` 已从当前工作区代码中移除。
@@ -64,9 +68,9 @@
 
 方向：
 
-- 将通用 `AgentControlPoint` 拆为 typed control point enum，例如 `RequestBuilt(RequestControlPoint)`、`ModelDelta(ModelDeltaControlPoint)`、`ToolResultCommitted(ToolResultControlPoint)`。
-- 每种 typed control point 只暴露对应合法方法，例如 `replace_request()`、`drop_delta()`、`replace_tool_result()`。
-- 外部拿到 `RequestControlPoint` 时没有 `replace_tool_result()` 方法，从编译期防止 control kind 用错。
+- 使用单个 `AgentCheckpoint` enum 表达 typed checkpoint，例如 `RequestBuilt(report)`、`ModelDelta(report)`、`ToolResult(report)`。
+- 外部通过 match checkpoint variant 获取对应 pending 数据，再提交 `AgentControl`。
+- 不再为每个 checkpoint 维护单独 wrapper struct，避免 API 和 runner 代码膨胀。
 - 保留低层 escape hatch 时必须走 immediate runtime validation。
 
 验收：
@@ -74,8 +78,8 @@
 - 非法 control 在 `control()` 返回 `Err`。
 - 旧的“下一次 step 才报错”测试改为 immediate error。
 - stale control 和非法 control 错误信息保持可区分。
-- 新增 typed control point compile-time API，常规调用路径不再需要手写 `AgentControl` enum。
-- 测试覆盖 typed control point 的合法路径，以及低层 API 的非法 control immediate error。
+- 新增 `AgentCheckpoint` enum 路径，常规调用围绕 checkpoint variant match 写控制逻辑。
+- 测试覆盖 checkpoint 合法路径，以及低层 API 的非法 control immediate error。
 
 ### 3. Pause / Resume 语义不完整（已完成）
 
@@ -98,7 +102,7 @@
 - `resume()` 产生 `RunResumed`，随后继续下一个 step。
 - in-flight model stream/tool execution 场景下 pause 不取消当前 action，只在 boundary 停住。
 
-### 4. Preempt / Abort / Recovery 语义较弱（部分完成）
+### 4. Preempt / Abort / Recovery 语义较弱（已完成）
 
 原问题：
 
@@ -189,7 +193,7 @@
 
 问题：
 
-- `run_stream()` 当前直接输出核心 `AgentEvent`，包含 `StepStarted` / `ControlRequired` / `StepCompleted` 等 step-level 事件。
+- `run_stream()` 当前直接输出核心 `AgentEvent`，包含 `StepReady` / `StepStarted` / `ControlRequired` / `StepCompleted` 等 step-level 事件。
 - 这是破坏性迁移的一部分，但对普通 chat consumer 可能过于底层。
 
 目标：
@@ -236,7 +240,7 @@
 
 内容：
 
-- 引入 typed control point API，通过类型系统防止 control kind 和 step outcome 的非法组合。
+- 引入 `AgentCheckpoint` enum，让常规控制逻辑围绕 typed checkpoint variant 编写。
 - `control()` 直接基于 allowed controls 校验，作为低层/防御性路径。
 - 增加 request/output/tool replacement validator 和专用 replacement 类型。
 - 保留运行层防御性校验。
@@ -244,7 +248,7 @@
 验收：
 
 - 非法 control 和非法 replacement 都在 `control()` 返回 `Err`。
-- 常规 typed API 不能编译出“request step 上 replace tool result”这类非法组合。
+- 常规 checkpoint API 通过 variant match 降低非法 control 组合风险，低层 `control()` 继续即时拒绝非法组合。
 - `ToolResultReplacement` 等专用类型避免外部传入不一致 identity 字段。
 - 测试覆盖每种非法替换。
 

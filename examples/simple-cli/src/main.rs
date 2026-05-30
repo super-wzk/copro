@@ -1,5 +1,5 @@
 use copro_agent::{
-    Agent, AgentControlPoint, AgentEvent, AgentOutcome, ToolExecutionPolicy, ToolRouter,
+    Agent, AgentCheckpoint, AgentControl, AgentEvent, AgentOutcome, ToolExecutionPolicy, ToolRouter,
 };
 use copro_api::message::{InputContent, Message, OutputContent, ToolResultStatus};
 use copro_api::stream::OutputContentDelta;
@@ -131,13 +131,17 @@ async fn run_turn(
 
         let finished = matches!(point.pending_outcome(), AgentOutcome::TurnFinished);
         match point {
-            AgentControlPoint::RequestBuilt(point) => {
-                let mut request = point.request().clone();
+            AgentCheckpoint::RequestBuilt(report) => {
+                let step_id = report.step.id;
+                let AgentOutcome::RequestBuilt(mut request) = report.outcome else {
+                    unreachable!("request checkpoint must carry a request outcome")
+                };
                 skill_request.prepare_request(&mut request).await?;
-                run.apply_control(point.replace_request(request)).await?;
+                run.control(step_id, AgentControl::ReplaceRequest(request))
+                    .await?;
             }
             point => {
-                run.apply_control(point.continue_run()).await?;
+                run.control(point.step_id(), AgentControl::Continue).await?;
             }
         }
 

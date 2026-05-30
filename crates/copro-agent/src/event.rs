@@ -23,6 +23,10 @@ pub enum AgentEvent {
         run_id: AgentRunId,
         at: AgentStepId,
     },
+    RunRecovering {
+        run_id: AgentRunId,
+        after: AgentStepId,
+    },
     RunFinished {
         run_id: AgentRunId,
     },
@@ -39,6 +43,9 @@ pub enum AgentEvent {
         turn_id: AgentTurnId,
     },
 
+    StepReady {
+        step: AgentStep,
+    },
     StepStarted {
         step: AgentStep,
     },

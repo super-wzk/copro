@@ -26,10 +26,10 @@
 
 ## 核心领域模型
 
-最终核心概念：
+公开入口和核心执行概念：
 
 ```text
-Agent          // public handle，创建 context/run，提供高层 API
+Agent          // public façade，创建 context/run，提供高层 API；不是执行核心
 AgentContext   // 长期 agent 上下文，拥有 history/config/model/tools
 AgentRun       // 一次可调度执行实例，拥有 lifecycle/in-flight/clock
 AgentRunHandle // 外部调度器控制 AgentRun 的 public handle
@@ -52,6 +52,30 @@ TurnEffect      // 改为 AgentAction
 旧 step 干预载荷 // 改为 AgentControl，避免和 agent 业务判断混淆
 AgentHook       // 不继续扩展，迁移到 step boundary control/observer
 ```
+
+## 模块命名空间
+
+public API 保持 crate root 扁平 re-export，避免把外部用户绑定到内部文件组织。
+
+当前内部模块布局：
+
+```text
+src/agent.rs          // public Agent façade
+src/context.rs        // long-lived context + command loop
+src/event.rs          // AgentEvent / AgentStream
+src/tools.rs          // ToolRouter / ToolExecutionPolicy
+src/turn.rs           // pure turn state machine
+src/cancel.rs         // per-run cancellation internals
+
+src/run/mod.rs        // run namespace declarations + re-export only
+src/run/types.rs      // ids, AgentStep, AgentAction, AgentOutcome, AgentRunState
+src/run/control.rs    // AgentControl, AgentControlKind, AgentControlSignal
+src/run/checkpoint.rs // AgentStepReport, AgentCheckpoint
+src/run/handle.rs     // AgentRunHandle public control surface
+src/run/execution.rs  // internal AgentRun execution loop
+```
+
+`runtime` 不作为 public namespace 暴露；`StopSignal` public API 已移除。in-flight cancellation 是每个 run 的内部机制，由 `AgentRunHandle` 的 `Abort*` / `preempt()` 触发。
 
 ## 分层边界
 
@@ -143,6 +167,8 @@ pub enum AgentRunState {
 }
 ```
 
+`Ready` 由 `StepReady` 事件驱动，`Recovering` 由 `RunRecovering` 事件驱动。recovery 期间产生的 tool result commit 仍走普通 `AgentStep` clock。
+
 ### AgentRunHandle
 
 `AgentRunHandle` 是外部调度器、UI、debugger、safety layer 控制 `AgentRun` 的公开句柄。
@@ -171,8 +197,7 @@ impl Agent {
 
 impl AgentRunHandle {
     pub async fn step(&self) -> Result<AgentStepReport>;
-    pub async fn step_until_control(&self) -> Result<AgentControlPoint>;
-    pub async fn apply_control(&self, decision: AgentControlDecision) -> Result<AgentStepReport>;
+    pub async fn step_until_control(&self) -> Result<AgentCheckpoint>;
     pub async fn control(&self, step_id: AgentStepId, control: AgentControl) -> Result<AgentStepReport>;
     pub async fn pause(&self) -> Result<()>;
     pub async fn resume(&self) -> Result<()>;
@@ -188,21 +213,14 @@ pub struct AgentStepReport {
     pub events: Vec<AgentEvent>,
 }
 
-pub enum AgentControlPoint {
-    Basic(BasicControlPoint),
-    RequestBuilt(RequestControlPoint),
-    ModelDelta(ModelDeltaControlPoint),
-    AssistantOutput(AssistantOutputControlPoint),
-    ToolCall(ToolCallControlPoint),
-    ToolResult(ToolResultControlPoint),
-}
-
-impl RequestControlPoint {
-    pub fn replace_request(&self, request: GenerateRequest) -> AgentControlDecision;
-}
-
-impl ToolResultControlPoint {
-    pub fn replace_tool_result(&self, replacement: ToolResultReplacement) -> AgentControlDecision;
+pub enum AgentCheckpoint {
+    Basic(AgentStepReport),
+    RequestBuilt(AgentStepReport),
+    ModelDelta(AgentStepReport),
+    AssistantOutput(AgentStepReport),
+    ToolPlanned(AgentStepReport),
+    ToolRejected(AgentStepReport),
+    ToolResult(AgentStepReport),
 }
 ```
 
@@ -489,12 +507,14 @@ pub enum AgentEvent {
     RunPaused { run_id: AgentRunId, at: AgentStepId },
     RunResumed { run_id: AgentRunId, at: AgentStepId },
     RunPreempted { run_id: AgentRunId, at: AgentStepId },
+    RunRecovering { run_id: AgentRunId, after: AgentStepId },
     RunFinished { run_id: AgentRunId },
     RunAborted { run_id: AgentRunId },
 
     TurnStarted { run_id: AgentRunId, turn_id: AgentTurnId },
     TurnFinished { run_id: AgentRunId, turn_id: AgentTurnId },
 
+    StepReady { step: AgentStep },
     StepStarted { step: AgentStep },
     ControlRequired { step: AgentStep, outcome: AgentOutcome },
     StepCompleted { step: AgentStep, outcome: AgentOutcome },
@@ -527,8 +547,10 @@ pub enum AgentEvent {
 event 规则：
 
 - `AgentEvent` 只描述已经发生或正在等待外部控制的事实。
+- `StepReady` 表示下一条 action 已分配 step id，但尚未进入 in-flight。
 - `ControlRequired` 只表示 run 等待 `AgentControl`，不代表 control 本身。
 - `StepCompleted` 只表示 control 已应用后的 final outcome，不承载 pending outcome。
+- `RunRecovering` 表示 run 正在补齐必须提交的 recovery step，例如 aborted tool result。
 - `ModelDelta` 必须是 `DropModelDelta` / `ReplaceModelDelta` 应用后的最终 delta。
 - `AssistantCommitted` 必须在 assistant message 已写入 context history 后发出。
 - `ToolResultCommitted` 必须在 tool result message 已写入 context history 后发出。
@@ -564,10 +586,10 @@ event 规则：
 调度器边界：
 
 - 调度器可以决定何时调用 `step()`、`step_until_control()`、`control()`、`pause()`、`resume()`、`preempt()`。
-- 调度器可以监听 `AgentEvent`，也可以在 `AgentControlPoint` 上改写 pending outcome。
+- 调度器可以监听 `AgentEvent`，也可以在 `AgentCheckpoint` 上 match pending outcome 并提交 `AgentControl`。
 - 调度器不能直接修改 `AgentTurn`、`AgentRunState`、in-flight handle 或 `AgentContext` history。
 - 调度器不能提交 stale `AgentControl`；每次 control 必须携带当前 `AgentStepId`。
-- 常规路径应通过 typed control point 生成 `AgentControlDecision`；低层 `control()` 会立即拒绝非法 control kind 和非法 replacement invariant。
+- `AgentCheckpoint` variant 保留细粒度切入点；`control()` 会立即拒绝非法 control kind 和非法 replacement invariant。
 - 同一个 `AgentRunHandle` 同一时间只能有一个 active driver；`events()` 持有 stream lease，`step()` 持有单次调用 lease。
 - 调度器 trait 如果需要，放在上层 crate，例如 `AgentRunDriver` / `AgentOrchestrator`，不进入底层核心。
 
@@ -580,7 +602,7 @@ pub trait AgentRunDriver: Send + Sync {
 
 impl AgentRunHandle {
     pub async fn step(&self) -> Result<AgentStepReport>; // auto-continue one step
-    pub async fn step_until_control(&self) -> Result<AgentControlPoint>;
+    pub async fn step_until_control(&self) -> Result<AgentCheckpoint>;
     pub async fn control(&self, step_id: AgentStepId, control: AgentControl) -> Result<AgentStepReport>;
     pub async fn pause(&self) -> Result<()>;
     pub async fn resume(&self) -> Result<()>;
@@ -712,7 +734,7 @@ AgentStrategy   // 对 model/tool/memory 使用策略进行配置
 
 - 内部创建 `AgentRun`。
 - 使用 auto mode 自动推进。
-- 输出 step-level event 和 committed domain event。
+- 输出 `StepReady` / `StepStarted` / `ControlRequired` / `StepCompleted` 等 step-level event 和 committed domain event。
 - 不保留旧 `AgentEvent` / `LegacyAgentEvent` 兼容类型。
 
 ## 破坏性迁移计划
@@ -749,7 +771,7 @@ AgentStrategy   // 对 model/tool/memory 使用策略进行配置
 - 新增 `AgentRunHandle`。
 - 新增 `Agent::start_run()`。
 - 实现 `step()`，一次推进一个 `AgentAction` 并返回 `AgentStepReport`。
-- 实现 `step_until_control()`，在 configured control gate 处返回 `AgentControlPoint`。
+- 实现 `step_until_control()`，在 configured control gate 处返回 `AgentCheckpoint`。
 - `run_stream()` 改为基于 `AgentRunHandle` auto mode 的薄封装。
 - 不引入核心 `AgentScheduler` trait；可替换调度器作为外部 `AgentRunHandle` driver 实现。
 

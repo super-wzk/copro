@@ -1,7 +1,7 @@
 use copro_agent::{
-    Agent, AgentAction, AgentControl, AgentControlPoint, AgentEvent, AgentInterruptReason,
-    AgentOutcome, AgentRunState, CancellationToken, StopSignal, ToolExecutionPolicy,
-    ToolResultReplacement, ToolRouter, async_trait,
+    Agent, AgentAction, AgentCheckpoint, AgentControl, AgentEvent, AgentInterruptReason,
+    AgentOutcome, AgentRunState, CancellationToken, ToolExecutionPolicy, ToolResultReplacement,
+    ToolRouter, async_trait,
 };
 use copro_api::error::Result;
 use copro_api::message::{
@@ -42,7 +42,7 @@ fn stream_events(events: &[AgentEvent]) -> Vec<StreamEvent> {
                 ..
             } => Some(StreamEvent::AssistantCommitted {
                 content: content.clone(),
-                reason: reason.clone(),
+                reason: *reason,
                 usage: usage.clone(),
             }),
             AgentEvent::ToolStarted { tool, .. } => Some(StreamEvent::ToolStarted(tool.clone())),
@@ -103,7 +103,7 @@ async fn run_stream_commits_assistant_message() {
 }
 
 #[tokio::test]
-async fn run_stream_stops_when_stop_signal_is_requested() {
+async fn run_handle_abort_run_at_model_delta_does_not_commit_assistant_message() {
     let agent = test_agent(vec![
         OutputStreamEvent::Delta {
             content_index: 0,
@@ -118,170 +118,114 @@ async fn run_stream_stops_when_stop_signal_is_requested() {
             usage: None,
         },
     ]);
-    let stop_signal = agent.stop_signal();
+    let run = agent.start_run().await.unwrap();
 
-    {
-        let mut stream = agent.run_stream();
-        loop {
-            match stream.next().await.transpose().unwrap() {
-                Some(AgentEvent::ModelDelta {
-                    delta: OutputContentDelta::Text(text),
-                    ..
-                }) if text == "first" => break,
-                Some(_) => {}
-                None => panic!("stream ended before first model delta"),
-            }
-        }
-
-        stop_signal.request_stop();
-        let remaining = stream
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-        assert!(stream_events(&remaining).is_empty());
-    }
-
-    assert!(agent.messages().await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn run_stream_interrupts_pending_model_stream() {
-    let agent = Agent::new(
-        Arc::new(PendingAfterFirstDeltaModel),
-        Arc::new(EmptyToolRouter),
-    );
-    let stop_signal = agent.stop_signal();
-
-    {
-        let mut stream = agent.run_stream();
-        loop {
-            match stream.next().await.transpose().unwrap() {
-                Some(AgentEvent::ModelDelta {
-                    delta: OutputContentDelta::Text(text),
-                    ..
-                }) if text == "first" => break,
-                Some(_) => {}
-                None => panic!("stream ended before first model delta"),
-            }
-        }
-
-        stop_signal.request_stop();
-        let remaining =
-            tokio::time::timeout(Duration::from_millis(100), stream.collect::<Vec<_>>())
-                .await
-                .unwrap();
-        let remaining = remaining.into_iter().collect::<Result<Vec<_>>>().unwrap();
-        assert!(stream_events(&remaining).is_empty());
-    }
-
-    assert!(agent.messages().await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn stop_after_tool_call_commit_records_aborted_tool_result() {
-    let agent = Agent::new(
-        Arc::new(ToolThenDoneModel {
-            calls: AtomicUsize::new(0),
-        }),
-        Arc::new(DoubleToolRouter),
-    );
-    let stop_signal = agent.stop_signal();
-
-    {
-        let mut stream = agent.run_stream();
-        loop {
-            match stream.next().await.transpose().unwrap() {
-                Some(AgentEvent::AssistantCommitted {
-                    reason: FinishReason::ToolCalls,
-                    ..
-                }) => break,
-                Some(_) => {}
-                None => panic!("stream ended before assistant tool call commit"),
-            }
-        }
-
-        stop_signal.request_stop();
-        let remaining = stream
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-        assert!(stream_events(&remaining).iter().any(|event| matches!(
-            event,
-            StreamEvent::ToolResultCommitted(ToolResult {
-                name,
-                status: ToolResultStatus::Error,
-                content,
+    let report = loop {
+        let report = run.step().await.unwrap();
+        if matches!(
+            report.outcome,
+            AgentOutcome::ModelDelta {
+                delta: OutputContentDelta::Text(ref text),
                 ..
-            }) if name == "double"
-                && content == &vec![InputContent::Text("aborted by user".to_string())]
-        )));
-    }
+            } if text == "first"
+        ) {
+            break report;
+        }
+        run.control(report.step.id, AgentControl::Continue)
+            .await
+            .unwrap();
+    };
 
-    assert!(matches!(
-        agent.messages().await.unwrap().as_slice(),
-        [
-            Message::Assistant(content),
-            Message::Tool(ToolResult {
-                call_id,
-                name,
-                status: ToolResultStatus::Error,
-                content: result_content,
-            })
-        ] if matches!(content.as_slice(), [OutputContent::ToolCall(ToolCall { id, name, .. })]
-            if id.as_str() == "call-1" && name == "double")
-            && call_id.as_str() == "call-1"
-            && name == "double"
-            && result_content == &vec![InputContent::Text("aborted by user".to_string())]
-    ));
+    run.control(report.step.id, AgentControl::AbortRun)
+        .await
+        .unwrap();
+    let remaining = run
+        .clone()
+        .events()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert!(stream_events(&remaining).is_empty());
+    assert!(
+        remaining
+            .iter()
+            .any(|event| matches!(event, AgentEvent::RunAborted { .. }))
+    );
+
+    assert!(agent.messages().await.unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn stop_during_tool_execution_still_commits_tool_result() {
-    let model = Arc::new(ToolThenDoneModel {
-        calls: AtomicUsize::new(0),
-    });
-    let stop_signal = StopSignal::new();
-    let agent = Agent::with_stop_signal(
-        model.clone(),
-        Arc::new(StopDuringToolRouter {
-            stop_signal: stop_signal.clone(),
-        }),
-        stop_signal,
+async fn abort_run_does_not_cancel_later_runs() {
+    let agent = test_agent(vec![OutputStreamEvent::Finished {
+        reason: FinishReason::Stop,
+        usage: None,
+    }]);
+    let first = agent.start_run().await.unwrap();
+    let report = first.step().await.unwrap();
+
+    first
+        .control(report.step.id, AgentControl::AbortRun)
+        .await
+        .unwrap();
+    let first_events = first
+        .clone()
+        .events()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        first_events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::RunAborted { .. }))
     );
 
-    let events = agent
+    let second_events = agent
         .run_stream()
         .collect::<Vec<_>>()
         .await
         .into_iter()
         .collect::<Result<Vec<_>>>()
         .unwrap();
+    assert!(
+        second_events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::RunFinished { .. }))
+    );
+    assert!(
+        !second_events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::RunAborted { .. }))
+    );
+}
 
-    let stream_events = stream_events(&events);
-    assert!(stream_events.iter().any(|event| matches!(
-        event,
-        StreamEvent::ToolResultCommitted(ToolResult {
-            name,
-            status: ToolResultStatus::Success,
-            content,
-            ..
-        }) if name == "double" && content == &vec![InputContent::Text("42".to_string())]
-    )));
-    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
-    assert!(matches!(
-        agent.messages().await.unwrap().as_slice(),
-        [
-            Message::Assistant(_),
-            Message::Tool(ToolResult {
-                status: ToolResultStatus::Success,
-                ..
-            })
-        ]
-    ));
+#[tokio::test]
+async fn run_stream_exposes_ready_state_before_step_starts() {
+    let agent = test_agent(vec![OutputStreamEvent::Finished {
+        reason: FinishReason::Stop,
+        usage: None,
+    }]);
+    let run = agent.start_run().await.unwrap();
+    let mut stream = run.clone().events();
+
+    loop {
+        let event = stream.next().await.transpose().unwrap().unwrap();
+        if let AgentEvent::StepReady { step } = event {
+            assert_eq!(step.action, AgentAction::LoadTools);
+            assert_eq!(
+                run.state().await.unwrap(),
+                AgentRunState::Ready {
+                    next: AgentAction::LoadTools,
+                    step_id: step.id,
+                }
+            );
+            break;
+        }
+    }
 }
 
 #[tokio::test]
@@ -658,6 +602,148 @@ async fn run_handle_abort_run_emits_run_aborted() {
 }
 
 #[tokio::test]
+async fn abort_run_after_assistant_tool_call_recovers_tool_result() {
+    let agent = Agent::new(
+        Arc::new(ToolThenDoneModel {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(DoubleToolRouter),
+    );
+    let run = agent.start_run().await.unwrap();
+
+    let report = loop {
+        let report = run.step().await.unwrap();
+        if matches!(
+            report.outcome,
+            AgentOutcome::AssistantCommitted {
+                reason: FinishReason::ToolCalls,
+                ..
+            }
+        ) {
+            break report;
+        }
+        run.control(report.step.id, AgentControl::Continue)
+            .await
+            .unwrap();
+    };
+
+    run.control(report.step.id, AgentControl::AbortRun)
+        .await
+        .unwrap();
+    assert_eq!(
+        run.state().await.unwrap(),
+        AgentRunState::Recovering {
+            after: report.step.id,
+        }
+    );
+
+    let events = run
+        .clone()
+        .events()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RunRecovering { after, .. } if *after == report.step.id
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolResultCommitted {
+            result:
+                ToolResult {
+                    name,
+                    status: ToolResultStatus::Error,
+                    content,
+                    ..
+                },
+            ..
+        } if name == "double"
+            && content == &vec![InputContent::Text("aborted by user".to_string())]
+    )));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::RunAborted { .. }))
+    );
+    assert!(matches!(
+        agent.messages().await.unwrap().as_slice(),
+        [
+            Message::Assistant(content),
+            Message::Tool(ToolResult {
+                call_id,
+                name,
+                status: ToolResultStatus::Error,
+                content: result_content,
+            })
+        ] if matches!(content.as_slice(), [OutputContent::ToolCall(ToolCall { id, name, .. })]
+            if id.as_str() == "call-1" && name == "double")
+            && call_id.as_str() == "call-1"
+            && name == "double"
+            && result_content == &vec![InputContent::Text("aborted by user".to_string())]
+    ));
+}
+
+#[tokio::test]
+async fn abort_run_at_tool_started_recovers_tool_result() {
+    let agent = Agent::new(
+        Arc::new(ToolThenDoneModel {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(DoubleToolRouter),
+    );
+    let run = agent.start_run().await.unwrap();
+
+    let report = loop {
+        let report = run.step().await.unwrap();
+        if matches!(report.outcome, AgentOutcome::ToolStarted { .. }) {
+            break report;
+        }
+        run.control(report.step.id, AgentControl::Continue)
+            .await
+            .unwrap();
+    };
+
+    run.control(report.step.id, AgentControl::AbortRun)
+        .await
+        .unwrap();
+    let events = run
+        .clone()
+        .events()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RunRecovering { after, .. } if *after == report.step.id
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolResultCommitted {
+            result:
+                ToolResult {
+                    name,
+                    status: ToolResultStatus::Error,
+                    content,
+                    ..
+                },
+            ..
+        } if name == "double"
+            && content == &vec![InputContent::Text("aborted by user".to_string())]
+    )));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::RunAborted { .. }))
+    );
+}
+
+#[tokio::test]
 async fn run_handle_preempt_inflight_model_stream_emits_run_preempted() {
     let agent = Agent::new(
         Arc::new(PendingAfterFirstDeltaModel),
@@ -719,6 +805,79 @@ async fn run_handle_preempt_inflight_model_stream_emits_run_preempted() {
         events
             .iter()
             .any(|event| matches!(event, AgentEvent::RunPreempted { .. }))
+    );
+}
+
+#[tokio::test]
+async fn run_handle_preempt_inflight_tool_execution_recovers_tool_result() {
+    let agent = Agent::new(
+        Arc::new(ToolThenDoneModel {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(PreemptibleToolRouter),
+    );
+    let run = agent.start_run().await.unwrap();
+
+    let started = loop {
+        let report = run.step().await.unwrap();
+        if matches!(report.outcome, AgentOutcome::ToolStarted { .. }) {
+            break report;
+        }
+        run.control(report.step.id, AgentControl::Continue)
+            .await
+            .unwrap();
+    };
+    run.control(started.step.id, AgentControl::Continue)
+        .await
+        .unwrap();
+
+    let step_task = tokio::spawn({
+        let run = run.clone();
+        async move { run.step().await }
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    run.preempt().await.unwrap();
+
+    let finished = step_task.await.unwrap().unwrap();
+    assert!(matches!(
+        finished.outcome,
+        AgentOutcome::ToolFinished { .. }
+    ));
+    let events = run
+        .clone()
+        .events()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::RunRecovering { .. }))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolResultCommitted {
+            result:
+                ToolResult {
+                    name,
+                    status: ToolResultStatus::Success,
+                    content,
+                    ..
+                },
+            ..
+        } if name == "double" && content == &vec![InputContent::Text("cancelled".to_string())]
+    )));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::RunPreempted { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::RunAborted { .. }))
     );
 }
 
@@ -1015,18 +1174,23 @@ async fn run_handle_replaces_request_before_model_stream() {
 
     let point = loop {
         let point = run.step_until_control().await.unwrap();
-        if matches!(point, AgentControlPoint::RequestBuilt(_)) {
+        if matches!(point, AgentCheckpoint::RequestBuilt(_)) {
             break point;
         }
-        run.apply_control(point.continue_run()).await.unwrap();
+        run.control(point.step_id(), AgentControl::Continue)
+            .await
+            .unwrap();
     };
-    let AgentControlPoint::RequestBuilt(point) = point else {
+    let AgentCheckpoint::RequestBuilt(report) = point else {
         unreachable!("request control point expected")
     };
 
-    run.apply_control(point.replace_request(replacement.clone()))
-        .await
-        .unwrap();
+    run.control(
+        report.step.id,
+        AgentControl::ReplaceRequest(replacement.clone()),
+    )
+    .await
+    .unwrap();
     run.clone()
         .events()
         .collect::<Vec<_>>()
@@ -1098,12 +1262,14 @@ async fn run_handle_replaces_tool_result_before_commit() {
 
     let point = loop {
         let point = run.step_until_control().await.unwrap();
-        if matches!(point, AgentControlPoint::ToolResult(_)) {
+        if matches!(point, AgentCheckpoint::ToolResult(_)) {
             break point;
         }
-        run.apply_control(point.continue_run()).await.unwrap();
+        run.control(point.step_id(), AgentControl::Continue)
+            .await
+            .unwrap();
     };
-    let AgentControlPoint::ToolResult(point) = point else {
+    let AgentCheckpoint::ToolResult(report) = point else {
         unreachable!("tool result control point expected")
     };
     let replacement = ToolResultReplacement {
@@ -1117,9 +1283,12 @@ async fn run_handle_replaces_tool_result_before_commit() {
         content: vec![InputContent::Text("blocked".to_string())],
     };
 
-    run.apply_control(point.replace_tool_result(replacement))
-        .await
-        .unwrap();
+    run.control(
+        report.step.id,
+        AgentControl::ReplaceToolResultContent(replacement),
+    )
+    .await
+    .unwrap();
     let next = run.step().await.unwrap();
     assert!(next.events.iter().any(|event| matches!(
         event,
@@ -1553,23 +1722,21 @@ impl ToolRouter for PanicToolRouter {
     }
 }
 
-struct StopDuringToolRouter {
-    stop_signal: StopSignal,
-}
+struct PreemptibleToolRouter;
 
 #[async_trait]
-impl ToolRouter for StopDuringToolRouter {
+impl ToolRouter for PreemptibleToolRouter {
     async fn definitions(&self) -> Result<Vec<ToolDefinition>> {
         DoubleToolRouter.definitions().await
     }
 
-    async fn execute(&self, call: ToolCall, _cancel: CancellationToken) -> Result<ToolResult> {
-        self.stop_signal.request_stop();
+    async fn execute(&self, call: ToolCall, cancel: CancellationToken) -> Result<ToolResult> {
+        cancel.cancelled().await;
         Ok(ToolResult {
             call_id: call.id,
             name: call.name,
             status: ToolResultStatus::Success,
-            content: vec![InputContent::Text("42".to_string())],
+            content: vec![InputContent::Text("cancelled".to_string())],
         })
     }
 }

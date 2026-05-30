@@ -1,6 +1,6 @@
+use crate::cancel::RunCancellation;
 use crate::event::AgentEvent;
 use crate::run::{AgentControlSignal, AgentRun, AgentRunId, AgentTurnId};
-use crate::runtime::StopSignal;
 use crate::tools::ToolRouter;
 use copro_api::error::Result;
 use copro_api::message::Message;
@@ -13,7 +13,6 @@ use tokio::sync::{mpsc, oneshot};
 pub(crate) struct AgentContext {
     pub(crate) model: Arc<dyn Model>,
     pub(crate) tools: Arc<dyn ToolRouter>,
-    pub(crate) stop_signal: StopSignal,
     pub(crate) messages: Vec<Message>,
     pub(crate) tool_choice: Option<ToolChoice>,
     pub(crate) hosted_tools: Vec<HostedToolSpec>,
@@ -23,15 +22,10 @@ pub(crate) struct AgentContext {
 }
 
 impl AgentContext {
-    pub(crate) fn new(
-        model: Arc<dyn Model>,
-        tools: Arc<dyn ToolRouter>,
-        stop_signal: StopSignal,
-    ) -> Self {
+    pub(crate) fn new(model: Arc<dyn Model>, tools: Arc<dyn ToolRouter>) -> Self {
         Self {
             model,
             tools,
-            stop_signal,
             messages: Vec::new(),
             tool_choice: None,
             hosted_tools: Vec::new(),
@@ -56,8 +50,13 @@ impl AgentContext {
     async fn run(mut self, mut rx: mpsc::Receiver<AgentCommand>) {
         while let Some(command) = rx.recv().await {
             match command {
-                AgentCommand::RunTurn { events } => {
-                    AgentRun::new(&mut self).run_turn(events).await;
+                AgentCommand::RunTurn {
+                    events,
+                    cancellation,
+                } => {
+                    AgentRun::new(&mut self, cancellation)
+                        .run_turn(events)
+                        .await;
                 }
                 AgentCommand::PushMessage { message, reply } => {
                     self.messages.push(message);
@@ -97,6 +96,7 @@ impl AgentContext {
 pub(crate) enum AgentCommand {
     RunTurn {
         events: mpsc::Sender<AgentStreamItem>,
+        cancellation: RunCancellation,
     },
     PushMessage {
         message: Message,
