@@ -32,6 +32,7 @@
 Agent          // public handle，创建 context/run，提供高层 API
 AgentContext   // 长期 agent 上下文，拥有 history/config/model/tools
 AgentRun       // 一次可调度执行实例，拥有 lifecycle/in-flight/clock
+AgentRunHandle // 外部调度器控制 AgentRun 的 public handle
 AgentTurn      // 单 turn 纯状态机，根据 outcome 选择下一条 action
 AgentStep      // 最小 clock tick，一次只执行一个 action
 AgentAction    // RISC-like 原子指令
@@ -75,7 +76,7 @@ impl Agent {
     pub fn new(model: Arc<dyn Model>, tools: Arc<dyn ToolRouter>) -> Self;
 
     pub async fn start_run(&self) -> Result<AgentRunHandle>;
-    pub fn run_stream(&self) -> AgentStream<'static>; // compatibility/high-level adapter
+    pub fn run_stream(&self) -> AgentStream;
 
     pub async fn push_message(&self, message: Message) -> Result<()>;
     pub async fn messages(&self) -> Result<Vec<Message>>;
@@ -125,6 +126,7 @@ impl Agent {
 - 不做 agent 业务规划。
 - 不把 coding agent、多 agent、人工审批等场景写死进底层。
 - 不允许外部绕过 step boundary 直接改写 run 内部状态。
+- 不内置可替换 scheduler 策略；外部调度器通过 `AgentRunHandle` 驱动。
 
 生命周期建议：
 
@@ -138,6 +140,57 @@ pub enum AgentRunState {
     Recovering { after: AgentStepId },
     Finished,
     Aborted,
+}
+```
+
+### AgentRunHandle
+
+`AgentRunHandle` 是外部调度器、UI、debugger、safety layer 控制 `AgentRun` 的公开句柄。
+
+职责：
+
+- 以 command 形式驱动一个 active `AgentRun`。
+- 暴露单步推进、运行到 control point、应用 control、pause/resume/preempt、读取 state。
+- 保证所有外部控制都经过当前 `AgentStepId` 校验。
+- 保证外部调度器只能在 step boundary 控制 run，不能直接改 `AgentTurn` 或 context history。
+- 可以被不同上层调度策略复用。
+
+不负责：
+
+- 不决定 agent 业务规划。
+- 不内置多 agent orchestration。
+- 不定义 scheduler plugin trait 作为核心领域模型。
+- 不允许多个 active mutable run 隐式共享同一个 `AgentContext` 写 history。
+
+建议 API：
+
+```rust
+impl Agent {
+    pub async fn start_run(&self) -> Result<AgentRunHandle>;
+}
+
+impl AgentRunHandle {
+    pub async fn step(&self) -> Result<AgentStepReport>;
+    pub async fn step_until_control(&self) -> Result<AgentControlPoint>;
+    pub async fn control(&self, step_id: AgentStepId, control: AgentControl) -> Result<AgentStepReport>;
+    pub async fn pause(&self) -> Result<()>;
+    pub async fn resume(&self) -> Result<()>;
+    pub async fn preempt(&self) -> Result<()>;
+    pub async fn state(&self) -> Result<AgentRunState>;
+    pub fn events(self) -> AgentStream;
+}
+
+pub struct AgentStepReport {
+    pub step: AgentStep,
+    pub outcome: AgentOutcome,
+    pub state: AgentRunState,
+    pub events: Vec<AgentEvent>,
+}
+
+pub struct AgentControlPoint {
+    pub step: AgentStep,
+    pub pending_outcome: AgentOutcome,
+    pub allowed_controls: Vec<AgentControlKind>,
 }
 ```
 
@@ -462,11 +515,13 @@ event 规则：
 - `ModelDelta` 必须是 `DropModelDelta` / `ReplaceModelDelta` 应用后的最终 delta。
 - `AssistantCommitted` 必须在 assistant message 已写入 context history 后发出。
 - `ToolResultCommitted` 必须在 tool result message 已写入 context history 后发出。
-- 高层 API 可以过滤 step-level event，只输出旧式 streaming event。
+- 上层 UI 可以自行过滤 step-level event，但框架不再提供旧式 streaming event 兼容层。
 
 ## 驱动模式
 
 底层需要同时支持自动执行和外部单步调度。
+
+可替换调度器通过组合实现，不作为核心 trait 强制注册到 `copro-agent`。核心只提供可控 run 协议；任何 scheduler、orchestrator、UI 或 debugger 都是 `AgentRunHandle` 的使用方。
 
 ### Auto mode
 
@@ -474,7 +529,7 @@ event 规则：
 
 适合：
 
-- 当前 `run_stream()` 兼容 API。
+- 当前 `run_stream()` 自动执行 API。
 - 普通 chat agent。
 - 不需要外部逐步调度的场景。
 
@@ -489,9 +544,21 @@ event 规则：
 - debugger / tracer。
 - safety layer。
 
+调度器边界：
+
+- 调度器可以决定何时调用 `step()`、`step_until_control()`、`control()`、`pause()`、`resume()`、`preempt()`。
+- 调度器可以监听 `AgentEvent`，也可以在 `AgentControlPoint` 上改写 pending outcome。
+- 调度器不能直接修改 `AgentTurn`、`AgentRunState`、in-flight handle 或 `AgentContext` history。
+- 调度器不能提交 stale `AgentControl`；每次 control 必须携带当前 `AgentStepId`。
+- 调度器 trait 如果需要，放在上层 crate，例如 `AgentRunDriver` / `AgentOrchestrator`，不进入底层核心。
+
 示例 API：
 
 ```rust
+pub trait AgentRunDriver: Send + Sync {
+    async fn drive(&self, run: AgentRunHandle) -> Result<AgentRunSummary>;
+}
+
 impl AgentRunHandle {
     pub async fn step(&self) -> Result<AgentStepReport>; // auto-continue one step
     pub async fn step_until_control(&self) -> Result<AgentControlPoint>;
@@ -618,36 +685,24 @@ AgentStrategy   // 对 model/tool/memory 使用策略进行配置
 
 这些扩展点可以监听 `AgentEvent` 或接管 controlled mode，但不能绕过 `AgentRun` 的 step boundary 和 history ownership。
 
-## run_stream 兼容层
+## run_stream 核心事件流
 
-旧的 `run_stream()` 可以保留为高层 adapter。
+`run_stream()` 直接输出新的核心 `AgentEvent`，不再提供旧式 streaming 事件兼容映射。
 
 规则：
 
 - 内部创建 `AgentRun`。
 - 使用 auto mode 自动推进。
-- 过滤 step-level event。
-- 只输出旧式 streaming 事件。
-- 不允许旧 `AgentEvent` 反向影响核心协议。
-
-兼容映射示例：
-
-```text
-AgentEvent::ModelDelta            -> legacy OutputDelta
-AgentEvent::AssistantCommitted    -> legacy OutputFinished
-AgentEvent::ToolStarted           -> legacy ToolCallStarted
-AgentEvent::ToolResultCommitted   -> legacy ToolResult
-```
-
-如果保留旧事件类型，建议改名为 `LegacyAgentEvent`，避免和新的核心 `AgentEvent` 混淆。
+- 输出 step-level event 和 committed domain event。
+- 不保留旧 `AgentEvent` / `LegacyAgentEvent` 兼容类型。
 
 ## 破坏性迁移计划
 
 ### Phase 1: 引入领域类型
 
 - 新增 `AgentContext`、`AgentRun`、`AgentTurn`、`AgentStepId`、`AgentAction`、`AgentOutcome`、`AgentControl`。
-- 明确旧 `AgentEvent` 是否改名为 `LegacyAgentEvent`。
-- 保持 `run_stream()` 行为不变。
+- 使用新的核心 `AgentEvent` 替换旧式 streaming 事件。
+- `run_stream()` 直接输出核心事件，作为破坏性迁移的一部分。
 
 ### Phase 2: 拆分长期状态和执行状态
 
@@ -670,14 +725,23 @@ AgentEvent::ToolResultCommitted   -> legacy ToolResult
 - 每个 step 产出 `AgentOutcome`。
 - 每个 committed outcome 产出新 `AgentEvent`。
 
-### Phase 5: 替换 hook/control 模型
+### Phase 5: 暴露可调度 run API
+
+- 新增 `AgentRunHandle`。
+- 新增 `Agent::start_run()`。
+- 实现 `step()`，一次推进一个 `AgentAction` 并返回 `AgentStepReport`。
+- 实现 `step_until_control()`，在 configured control gate 处返回 `AgentControlPoint`。
+- `run_stream()` 改为基于 `AgentRunHandle` auto mode 的薄封装。
+- 不引入核心 `AgentScheduler` trait；可替换调度器作为外部 `AgentRunHandle` driver 实现。
+
+### Phase 6: 替换 hook/control 模型
 
 - 不继续扩展传统 `AgentHook`。
 - 在 step boundary 支持 `AgentControl`。
 - 迁移 request/output/tool/result 改写逻辑。
 - stale control 和非法 control 必须有测试。
 
-### Phase 6: Pause / Resume / Preempt / Recovery
+### Phase 7: Pause / Resume / Preempt / Recovery
 
 - 添加 pause/resume/preempt command。
 - 实现 model stream cancellation。
@@ -685,10 +749,10 @@ AgentEvent::ToolResultCommitted   -> legacy ToolResult
 - 实现 assistant tool call 已 commit 后的 recovery。
 - 增加 history 合法性测试。
 
-### Phase 7: 兼容层收敛
+### Phase 8: 兼容层收敛
 
-- `run_stream()` 变成 `AgentRun` auto mode adapter。
-- 旧事件从新 `AgentEvent` 映射。
+- `run_stream()` 直接输出核心 `AgentEvent`。
+- 移除旧事件兼容映射。
 - 旧 hook API 标记为 legacy 或移除。
 
 ## 当前非目标
@@ -698,5 +762,6 @@ AgentEvent::ToolResultCommitted   -> legacy ToolResult
 - 不在第一版设计 context fork/snapshot/rebase。
 - 不在底层框架内置 coding agent planner。
 - 不在底层框架内置多 agent orchestration 策略。
+- 不把 scheduler/plugin trait 做成核心领域模型。
 - 不让 `AgentTurn` 成为 async 类型。
 - 不把传统 hook API 继续做成主要扩展点。

@@ -1,6 +1,7 @@
-use crate::context::{AgentCommand, AgentContext, AgentStreamItem};
+use crate::context::{AgentCommand, AgentContext};
 use crate::event::AgentStream;
 use crate::hook::AgentHook;
+use crate::run::AgentRunHandle;
 use crate::runtime::StopSignal;
 use crate::tools::ToolRouter;
 use copro_api::error::{Error, Result};
@@ -8,6 +9,7 @@ use copro_api::message::Message;
 use copro_api::request::GenerateRequestOptions;
 use copro_api::stream::Model;
 use copro_api::tool::{HostedToolSpec, ToolChoice};
+use futures_util::StreamExt;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -38,28 +40,24 @@ impl Agent {
         Self { tx, stop_signal }
     }
 
-    /// Run one streaming turn using this agent's bound model and conversation state.
-    ///
-    /// Model content is streamed as [`crate::event::AgentEvent::OutputDelta`] events.
-    /// Completed model outputs and tool results are yielded when they are
-    /// committed to state. Stream completion marks the end of the turn.
-    pub fn run_stream(&self) -> AgentStream<'static> {
-        let tx = self.tx.clone();
+    pub async fn start_run(&self) -> Result<AgentRunHandle> {
+        let (events, rx) = mpsc::channel(EVENT_BUFFER);
+        self.tx
+            .send(AgentCommand::RunTurn { events })
+            .await
+            .map_err(|_| agent_closed())?;
+        Ok(AgentRunHandle::new(rx, self.stop_signal.clone()))
+    }
+
+    /// Run one turn and stream core agent events.
+    pub fn run_stream(&self) -> AgentStream {
+        let agent = self.clone();
 
         Box::pin(async_stream::try_stream! {
-            let (events, mut rx) = mpsc::channel(EVENT_BUFFER);
-            tx.send(AgentCommand::RunTurn { events })
-                .await
-                .map_err(|_| agent_closed())?;
-
-            while let Some(item) = rx.recv().await {
-                match item {
-                    AgentStreamItem::Event(event, ack) => {
-                        yield event;
-                        let _ = ack.send(());
-                    }
-                    AgentStreamItem::Error(error) => Err(error)?,
-                }
+            let handle = agent.start_run().await?;
+            let mut stream = handle.events();
+            while let Some(event) = stream.next().await {
+                yield event?;
             }
         })
     }

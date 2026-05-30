@@ -16,8 +16,9 @@ pub use agent::Agent;
 pub use event::{AgentEvent, AgentStream};
 pub use hook::{AgentHook, AgentHooks, ToolCallDecision};
 pub use run::{
-    AgentAction, AgentControl, AgentInterruptReason, AgentOutcome, AgentRunId, AgentRunState,
-    AgentStep, AgentStepId, AgentTurnId,
+    AgentAction, AgentControl, AgentControlKind, AgentControlPoint, AgentInterruptReason,
+    AgentOutcome, AgentRunHandle, AgentRunId, AgentRunState, AgentStep, AgentStepId,
+    AgentStepReport, AgentTurnId,
 };
 pub use runtime::StopSignal;
 pub use tools::{ToolExecutionPolicy, ToolRouter};

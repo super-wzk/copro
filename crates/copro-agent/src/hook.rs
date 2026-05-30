@@ -174,7 +174,7 @@ pub trait AgentHook: Send + Sync {
     /// well before this specific tool is dispatched. Returning
     /// [`ToolCallDecision::Reject`] short-circuits the tool with an error
     /// result instead of executing it. The actual start of execution is
-    /// observable via the `ToolCallStarted` agent event.
+    /// observable via the `ToolStarted` agent event.
     async fn before_tool_call(&self, _tool: &mut ToolCall) -> Result<ToolCallDecision> {
         Ok(ToolCallDecision::Allow)
     }

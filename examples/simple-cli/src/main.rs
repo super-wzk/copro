@@ -113,7 +113,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         while let Some(result) = stream.next().await {
             match result {
                 Ok(event) => match event {
-                    AgentEvent::OutputDelta(delta) => match delta {
+                    AgentEvent::ModelDelta { delta, .. } => match delta {
                         OutputContentDelta::Text(text) => {
                             if streaming_thinking {
                                 eprintln!();
@@ -137,7 +137,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                         OutputContentDelta::Image(_) => {}
                         OutputContentDelta::ToolCall { .. } => {}
                     },
-                    AgentEvent::OutputFinished { content, .. } => {
+                    AgentEvent::AssistantCommitted { content, .. } => {
                         if streaming_thinking {
                             eprintln!();
                             streaming_thinking = false;
@@ -155,14 +155,16 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                             }
                         }
                     }
-                    AgentEvent::ToolCallStarted(tool_call) => {
+                    AgentEvent::ToolStarted {
+                        tool: tool_call, ..
+                    } => {
                         if streaming_thinking {
                             eprintln!();
                             streaming_thinking = false;
                         }
                         eprintln!("[tool started] {}", tool_call.name);
                     }
-                    AgentEvent::ToolResult(result) => {
+                    AgentEvent::ToolResultCommitted { result, .. } => {
                         if streaming_thinking {
                             eprintln!();
                             streaming_thinking = false;
@@ -177,6 +179,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                             input_content_text(&result.content)
                         );
                     }
+                    _ => {}
                 },
                 Err(e) => {
                     if streaming_thinking {

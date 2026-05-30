@@ -1,6 +1,6 @@
 use copro_agent::{
-    Agent, AgentEvent, AgentHook, CancellationToken, StopSignal, ToolExecutionPolicy, ToolRouter,
-    async_trait,
+    Agent, AgentAction, AgentControl, AgentEvent, AgentHook, AgentOutcome, AgentRunState,
+    CancellationToken, StopSignal, ToolExecutionPolicy, ToolRouter, async_trait,
 };
 use copro_api::error::Result;
 use copro_api::message::{
@@ -16,6 +16,42 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+
+#[derive(Debug, Clone, PartialEq)]
+enum StreamEvent {
+    ModelDelta(OutputContentDelta),
+    AssistantCommitted {
+        content: Vec<OutputContent>,
+        reason: FinishReason,
+        usage: Option<copro_api::response::Usage>,
+    },
+    ToolStarted(ToolCall),
+    ToolResultCommitted(ToolResult),
+}
+
+fn stream_events(events: &[AgentEvent]) -> Vec<StreamEvent> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ModelDelta { delta, .. } => Some(StreamEvent::ModelDelta(delta.clone())),
+            AgentEvent::AssistantCommitted {
+                content,
+                reason,
+                usage,
+                ..
+            } => Some(StreamEvent::AssistantCommitted {
+                content: content.clone(),
+                reason: reason.clone(),
+                usage: usage.clone(),
+            }),
+            AgentEvent::ToolStarted { tool, .. } => Some(StreamEvent::ToolStarted(tool.clone())),
+            AgentEvent::ToolResultCommitted { result, .. } => {
+                Some(StreamEvent::ToolResultCommitted(result.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
 
 #[tokio::test]
 async fn run_stream_commits_assistant_message() {
@@ -46,10 +82,10 @@ async fn run_stream_commits_assistant_message() {
 
     let assistant = Message::Assistant(vec![OutputContent::Text("Hello".to_string())]);
     assert_eq!(
-        events,
+        stream_events(&events),
         vec![
-            AgentEvent::OutputDelta(OutputContentDelta::Text("Hello".to_string())),
-            AgentEvent::OutputFinished {
+            StreamEvent::ModelDelta(OutputContentDelta::Text("Hello".to_string())),
+            StreamEvent::AssistantCommitted {
                 content: vec![OutputContent::Text("Hello".to_string())],
                 reason: FinishReason::Stop,
                 usage: None,
@@ -89,10 +125,10 @@ async fn before_output_commit_hook_can_modify_output() {
 
     let redacted = vec![OutputContent::Text("redacted".to_string())];
     assert_eq!(
-        events,
+        stream_events(&events),
         vec![
-            AgentEvent::OutputDelta(OutputContentDelta::Text("secret".to_string())),
-            AgentEvent::OutputFinished {
+            StreamEvent::ModelDelta(OutputContentDelta::Text("secret".to_string())),
+            StreamEvent::AssistantCommitted {
                 content: redacted.clone(),
                 reason: FinishReason::Stop,
                 usage: None,
@@ -129,10 +165,10 @@ async fn before_output_delta_hook_can_modify_stream_and_history() {
 
     let redacted = vec![OutputContent::Text("redacted".to_string())];
     assert_eq!(
-        events,
+        stream_events(&events),
         vec![
-            AgentEvent::OutputDelta(OutputContentDelta::Text("redacted".to_string())),
-            AgentEvent::OutputFinished {
+            StreamEvent::ModelDelta(OutputContentDelta::Text("redacted".to_string())),
+            StreamEvent::AssistantCommitted {
                 content: redacted.clone(),
                 reason: FinishReason::Stop,
                 usage: None,
@@ -166,17 +202,21 @@ async fn after_turn_hook_runs_before_final_event_is_yielded() {
         .unwrap();
 
     let mut stream = agent.run_stream();
-    assert!(matches!(
-        stream.next().await.transpose().unwrap(),
-        Some(AgentEvent::OutputDelta(_))
-    ));
-    assert_eq!(completed.load(Ordering::SeqCst), 0);
-
-    assert!(matches!(
-        stream.next().await.transpose().unwrap(),
-        Some(AgentEvent::OutputFinished { .. })
-    ));
-    assert_eq!(completed.load(Ordering::SeqCst), 1);
+    let mut saw_delta = false;
+    while let Some(event) = stream.next().await.transpose().unwrap() {
+        match event {
+            AgentEvent::ModelDelta { .. } => {
+                saw_delta = true;
+                assert_eq!(completed.load(Ordering::SeqCst), 0);
+            }
+            AgentEvent::AssistantCommitted { .. } => {
+                assert!(saw_delta);
+                assert_eq!(completed.load(Ordering::SeqCst), 1);
+                break;
+            }
+            _ => {}
+        }
+    }
 }
 
 #[tokio::test]
@@ -206,15 +246,25 @@ async fn run_stream_stops_when_stop_signal_is_requested() {
 
     {
         let mut stream = agent.run_stream();
-        assert_eq!(
-            stream.next().await.transpose().unwrap(),
-            Some(AgentEvent::OutputDelta(OutputContentDelta::Text(
-                "first".to_string()
-            )))
-        );
+        loop {
+            match stream.next().await.transpose().unwrap() {
+                Some(AgentEvent::ModelDelta {
+                    delta: OutputContentDelta::Text(text),
+                    ..
+                }) if text == "first" => break,
+                Some(_) => {}
+                None => panic!("stream ended before first model delta"),
+            }
+        }
 
         stop_signal.request_stop();
-        assert!(stream.next().await.is_none());
+        let remaining = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(stream_events(&remaining).is_empty());
     }
 
     assert_eq!(completed.load(Ordering::SeqCst), 1);
@@ -238,18 +288,24 @@ async fn run_stream_interrupts_pending_model_stream() {
 
     {
         let mut stream = agent.run_stream();
-        assert_eq!(
-            stream.next().await.transpose().unwrap(),
-            Some(AgentEvent::OutputDelta(OutputContentDelta::Text(
-                "first".to_string()
-            )))
-        );
+        loop {
+            match stream.next().await.transpose().unwrap() {
+                Some(AgentEvent::ModelDelta {
+                    delta: OutputContentDelta::Text(text),
+                    ..
+                }) if text == "first" => break,
+                Some(_) => {}
+                None => panic!("stream ended before first model delta"),
+            }
+        }
 
         stop_signal.request_stop();
-        let next = tokio::time::timeout(Duration::from_millis(100), stream.next())
-            .await
-            .unwrap();
-        assert!(next.is_none());
+        let remaining =
+            tokio::time::timeout(Duration::from_millis(100), stream.collect::<Vec<_>>())
+                .await
+                .unwrap();
+        let remaining = remaining.into_iter().collect::<Result<Vec<_>>>().unwrap();
+        assert!(stream_events(&remaining).is_empty());
     }
 
     assert_eq!(completed.load(Ordering::SeqCst), 1);
@@ -268,30 +324,34 @@ async fn stop_after_tool_call_commit_records_aborted_tool_result() {
 
     {
         let mut stream = agent.run_stream();
-        assert!(matches!(
-            stream.next().await.transpose().unwrap(),
-            Some(AgentEvent::OutputDelta(OutputContentDelta::ToolCall { .. }))
-        ));
-        assert!(matches!(
-            stream.next().await.transpose().unwrap(),
-            Some(AgentEvent::OutputFinished {
-                reason: FinishReason::ToolCalls,
-                ..
-            })
-        ));
+        loop {
+            match stream.next().await.transpose().unwrap() {
+                Some(AgentEvent::AssistantCommitted {
+                    reason: FinishReason::ToolCalls,
+                    ..
+                }) => break,
+                Some(_) => {}
+                None => panic!("stream ended before assistant tool call commit"),
+            }
+        }
 
         stop_signal.request_stop();
-        assert!(matches!(
-            stream.next().await.transpose().unwrap(),
-            Some(AgentEvent::ToolResult(ToolResult {
+        let remaining = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(stream_events(&remaining).iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolResultCommitted(ToolResult {
                 name,
                 status: ToolResultStatus::Error,
                 content,
                 ..
-            })) if name == "double"
-                && content == vec![InputContent::Text("aborted by user".to_string())]
-        ));
-        assert!(stream.next().await.is_none());
+            }) if name == "double"
+                && content == &vec![InputContent::Text("aborted by user".to_string())]
+        )));
     }
 
     assert!(matches!(
@@ -334,9 +394,10 @@ async fn stop_during_tool_execution_still_commits_tool_result() {
         .collect::<Result<Vec<_>>>()
         .unwrap();
 
-    assert!(events.iter().any(|event| matches!(
+    let stream_events = stream_events(&events);
+    assert!(stream_events.iter().any(|event| matches!(
         event,
-        AgentEvent::ToolResult(ToolResult {
+        StreamEvent::ToolResultCommitted(ToolResult {
             name,
             status: ToolResultStatus::Success,
             content,
@@ -373,22 +434,23 @@ async fn run_stream_awaits_async_tool_router() {
         .collect::<Result<Vec<_>>>()
         .unwrap();
 
-    let started_index = events
+    let stream_events = stream_events(&events);
+    let started_index = stream_events
         .iter()
         .position(|event| {
             matches!(
                 event,
-                AgentEvent::ToolCallStarted(ToolCall { id, name, .. })
+                StreamEvent::ToolStarted(ToolCall { id, name, .. })
                     if id.as_str() == "call-1" && name == "double"
             )
         })
         .unwrap();
-    let result_index = events
+    let result_index = stream_events
         .iter()
         .position(|event| {
             matches!(
                 event,
-                AgentEvent::ToolResult(ToolResult {
+                StreamEvent::ToolResultCommitted(ToolResult {
                     name,
                     status: ToolResultStatus::Success,
                     content,
@@ -400,8 +462,8 @@ async fn run_stream_awaits_async_tool_router() {
         .unwrap();
     assert!(started_index < result_index);
     assert!(matches!(
-        events.last(),
-        Some(AgentEvent::OutputFinished {
+        stream_events.last(),
+        Some(StreamEvent::AssistantCommitted {
             content,
             reason: FinishReason::Stop,
             usage: None,
@@ -426,9 +488,10 @@ async fn tool_task_panic_is_committed_as_error_tool_result() {
         .collect::<Result<Vec<_>>>()
         .unwrap();
 
-    assert!(events.iter().any(|event| matches!(
+    let stream_events = stream_events(&events);
+    assert!(stream_events.iter().any(|event| matches!(
         event,
-        AgentEvent::ToolResult(ToolResult {
+        StreamEvent::ToolResultCommitted(ToolResult {
             call_id,
             name,
             status: ToolResultStatus::Error,
@@ -438,8 +501,8 @@ async fn tool_task_panic_is_committed_as_error_tool_result() {
             && content == &vec![InputContent::Text("tool task panicked: boom".to_string())]
     )));
     assert!(matches!(
-        events.last(),
-        Some(AgentEvent::OutputFinished {
+        stream_events.last(),
+        Some(StreamEvent::AssistantCommitted {
             content,
             reason: FinishReason::Stop,
             usage: None,
@@ -484,17 +547,18 @@ async fn run_stream_batches_parallel_tools_behind_serial_barriers() {
         .collect::<Result<Vec<_>>>()
         .unwrap();
 
-    let started_names = events
+    let stream_events = stream_events(&events);
+    let started_names = stream_events
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::ToolCallStarted(tool) => Some(tool.name.as_str()),
+            StreamEvent::ToolStarted(tool) => Some(tool.name.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>();
-    let tool_names = events
+    let tool_names = stream_events
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::ToolResult(result) => Some(result.name.as_str()),
+            StreamEvent::ToolResultCommitted(result) => Some(result.name.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -503,6 +567,528 @@ async fn run_stream_batches_parallel_tools_behind_serial_barriers() {
     assert_eq!(tool_names, vec!["p1", "p2", "serial", "p3", "p4"]);
     assert_eq!(router.max_parallel.load(Ordering::SeqCst), 2);
     assert_eq!(router.barrier_violations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn start_run_steps_to_model_delta_boundary() {
+    let agent = test_agent(vec![
+        OutputStreamEvent::Delta {
+            content_index: 0,
+            delta: OutputContentDelta::Text("Hello".to_string()),
+        },
+        OutputStreamEvent::Finished {
+            reason: FinishReason::Stop,
+            usage: None,
+        },
+    ]);
+    let run = agent.start_run().await.unwrap();
+
+    let mut report = run.step().await.unwrap();
+    while !matches!(report.outcome, AgentOutcome::ModelDelta { .. }) {
+        report = run.step().await.unwrap();
+    }
+
+    assert!(matches!(report.step.action, AgentAction::ReadModelStream));
+    assert_eq!(report.step.id.tick, 3);
+    assert!(matches!(
+        report.outcome,
+        AgentOutcome::ModelDelta {
+            content_index: 0,
+            delta: OutputContentDelta::Text(ref text),
+        } if text == "Hello"
+    ));
+    assert!(matches!(
+        run.state().await.unwrap(),
+        AgentRunState::WaitingControl { .. }
+    ));
+    run.control(report.step.id, AgentControl::Continue)
+        .await
+        .unwrap();
+    let next = run.step().await.unwrap();
+    assert!(next.events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ModelDelta {
+            delta: OutputContentDelta::Text(text),
+            ..
+        } if text == "Hello"
+    )));
+}
+
+#[tokio::test]
+async fn run_handle_pause_and_resume_at_boundary() {
+    let agent = test_agent(vec![OutputStreamEvent::Finished {
+        reason: FinishReason::Stop,
+        usage: None,
+    }]);
+    let run = agent.start_run().await.unwrap();
+
+    let first = run.step().await.unwrap();
+    run.pause().await.unwrap();
+    assert_eq!(
+        run.state().await.unwrap(),
+        AgentRunState::Paused { at: first.step.id }
+    );
+
+    run.resume().await.unwrap();
+    let second = run.step().await.unwrap();
+    assert_eq!(second.step.id.tick, first.step.id.tick + 1);
+}
+
+#[tokio::test]
+async fn run_handle_rejects_stale_control() {
+    let agent = test_agent(vec![OutputStreamEvent::Finished {
+        reason: FinishReason::Stop,
+        usage: None,
+    }]);
+    let run = agent.start_run().await.unwrap();
+    let report = run.step().await.unwrap();
+    let mut stale_step_id = report.step.id;
+    stale_step_id.tick += 1;
+
+    let error = run
+        .control(stale_step_id, AgentControl::Continue)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("stale agent control step id"));
+}
+
+#[tokio::test]
+async fn run_handle_reports_illegal_control_for_step() {
+    let agent = test_agent(vec![OutputStreamEvent::Finished {
+        reason: FinishReason::Stop,
+        usage: None,
+    }]);
+    let run = agent.start_run().await.unwrap();
+    let report = run.step().await.unwrap();
+    assert!(matches!(report.outcome, AgentOutcome::ToolsLoaded(_)));
+
+    run.control(
+        report.step.id,
+        AgentControl::ReplaceRequest(GenerateRequest {
+            messages: Vec::new(),
+            tools: Vec::new(),
+            hosted_tools: Vec::new(),
+            tool_choice: None,
+            options: GenerateRequestOptions::default(),
+        }),
+    )
+    .await
+    .unwrap();
+    let error = run.step().await.unwrap_err();
+    assert!(error.to_string().contains("is not valid for this step"));
+}
+
+#[tokio::test]
+async fn run_handle_replaces_model_delta_before_history() {
+    let agent = test_agent(vec![
+        OutputStreamEvent::Delta {
+            content_index: 0,
+            delta: OutputContentDelta::Text("secret".to_string()),
+        },
+        OutputStreamEvent::Finished {
+            reason: FinishReason::Stop,
+            usage: None,
+        },
+    ]);
+    let run = agent.start_run().await.unwrap();
+
+    let report = loop {
+        let report = run.step().await.unwrap();
+        if matches!(report.outcome, AgentOutcome::ModelDelta { .. }) {
+            break report;
+        }
+        run.control(report.step.id, AgentControl::Continue)
+            .await
+            .unwrap();
+    };
+
+    run.control(
+        report.step.id,
+        AgentControl::ReplaceModelDelta(OutputContentDelta::Text("redacted".to_string())),
+    )
+    .await
+    .unwrap();
+    let next = run.step().await.unwrap();
+    assert!(next.events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ModelDelta {
+            delta: OutputContentDelta::Text(text),
+            ..
+        } if text == "redacted"
+    )));
+
+    run.control(next.step.id, AgentControl::Continue)
+        .await
+        .unwrap();
+    run.clone()
+        .events()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        agent.messages().await.unwrap(),
+        vec![Message::Assistant(vec![OutputContent::Text(
+            "redacted".to_string()
+        )])]
+    );
+}
+
+#[tokio::test]
+async fn run_handle_drops_model_delta_before_history() {
+    let agent = test_agent(vec![
+        OutputStreamEvent::Delta {
+            content_index: 0,
+            delta: OutputContentDelta::Text("secret".to_string()),
+        },
+        OutputStreamEvent::Finished {
+            reason: FinishReason::Stop,
+            usage: None,
+        },
+    ]);
+    let run = agent.start_run().await.unwrap();
+
+    let report = loop {
+        let report = run.step().await.unwrap();
+        if matches!(report.outcome, AgentOutcome::ModelDelta { .. }) {
+            break report;
+        }
+        run.control(report.step.id, AgentControl::Continue)
+            .await
+            .unwrap();
+    };
+
+    run.control(report.step.id, AgentControl::DropModelDelta)
+        .await
+        .unwrap();
+    let events = run
+        .clone()
+        .events()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ModelDelta {
+            delta: OutputContentDelta::Text(text),
+            ..
+        } if text == "secret"
+    )));
+    assert_eq!(
+        agent.messages().await.unwrap(),
+        vec![Message::Assistant(Vec::new())]
+    );
+}
+
+#[tokio::test]
+async fn run_handle_replaces_request_before_model_stream() {
+    let captured = Arc::new(Mutex::new(None));
+    let model = Arc::new(CapturingModel {
+        captured: Arc::clone(&captured),
+    });
+    let agent = Agent::new(model, Arc::new(EmptyToolRouter));
+    let replacement = GenerateRequest {
+        messages: vec![Message::System(vec![InputContent::Text(
+            "replacement".to_string(),
+        )])],
+        tools: Vec::new(),
+        hosted_tools: Vec::new(),
+        tool_choice: Some(ToolChoice::None),
+        options: GenerateRequestOptions {
+            max_tokens: Some(7),
+            ..GenerateRequestOptions::default()
+        },
+    };
+    let run = agent.start_run().await.unwrap();
+
+    let report = loop {
+        let report = run.step().await.unwrap();
+        if matches!(report.outcome, AgentOutcome::RequestBuilt(_)) {
+            break report;
+        }
+        run.control(report.step.id, AgentControl::Continue)
+            .await
+            .unwrap();
+    };
+
+    run.control(
+        report.step.id,
+        AgentControl::ReplaceRequest(replacement.clone()),
+    )
+    .await
+    .unwrap();
+    run.clone()
+        .events()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+
+    assert_eq!(captured.lock().unwrap().take(), Some(replacement));
+}
+
+#[tokio::test]
+async fn run_handle_replaces_assistant_output_before_commit() {
+    let agent = test_agent(vec![OutputStreamEvent::Finished {
+        reason: FinishReason::Stop,
+        usage: None,
+    }]);
+    let run = agent.start_run().await.unwrap();
+
+    let report = loop {
+        let report = run.step().await.unwrap();
+        if matches!(report.outcome, AgentOutcome::ModelOutputFinished { .. }) {
+            break report;
+        }
+        run.control(report.step.id, AgentControl::Continue)
+            .await
+            .unwrap();
+    };
+
+    run.control(
+        report.step.id,
+        AgentControl::ReplaceAssistantOutput(vec![OutputContent::Text("redacted".to_string())]),
+    )
+    .await
+    .unwrap();
+    let next = run.step().await.unwrap();
+    assert!(next.events.iter().any(|event| matches!(
+        event,
+        AgentEvent::AssistantCommitted { content, .. }
+            if content == &vec![OutputContent::Text("redacted".to_string())]
+    )));
+    run.control(next.step.id, AgentControl::Continue)
+        .await
+        .unwrap();
+    run.clone()
+        .events()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        agent.messages().await.unwrap(),
+        vec![Message::Assistant(vec![OutputContent::Text(
+            "redacted".to_string()
+        )])]
+    );
+}
+
+#[tokio::test]
+async fn run_handle_replaces_tool_result_before_commit() {
+    let agent = Agent::new(
+        Arc::new(ToolThenDoneModel {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(DoubleToolRouter),
+    );
+    let run = agent.start_run().await.unwrap();
+
+    let report = loop {
+        let report = run.step().await.unwrap();
+        if matches!(report.outcome, AgentOutcome::ToolResultCommitted { .. }) {
+            break report;
+        }
+        run.control(report.step.id, AgentControl::Continue)
+            .await
+            .unwrap();
+    };
+    let replacement = ToolResult {
+        call_id: "call-1".into(),
+        name: "double".to_string(),
+        status: ToolResultStatus::Error,
+        content: vec![InputContent::Text("blocked".to_string())],
+    };
+
+    run.control(
+        report.step.id,
+        AgentControl::ReplaceToolResult(replacement.clone()),
+    )
+    .await
+    .unwrap();
+    let next = run.step().await.unwrap();
+    assert!(next.events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolResultCommitted { result, .. } if result == &replacement
+    )));
+    run.control(next.step.id, AgentControl::Continue)
+        .await
+        .unwrap();
+    run.clone()
+        .events()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        agent
+            .messages()
+            .await
+            .unwrap()
+            .iter()
+            .any(|message| matches!(message, Message::Tool(result) if result == &replacement))
+    );
+}
+
+#[tokio::test]
+async fn run_handle_replaces_tool_call_before_execution() {
+    let agent = Agent::new(
+        Arc::new(ToolThenDoneModel {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(DoubleToolRouter),
+    );
+    let mut replacement_arguments = serde_json::Map::new();
+    replacement_arguments.insert("value".to_string(), Value::from(5));
+    let replacement = ToolCall {
+        id: "call-2".into(),
+        name: "double".to_string(),
+        arguments: replacement_arguments.clone(),
+    };
+    let run = agent.start_run().await.unwrap();
+
+    let report = loop {
+        let report = run.step().await.unwrap();
+        if matches!(report.outcome, AgentOutcome::ToolPlanned { .. }) {
+            break report;
+        }
+        run.control(report.step.id, AgentControl::Continue)
+            .await
+            .unwrap();
+    };
+
+    run.control(
+        report.step.id,
+        AgentControl::ReplaceToolCall(replacement.clone()),
+    )
+    .await
+    .unwrap();
+    let events = run
+        .clone()
+        .events()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    let stream_events = stream_events(&events);
+
+    assert!(stream_events.iter().any(|event| matches!(
+        event,
+        StreamEvent::ToolStarted(ToolCall { id, name, arguments })
+            if id.as_str() == "call-2"
+                && name == "double"
+                && arguments == &replacement_arguments
+    )));
+    assert!(stream_events.iter().any(|event| matches!(
+        event,
+        StreamEvent::ToolResultCommitted(ToolResult {
+            call_id,
+            name,
+            status: ToolResultStatus::Success,
+            content,
+        }) if call_id.as_str() == "call-2"
+            && name == "double"
+            && content == &vec![InputContent::Text("10".to_string())]
+    )));
+    assert!(matches!(
+        agent.messages().await.unwrap().as_slice(),
+        [
+            Message::Assistant(content),
+            Message::Tool(ToolResult {
+                call_id,
+                name,
+                status: ToolResultStatus::Success,
+                content: result_content,
+            }),
+            Message::Assistant(done_content),
+        ] if matches!(content.as_slice(), [OutputContent::ToolCall(ToolCall { id, name, arguments })]
+            if id.as_str() == "call-2"
+                && name == "double"
+                && arguments == &replacement_arguments)
+            && call_id.as_str() == "call-2"
+            && name == "double"
+            && result_content == &vec![InputContent::Text("10".to_string())]
+            && done_content == &vec![OutputContent::Text("done".to_string())]
+    ));
+}
+
+#[tokio::test]
+async fn run_handle_rejects_tool_call_before_execution() {
+    let agent = Agent::new(
+        Arc::new(ToolThenDoneModel {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(DoubleToolRouter),
+    );
+    let run = agent.start_run().await.unwrap();
+
+    let report = loop {
+        let report = run.step().await.unwrap();
+        if matches!(report.outcome, AgentOutcome::ToolPlanned { .. }) {
+            break report;
+        }
+        run.control(report.step.id, AgentControl::Continue)
+            .await
+            .unwrap();
+    };
+
+    run.control(
+        report.step.id,
+        AgentControl::RejectToolCall {
+            reason: "blocked by policy".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = run
+        .clone()
+        .events()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    let stream_events = stream_events(&events);
+
+    assert!(
+        !stream_events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolStarted(_)))
+    );
+    assert!(stream_events.iter().any(|event| matches!(
+        event,
+        StreamEvent::ToolResultCommitted(ToolResult {
+            call_id,
+            name,
+            status: ToolResultStatus::Error,
+            content,
+        }) if call_id.as_str() == "call-1"
+            && name == "double"
+            && content == &vec![InputContent::Text("blocked by policy".to_string())]
+    )));
+    assert!(matches!(
+        agent.messages().await.unwrap().as_slice(),
+        [
+            Message::Assistant(_),
+            Message::Tool(ToolResult {
+                call_id,
+                name,
+                status: ToolResultStatus::Error,
+                content,
+            }),
+            Message::Assistant(done_content),
+        ] if call_id.as_str() == "call-1"
+            && name == "double"
+            && content == &vec![InputContent::Text("blocked by policy".to_string())]
+            && done_content == &vec![OutputContent::Text("done".to_string())]
+    ));
 }
 
 fn test_agent(events: Vec<OutputStreamEvent>) -> Agent {

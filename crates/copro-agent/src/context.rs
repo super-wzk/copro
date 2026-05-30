@@ -1,6 +1,6 @@
 use crate::event::AgentEvent;
 use crate::hook::{AgentHook, AgentHooks};
-use crate::run::AgentRun;
+use crate::run::{AgentControl, AgentRun, AgentRunId, AgentTurnId};
 use crate::runtime::StopSignal;
 use crate::tools::ToolRouter;
 use copro_api::error::Result;
@@ -20,6 +20,8 @@ pub(crate) struct AgentContext {
     pub(crate) tool_choice: Option<ToolChoice>,
     pub(crate) hosted_tools: Vec<HostedToolSpec>,
     pub(crate) options: GenerateRequestOptions,
+    next_run_id: AgentRunId,
+    next_turn_id: AgentTurnId,
 }
 
 impl AgentContext {
@@ -37,7 +39,17 @@ impl AgentContext {
             tool_choice: None,
             hosted_tools: Vec::new(),
             options: GenerateRequestOptions::default(),
+            next_run_id: AgentRunId(0),
+            next_turn_id: AgentTurnId(0),
         }
+    }
+
+    pub(crate) fn allocate_run_ids(&mut self) -> (AgentRunId, AgentTurnId) {
+        let run_id = self.next_run_id;
+        let turn_id = self.next_turn_id;
+        self.next_run_id = AgentRunId(self.next_run_id.0 + 1);
+        self.next_turn_id = AgentTurnId(self.next_turn_id.0 + 1);
+        (run_id, turn_id)
     }
 
     pub(crate) fn spawn(context: Self, rx: mpsc::Receiver<AgentCommand>) {
@@ -126,6 +138,6 @@ pub(crate) enum AgentCommand {
 }
 
 pub(crate) enum AgentStreamItem {
-    Event(AgentEvent, oneshot::Sender<()>),
+    Event(AgentEvent, oneshot::Sender<AgentControl>),
     Error(copro_api::error::Error),
 }
