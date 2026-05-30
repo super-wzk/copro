@@ -163,14 +163,20 @@ pub(crate) fn path_is_under(path: &Path, root: &Path) -> bool {
     root == Path::new(".") || root.as_os_str().is_empty() || path == root || path.starts_with(root)
 }
 
-pub(crate) fn is_git_dir(path: &AsyncVfsPath) -> bool {
-    path.filename() == ".git"
+const VCS_DIRECTORIES: &[&str] = &[".git", ".svn", ".hg", ".bzr", ".jj", ".sl", "_darcs"];
+
+pub(crate) fn is_vcs_dir(path: &AsyncVfsPath) -> bool {
+    VCS_DIRECTORIES.contains(&path.filename().as_str())
 }
 
-pub(crate) fn is_under_git_dir(path: &AsyncVfsPath) -> bool {
+pub(crate) fn is_under_vcs_dir(path: &AsyncVfsPath) -> bool {
     Path::new(&display_path(path))
         .components()
-        .any(|component| component.as_os_str() == ".git")
+        .any(|component| {
+            VCS_DIRECTORIES
+                .iter()
+                .any(|dir| component.as_os_str() == *dir)
+        })
 }
 
 pub(crate) fn display_path(path: &AsyncVfsPath) -> String {

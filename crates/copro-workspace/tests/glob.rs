@@ -45,13 +45,15 @@ async fn path_limits_search_root() {
 }
 
 #[tokio::test]
-async fn respects_gitignore_and_skips_git_dir() {
+async fn respects_gitignore_and_skips_vcs_dirs() {
     let root = memory_root().await;
     write_file(&root, ".gitignore", b"ignored/\n*.log\n").await;
     write_file(&root, "src/app.rs", b"fn app() {}\n").await;
     write_file(&root, "ignored/app.rs", b"fn ignored() {}\n").await;
     write_file(&root, "debug.log", b"debug\n").await;
     write_file(&root, ".git/config", b"[core]\n").await;
+    write_file(&root, ".svn/entries", b"svn\n").await;
+    write_file(&root, ".hg/store/data", b"hg\n").await;
 
     let result = execute_glob(root, json!({ "pattern": "**/*" })).await;
 
@@ -59,6 +61,33 @@ async fn respects_gitignore_and_skips_git_dir() {
     assert_eq!(
         tool_text(&result),
         ".gitignore\nsrc/app.rs\n[sort: path order; modification time unavailable from VFS for matched files]\n2 files"
+    );
+}
+
+#[tokio::test]
+async fn include_ignored_finds_gitignored_files_but_still_skips_vcs_dirs() {
+    let root = memory_root().await;
+    write_file(&root, ".gitignore", b"ignored/\n*.log\n").await;
+    write_file(&root, "src/app.rs", b"fn app() {}\n").await;
+    write_file(&root, "ignored/app.rs", b"fn ignored() {}\n").await;
+    write_file(&root, "debug.log", b"debug\n").await;
+    write_file(&root, ".git/config", b"[core]\n").await;
+    write_file(&root, ".svn/entries", b"svn\n").await;
+    write_file(&root, ".hg/store/data", b"hg\n").await;
+
+    let result = execute_glob(
+        root,
+        json!({
+            "pattern": "**/*",
+            "include_ignored": true
+        }),
+    )
+    .await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(
+        tool_text(&result),
+        ".gitignore\ndebug.log\nignored/app.rs\nsrc/app.rs\n[sort: path order; modification time unavailable from VFS for matched files]\n4 files"
     );
 }
 

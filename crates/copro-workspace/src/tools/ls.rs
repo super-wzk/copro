@@ -1,6 +1,6 @@
 use crate::tools::utils::resolve_path;
 use crate::tools::vfs_walk::{
-    directory_entries, display_path, gitignore_is_ignored, is_git_dir, is_under_git_dir,
+    directory_entries, display_path, gitignore_is_ignored, is_under_vcs_dir, is_vcs_dir,
     load_ancestor_gitignores, load_gitignore_in_dir,
 };
 use copro_agent::{CancellationToken, ToolExecutionPolicy};
@@ -16,7 +16,7 @@ pub const LS_TOOL_NAME: &str = "ls";
 
 const LS_TOOL_DESCRIPTION: &str = concat!(
     "List immediate files and directories at a workspace path. Directories end with '/', ",
-    "results are workspace-relative, and .git/.gitignored entries are omitted."
+    "results are workspace-relative, and VCS/.gitignored entries are omitted."
 );
 
 #[derive(Clone)]
@@ -149,7 +149,7 @@ async fn list_path(
         resolve_path(root, input_path)?
     };
 
-    if is_under_git_dir(&start) {
+    if is_under_vcs_dir(&start) {
         return Ok(());
     }
 
@@ -193,8 +193,8 @@ async fn list_directory(
         }
 
         let is_dir = metadata.file_type == VfsFileType::Directory;
-        if is_under_git_dir(&entry_path)
-            || is_git_dir(&entry_path)
+        if is_under_vcs_dir(&entry_path)
+            || is_vcs_dir(&entry_path)
             || gitignore_is_ignored(gitignores, &entry_path, is_dir)
         {
             continue;

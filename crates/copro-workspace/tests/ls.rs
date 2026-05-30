@@ -44,13 +44,15 @@ async fn file_path_outputs_file() {
 }
 
 #[tokio::test]
-async fn respects_gitignore_and_skips_git_dir() {
+async fn respects_gitignore_and_skips_vcs_dirs() {
     let root = memory_root().await;
     write_file(&root, ".gitignore", b"ignored/\n*.log\n").await;
     write_file(&root, "src/app.rs", b"fn app() {}\n").await;
     write_file(&root, "ignored/app.rs", b"fn ignored() {}\n").await;
     write_file(&root, "debug.log", b"debug\n").await;
     write_file(&root, ".git/config", b"[core]\n").await;
+    write_file(&root, ".svn/entries", b"svn\n").await;
+    write_file(&root, ".hg/store/data", b"hg\n").await;
 
     let result = execute_ls(root, json!({})).await;
 
