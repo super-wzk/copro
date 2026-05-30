@@ -1,7 +1,7 @@
 use copro_agent::{
-    Agent, AgentAction, AgentControl, AgentControlPoint, AgentEvent, AgentOutcome, AgentRunState,
-    CancellationToken, StopSignal, ToolExecutionPolicy, ToolResultReplacement, ToolRouter,
-    async_trait,
+    Agent, AgentAction, AgentControl, AgentControlPoint, AgentEvent, AgentInterruptReason,
+    AgentOutcome, AgentRunState, CancellationToken, StopSignal, ToolExecutionPolicy,
+    ToolResultReplacement, ToolRouter, async_trait,
 };
 use copro_api::error::Result;
 use copro_api::message::{
@@ -590,6 +590,136 @@ async fn run_handle_pause_request_waits_for_next_boundary() {
         event,
         AgentEvent::RunResumed { at, .. } if *at == paused.step.id
     )));
+}
+
+#[tokio::test]
+async fn run_handle_abort_turn_finishes_without_run_aborted() {
+    let agent = test_agent(vec![OutputStreamEvent::Finished {
+        reason: FinishReason::Stop,
+        usage: None,
+    }]);
+    let run = agent.start_run().await.unwrap();
+    let report = run.step().await.unwrap();
+
+    run.control(report.step.id, AgentControl::AbortTurn)
+        .await
+        .unwrap();
+    let events = run
+        .clone()
+        .events()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TurnFinished { turn_id, .. } if *turn_id == report.step.id.turn_id
+    )));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::RunFinished { .. }))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::RunAborted { .. }))
+    );
+}
+
+#[tokio::test]
+async fn run_handle_abort_run_emits_run_aborted() {
+    let agent = test_agent(vec![OutputStreamEvent::Finished {
+        reason: FinishReason::Stop,
+        usage: None,
+    }]);
+    let run = agent.start_run().await.unwrap();
+    let report = run.step().await.unwrap();
+
+    run.control(report.step.id, AgentControl::AbortRun)
+        .await
+        .unwrap();
+    let events = run
+        .clone()
+        .events()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::RunAborted { .. }))
+    );
+}
+
+#[tokio::test]
+async fn run_handle_preempt_inflight_model_stream_emits_run_preempted() {
+    let agent = Agent::new(
+        Arc::new(PendingAfterFirstDeltaModel),
+        Arc::new(EmptyToolRouter),
+    );
+    let run = agent.start_run().await.unwrap();
+
+    let first = loop {
+        let report = run.step().await.unwrap();
+        if matches!(
+            report.outcome,
+            AgentOutcome::ModelDelta {
+                delta: OutputContentDelta::Text(ref text),
+                ..
+            } if text == "first"
+        ) {
+            break report;
+        }
+        run.control(report.step.id, AgentControl::Continue)
+            .await
+            .unwrap();
+    };
+    run.control(first.step.id, AgentControl::Continue)
+        .await
+        .unwrap();
+
+    let step_task = tokio::spawn({
+        let run = run.clone();
+        async move { run.step().await }
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    run.preempt().await.unwrap();
+
+    let interrupted = step_task.await.unwrap().unwrap();
+    assert!(matches!(
+        interrupted.outcome,
+        AgentOutcome::ActionInterrupted {
+            reason: AgentInterruptReason::Stopped
+        }
+    ));
+    let events = run
+        .clone()
+        .events()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::StepCompleted {
+            outcome: AgentOutcome::ActionInterrupted {
+                reason: AgentInterruptReason::Preempted
+            },
+            ..
+        }
+    )));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::RunPreempted { .. }))
+    );
 }
 
 #[tokio::test]

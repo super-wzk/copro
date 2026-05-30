@@ -159,6 +159,7 @@ pub struct ToolResultReplacement {
 pub(crate) enum AgentControlSignal {
     Control(AgentControl),
     Pause { resume: oneshot::Receiver<()> },
+    Preempt,
 }
 
 impl AgentControlSignal {
@@ -166,14 +167,15 @@ impl AgentControlSignal {
         Self::Control(AgentControl::Continue)
     }
 
-    fn abort_run() -> Self {
-        Self::Control(AgentControl::AbortRun)
+    fn preempt() -> Self {
+        Self::Preempt
     }
 
     fn kind(&self) -> AgentControlKind {
         match self {
             AgentControlSignal::Control(control) => control.kind(),
             AgentControlSignal::Pause { .. } => AgentControlKind::Pause,
+            AgentControlSignal::Preempt => AgentControlKind::AbortRun,
         }
     }
 }
@@ -599,6 +601,7 @@ struct AgentRunHandleState {
     pending_control: Option<(AgentStepId, oneshot::Sender<AgentControlSignal>)>,
     pending_resume: Option<(AgentStepId, oneshot::Sender<()>)>,
     pause_requested: bool,
+    preempt_requested: bool,
     last_report: Option<AgentStepReport>,
     state: Option<AgentRunState>,
     active_tool_call_ids: HashSet<ToolCallId>,
@@ -612,6 +615,7 @@ impl AgentRunHandle {
                 pending_control: None,
                 pending_resume: None,
                 pause_requested: false,
+                preempt_requested: false,
                 last_report: None,
                 state: None,
                 active_tool_call_ids: HashSet::new(),
@@ -656,7 +660,12 @@ impl AgentRunHandle {
                             outcome: outcome.clone(),
                         };
                         state_inner.state = Some(state.clone());
-                        if state_inner.pause_requested {
+                        if state_inner.preempt_requested {
+                            state_inner.preempt_requested = false;
+                            state = AgentRunState::Preempting { step_id: step.id };
+                            state_inner.state = Some(state.clone());
+                            let _ = ack.send(AgentControlSignal::preempt());
+                        } else if state_inner.pause_requested {
                             state_inner.pause_requested = false;
                             state = AgentRunState::Paused { at: step.id };
                             state_inner.state = Some(state.clone());
@@ -723,7 +732,13 @@ impl AgentRunHandle {
                 inner.state = Some(AgentRunState::Paused { at: step_id });
                 Ok(report)
             }
-            AgentControl::AbortTurn | AgentControl::AbortRun => {
+            AgentControl::AbortTurn => {
+                self.stop_signal.request_stop();
+                inner.send_pending_control(control);
+                inner.state = Some(AgentRunState::Finished);
+                Ok(report)
+            }
+            AgentControl::AbortRun => {
                 self.stop_signal.request_stop();
                 inner.send_pending_control(control);
                 inner.state = Some(AgentRunState::Aborted);
@@ -763,8 +778,10 @@ impl AgentRunHandle {
         let mut inner = self.state.lock().await;
         if let Some((step_id, _)) = &inner.pending_control {
             inner.state = Some(AgentRunState::Preempting { step_id: *step_id });
+            inner.send_pending_signal(AgentControlSignal::preempt());
+        } else {
+            inner.preempt_requested = true;
         }
-        inner.send_pending_signal(AgentControlSignal::abort_run());
         Ok(())
     }
 
@@ -785,7 +802,11 @@ impl AgentRunHandle {
                 let mut state = self.state.lock().await;
                 state.observe_event(&event);
                 let signal = if let AgentEvent::ControlRequired { step, .. } = &event {
-                    if state.pause_requested {
+                    if state.preempt_requested {
+                        state.preempt_requested = false;
+                        state.state = Some(AgentRunState::Preempting { step_id: step.id });
+                        AgentControlSignal::preempt()
+                    } else if state.pause_requested {
                         state.pause_requested = false;
                         state.state = Some(AgentRunState::Paused { at: step.id });
                         state.make_pause_signal(step.id)
@@ -1947,6 +1968,31 @@ async fn complete_step_after_control(
             }
             pause_after_control(events, run_id, step_id, Some(resume)).await
         }
+        AgentControlSignal::Preempt => {
+            let step_id = step.id;
+            let outcome = match outcome {
+                AgentOutcome::ActionInterrupted { .. } => AgentOutcome::ActionInterrupted {
+                    reason: AgentInterruptReason::Preempted,
+                },
+                outcome => outcome,
+            };
+            if !emit_step_completed(events, step, outcome).await {
+                return Ok(false);
+            }
+            if !emit(
+                events,
+                AgentEvent::RunPreempted {
+                    run_id,
+                    at: step_id,
+                },
+            )
+            .await
+            {
+                return Ok(false);
+            }
+            let _ = emit(events, AgentEvent::RunAborted { run_id }).await;
+            Ok(false)
+        }
         other => Err(Error::client(format!(
             "agent control {:?} is not valid for this step",
             other.kind()
@@ -2011,7 +2057,22 @@ async fn continue_after_control(
             .await;
             Ok(false)
         }
-        AgentControl::AbortTurn | AgentControl::AbortRun => {
+        AgentControl::AbortTurn => {
+            if !emit(
+                events,
+                AgentEvent::TurnFinished {
+                    run_id,
+                    turn_id: step_id.turn_id,
+                },
+            )
+            .await
+            {
+                return Ok(false);
+            }
+            let _ = emit(events, AgentEvent::RunFinished { run_id }).await;
+            Ok(false)
+        }
+        AgentControl::AbortRun => {
             let _ = emit(events, AgentEvent::RunAborted { run_id }).await;
             Ok(false)
         }

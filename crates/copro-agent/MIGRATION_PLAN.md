@@ -15,6 +15,7 @@
 - `control()` 已对非法 control kind 和 replacement invariant 做即时校验。
 - `ToolResultReplacement` 已用于 typed tool result replacement，由运行层自动填充 `call_id` / `name`。
 - `Pause` / `Resume` 已形成 boundary 和 in-flight pause request 的 `RunPaused` -> `RunResumed` 事件链。
+- `AbortTurn` / `AbortRun` 已在事件层区分，in-flight `preempt()` 已产生 `RunPreempted`。
 - `run_stream()` 已基于 `AgentRunHandle` auto mode 实现。
 - `AgentControl` 已支持 request、model delta、assistant output、tool call、tool result 的改写/拒绝。
 - `AgentHook` / `AgentHooks` / `ToolCallDecision` 已从当前工作区代码中移除。
@@ -95,9 +96,9 @@
 - `resume()` 产生 `RunResumed`，随后继续下一个 step。
 - in-flight model stream/tool execution 场景下 pause 不取消当前 action，只在 boundary 停住。
 
-### 4. Preempt / Abort / Recovery 语义较弱
+### 4. Preempt / Abort / Recovery 语义较弱（部分完成）
 
-问题：
+原问题：
 
 - `RunPreempted` / `Recovering` 目前偏预留。
 - `AbortTurn` 和 `AbortRun` 行为仍接近。
