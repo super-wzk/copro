@@ -2,7 +2,7 @@ use copro_agent::{
     AgentCheckpoint, AgentControl, AgentEvent, AgentHistory, AgentOutcome, AgentTurnConfig,
     InputMessage, ToolExecutionPolicy, ToolRouter, start_turn,
 };
-use copro_api::message::{InputContent, OutputContent, ToolResultStatus};
+use copro_api::message::{ImageContent, InputContent, OutputContent, ToolResultStatus};
 use copro_api::stream::{Model, OutputContentDelta};
 use copro_harness::request::RequestPipeline;
 use copro_harness::skills::{SkillRequestInjector, SkillRuntime, SkillToolRouter};
@@ -256,14 +256,7 @@ async fn setup_workspace(root: &AsyncVfsPath) {
     write_file(root, "tests/lib.rs", b"#[test]\nfn ok() {}\n").await;
     write_file(root, ".gitignore", b"*.log\n").await;
 
-    let png = &[
-        0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
-        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
-        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc,
-        0xcf, 0xc0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x05, 0xfe, 0xd8, 0x00, 0x00, 0x00,
-        0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-    ];
-    write_file(root, "assets/logo.png", png).await;
+    write_file(root, "test.png", include_bytes!("../assets/test.png")).await;
 }
 
 async fn write_file(root: &AsyncVfsPath, path: &str, bytes: &[u8]) {
@@ -284,9 +277,12 @@ fn text(t: impl Into<String>) -> InputContent {
 fn input_content_text(content: &[InputContent]) -> String {
     content
         .iter()
-        .filter_map(|content| match content {
-            InputContent::Text(text) => Some(text.as_str()),
-            InputContent::Image(_) => None,
+        .map(|content| match content {
+            InputContent::Text(text) => text.clone(),
+            InputContent::Image(ImageContent::Url { url }) => format!("[image: {url}]"),
+            InputContent::Image(ImageContent::Data { mime_type, data }) => {
+                format!("[image: {mime_type}, {} bytes]", data.len())
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
