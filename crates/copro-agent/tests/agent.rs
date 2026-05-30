@@ -602,6 +602,84 @@ async fn run_handle_replaces_model_delta_before_history() {
 }
 
 #[tokio::test]
+async fn control_required_precedes_final_step_completed() {
+    let agent = test_agent(vec![
+        OutputStreamEvent::Delta {
+            content_index: 0,
+            delta: OutputContentDelta::Text("secret".to_string()),
+        },
+        OutputStreamEvent::Finished {
+            reason: FinishReason::Stop,
+            usage: None,
+        },
+    ]);
+    let run = agent.start_run().await.unwrap();
+
+    let report = loop {
+        let report = run.step().await.unwrap();
+        if matches!(report.outcome, AgentOutcome::ModelDelta { .. }) {
+            break report;
+        }
+        run.control(report.step.id, AgentControl::Continue)
+            .await
+            .unwrap();
+    };
+
+    assert!(report.events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ControlRequired {
+            step,
+            outcome: AgentOutcome::ModelDelta {
+                delta: OutputContentDelta::Text(text),
+                ..
+            },
+        } if step.id == report.step.id && text == "secret"
+    )));
+    assert!(!report.events.iter().any(|event| matches!(
+        event,
+        AgentEvent::StepCompleted { step, .. } if step.id == report.step.id
+    )));
+
+    run.control(
+        report.step.id,
+        AgentControl::ReplaceModelDelta(OutputContentDelta::Text("redacted".to_string())),
+    )
+    .await
+    .unwrap();
+    let next = run.step().await.unwrap();
+    let completed_index = next
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::StepCompleted {
+                    step,
+                    outcome: AgentOutcome::ModelDelta {
+                        delta: OutputContentDelta::Text(text),
+                        ..
+                    },
+                } if step.id == report.step.id && text == "redacted"
+            )
+        })
+        .expect("final step completion emitted");
+    let delta_index = next
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::ModelDelta {
+                    delta: OutputContentDelta::Text(text),
+                    ..
+                } if text == "redacted"
+            )
+        })
+        .expect("rewritten delta emitted");
+    assert!(completed_index < delta_index);
+}
+
+#[tokio::test]
 async fn run_handle_drops_model_delta_before_history() {
     let agent = test_agent(vec![
         OutputStreamEvent::Delta {
