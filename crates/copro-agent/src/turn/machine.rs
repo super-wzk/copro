@@ -2,7 +2,7 @@ use crate::tools::ToolExecutionPolicy;
 use crate::turn::{AgentAction, AgentOutcome};
 use copro_api::error::{Error, Result};
 use copro_api::message::{
-    InputContent, Message, OutputContent, ToolCall, ToolResult, ToolResultStatus,
+    InputContent, Message, OutputContent, OutputMessage, ToolCall, ToolResult, ToolResultStatus,
 };
 use copro_api::request::{GenerateRequest, GenerateRequestOptions};
 use copro_api::response::{FinishReason, Usage};
@@ -517,9 +517,9 @@ pub(crate) fn aborted_tool_result(tool: &ToolCall) -> ToolResult {
     }
 }
 
-pub(crate) fn normalize_for_history(message: Message) -> Message {
+pub(crate) fn normalize_for_history(message: OutputMessage) -> OutputMessage {
     match message {
-        Message::Assistant(content) => Message::Assistant(
+        OutputMessage::Assistant(content) => OutputMessage::Assistant(
             content
                 .into_iter()
                 .filter(|c| !matches!(c, OutputContent::Thinking(_) | OutputContent::Image(_)))
@@ -573,7 +573,7 @@ fn recover_tool_execution(
 
 fn into_assistant_content(message: Message) -> Result<Vec<OutputContent>> {
     match message {
-        Message::Assistant(content) => Ok(content),
+        Message::Output(OutputMessage::Assistant(content)) => Ok(content),
         other => Err(Error::protocol(format!(
             "expected assistant message, got {other:?}"
         ))),

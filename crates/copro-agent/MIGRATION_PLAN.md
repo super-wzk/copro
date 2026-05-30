@@ -23,8 +23,10 @@
 - `AgentTurnMachine` 已收敛为 `next_action()` / `apply_outcome()` 纯同步状态机；`AgentTurn` 统一按 action step loop 执行 async IO、control boundary、commit 和 event emission。
 - turn 执行模块已拆为 `turn/{types,control,checkpoint,handle,execution}.rs`，`turn/mod.rs` 只保留声明和 re-export。
 - `runtime` public namespace 已移除；`StopSignal` public API 已移除，取消能力收拢为每个 turn 内部的 cancellation source，由 `AgentTurnHandle` 的 `AbortTurn` / `preempt()` 驱动。
-- `AgentContext` 已作为 public 可序列化值对象加入 API，用于保存/恢复长期 context 状态；字段私有且只提供 getter，不包含 model/tools 或 in-flight turn/runtime 对象。
-- `AgentTurnHandle::events()` 已作为 core event stream，`run_stream()` convenience API 已移除，应用层统一通过 `Agent::start_turn()` 获取 handle。
+- `AgentHistory` 已作为 public 可序列化 history 值对象加入 API，用于保存/恢复长期对话历史；字段私有，常规应用层只通过 `push_input(InputMessage)` 追加输入，不包含 model/tools 或 in-flight turn/runtime 对象。
+- `AgentTurnConfig` 已作为 public 可序列化 turn 配置值对象加入 API，用于保存/复用 options/tool_choice/hosted_tools。
+- `AgentTurnHandle::events()` 已作为 core event stream，`run_stream()` convenience API 已移除，应用层通过 `start_turn(history, config, model, tools)` 获取 handle。
+- public `Agent` facade 已移除；应用层拥有 `AgentHistory`，每个 turn 消费 history，并在完成后通过 `AgentTurnHandle::into_history()` 取回更新后的 history。
 - `AgentControl` 已支持 request、model delta、assistant output、tool call、tool result 的改写/拒绝。
 - `AgentHook` / `AgentHooks` / `ToolCallDecision` 已从当前工作区代码中移除。
 - `copro-harness` 的 skills 注入已迁移为显式 `SkillRequestInjector`。
@@ -200,7 +202,7 @@
 
 目标：
 
-- 移除 `run_stream()`，统一通过 `Agent::start_turn()` 获取 `AgentTurnHandle`。
+- 移除 `run_stream()`，统一通过 `start_turn(history, config, model, tools)` 获取 `AgentTurnHandle`。
 - `AgentTurnHandle::events()` 作为 core stream 的自动驱动入口。
 - 如需 high-level chat stream，新增 adapter，而不是恢复旧兼容层。
 

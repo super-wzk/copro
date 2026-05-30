@@ -1,8 +1,9 @@
 use copro_agent::{
-    Agent, AgentCheckpoint, AgentControl, AgentEvent, AgentOutcome, ToolExecutionPolicy, ToolRouter,
+    AgentCheckpoint, AgentControl, AgentEvent, AgentHistory, AgentOutcome, AgentTurnConfig,
+    InputMessage, ToolExecutionPolicy, ToolRouter, start_turn,
 };
-use copro_api::message::{InputContent, Message, OutputContent, ToolResultStatus};
-use copro_api::stream::OutputContentDelta;
+use copro_api::message::{InputContent, OutputContent, ToolResultStatus};
+use copro_api::stream::{Model, OutputContentDelta};
 use copro_harness::skills::{SkillRequestInjector, SkillRuntime, SkillToolRouter};
 use copro_harness::tool;
 use copro_harness::tools::{CompositeToolRouter, LocalToolRouter};
@@ -67,14 +68,16 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         env::current_dir()?.join("examples/simple-cli/skills"),
     ))));
     let skill_tools = Arc::new(SkillToolRouter::new(Arc::clone(&skill_runtime)));
-    let tool_router =
-        CompositeToolRouter::new(vec![local_tools, workspace_tools.clone(), skill_tools]);
-    let agent = Agent::new(model, Arc::new(tool_router));
+    let tool_router: Arc<dyn ToolRouter> = Arc::new(CompositeToolRouter::new(vec![
+        local_tools,
+        workspace_tools.clone(),
+        skill_tools,
+    ]));
     let skill_request = SkillRequestInjector::new(skill_runtime);
 
-    agent
-        .push_message(Message::System(vec![text(SYSTEM_PROMPT)]))
-        .await?;
+    let mut history = AgentHistory::default();
+    let config = AgentTurnConfig::default();
+    history.push_input(InputMessage::System(vec![text(SYSTEM_PROMPT)]));
 
     println!("copro CLI — type /quit to exit, /clear to reset\n");
 
@@ -93,21 +96,30 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             break;
         }
         if input == "/clear" {
-            agent.clear_messages().await?;
+            history = AgentHistory::default();
             workspace_tools.clear_cache();
-            agent
-                .push_message(Message::System(vec![text(SYSTEM_PROMPT)]))
-                .await?;
+            history.push_input(InputMessage::System(vec![text(SYSTEM_PROMPT)]));
             println!("[conversation cleared]\n");
             continue;
         }
 
-        agent
-            .push_message(Message::User(vec![text(&input)]))
-            .await?;
+        history.push_input(InputMessage::User(vec![text(&input)]));
+        let rollback = history.clone();
 
-        if let Err(error) = drive_turn(&agent, &skill_request).await {
-            eprintln!("[error] {error}");
+        match drive_turn(
+            history,
+            config.clone(),
+            Arc::clone(&model),
+            Arc::clone(&tool_router),
+            &skill_request,
+        )
+        .await
+        {
+            Ok(updated) => history = updated,
+            Err(error) => {
+                history = rollback;
+                eprintln!("[error] {error}");
+            }
         }
         println!();
     }
@@ -116,10 +128,13 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 }
 
 async fn drive_turn(
-    agent: &Agent,
+    history: AgentHistory,
+    config: AgentTurnConfig,
+    model: Arc<dyn Model>,
+    tools: Arc<dyn ToolRouter>,
     skill_request: &SkillRequestInjector,
-) -> Result<(), Box<dyn StdError>> {
-    let run = agent.start_turn().await?;
+) -> Result<AgentHistory, Box<dyn StdError>> {
+    let run = start_turn(history, config, model, tools);
     let mut started_assistant = false;
     let mut streaming_thinking = false;
 
@@ -157,7 +172,7 @@ async fn drive_turn(
         }
     }
 
-    Ok(())
+    Ok(run.into_history().await)
 }
 
 fn handle_agent_event(

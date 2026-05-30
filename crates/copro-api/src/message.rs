@@ -64,10 +64,54 @@ pub enum OutputContent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Message {
+pub enum InputMessage {
     System(Vec<InputContent>),
     Developer(Vec<InputContent>),
     User(Vec<InputContent>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OutputMessage {
     Assistant(Vec<OutputContent>),
     Tool(ToolResult),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Message {
+    Input(InputMessage),
+    Output(OutputMessage),
+}
+
+impl From<InputMessage> for Message {
+    fn from(message: InputMessage) -> Self {
+        Self::Input(message)
+    }
+}
+
+impl From<OutputMessage> for Message {
+    fn from(message: OutputMessage) -> Self {
+        Self::Output(message)
+    }
+}
+
+impl Message {
+    pub fn system(content: Vec<InputContent>) -> Self {
+        InputMessage::System(content).into()
+    }
+
+    pub fn developer(content: Vec<InputContent>) -> Self {
+        InputMessage::Developer(content).into()
+    }
+
+    pub fn user(content: Vec<InputContent>) -> Self {
+        InputMessage::User(content).into()
+    }
+
+    pub fn assistant(content: Vec<OutputContent>) -> Self {
+        OutputMessage::Assistant(content).into()
+    }
+
+    pub fn tool(result: ToolResult) -> Self {
+        OutputMessage::Tool(result).into()
+    }
 }

@@ -2,7 +2,8 @@ use copro_agent::{CancellationToken, ToolRouter};
 use copro_api::async_trait;
 use copro_api::error::{Error, Result};
 use copro_api::message::{
-    InputContent, Message, OutputContent, ToolCall, ToolResult, ToolResultStatus,
+    InputContent, InputMessage, Message, OutputContent, OutputMessage, ToolCall, ToolResult,
+    ToolResultStatus,
 };
 use copro_api::request::{GenerateRequest, GenerateRequestOptions};
 use copro_harness::skills::{
@@ -18,8 +19,8 @@ async fn request_injector_adds_available_skills_after_initial_instructions() {
     let injector = SkillRequestInjector::new(runtime);
     let mut request = GenerateRequest {
         messages: vec![
-            Message::System(vec![InputContent::Text("system".to_string())]),
-            Message::User(vec![InputContent::Text("hi".to_string())]),
+            Message::system(vec![InputContent::Text("system".to_string())]),
+            Message::user(vec![InputContent::Text("hi".to_string())]),
         ],
         tools: Vec::new(),
         tool_choice: None,
@@ -29,12 +30,18 @@ async fn request_injector_adds_available_skills_after_initial_instructions() {
 
     injector.prepare_request(&mut request).await.unwrap();
 
-    assert!(matches!(request.messages.first(), Some(Message::System(_))));
+    assert!(matches!(
+        request.messages.first(),
+        Some(Message::Input(InputMessage::System(_)))
+    ));
     assert!(matches!(
         request.messages.get(1),
-        Some(Message::Developer(_))
+        Some(Message::Input(InputMessage::Developer(_)))
     ));
-    assert!(matches!(request.messages.get(2), Some(Message::User(_))));
+    assert!(matches!(
+        request.messages.get(2),
+        Some(Message::Input(InputMessage::User(_)))
+    ));
 }
 
 #[tokio::test]
@@ -43,15 +50,15 @@ async fn request_injector_prunes_loaded_skill_context_from_previous_turns() {
     let injector = SkillRequestInjector::new(runtime);
     let mut request = GenerateRequest {
         messages: vec![
-            Message::System(vec![InputContent::Text("system".to_string())]),
-            Message::User(vec![InputContent::Text("old request".to_string())]),
-            Message::Assistant(vec![OutputContent::ToolCall(load_skill_call(
+            Message::system(vec![InputContent::Text("system".to_string())]),
+            Message::user(vec![InputContent::Text("old request".to_string())]),
+            Message::assistant(vec![OutputContent::ToolCall(load_skill_call(
                 "load_skill",
                 "test-skill",
             ))]),
             load_skill_result(),
-            Message::Assistant(vec![OutputContent::Text("done".to_string())]),
-            Message::User(vec![InputContent::Text("new request".to_string())]),
+            Message::assistant(vec![OutputContent::Text("done".to_string())]),
+            Message::user(vec![InputContent::Text("new request".to_string())]),
         ],
         tools: Vec::new(),
         tool_choice: None,
@@ -62,18 +69,27 @@ async fn request_injector_prunes_loaded_skill_context_from_previous_turns() {
     injector.prepare_request(&mut request).await.unwrap();
 
     assert_eq!(request.messages.len(), 5);
-    assert!(matches!(request.messages.first(), Some(Message::System(_))));
+    assert!(matches!(
+        request.messages.first(),
+        Some(Message::Input(InputMessage::System(_)))
+    ));
     assert!(matches!(
         request.messages.get(1),
-        Some(Message::Developer(_))
+        Some(Message::Input(InputMessage::Developer(_)))
     ));
-    assert!(matches!(request.messages.get(2), Some(Message::User(_))));
+    assert!(matches!(
+        request.messages.get(2),
+        Some(Message::Input(InputMessage::User(_)))
+    ));
     assert!(matches!(
         request.messages.get(3),
-        Some(Message::Assistant(content))
+        Some(Message::Output(OutputMessage::Assistant(content)))
             if matches!(content.first(), Some(OutputContent::Text(text)) if text == "done")
     ));
-    assert!(matches!(request.messages.get(4), Some(Message::User(_))));
+    assert!(matches!(
+        request.messages.get(4),
+        Some(Message::Input(InputMessage::User(_)))
+    ));
     assert!(!has_load_skill_tool_call(&request.messages));
     assert!(!has_load_skill_result(&request.messages));
 }
@@ -84,9 +100,9 @@ async fn request_injector_keeps_loaded_skill_context_in_current_turn() {
     let injector = SkillRequestInjector::new(runtime);
     let mut request = GenerateRequest {
         messages: vec![
-            Message::System(vec![InputContent::Text("system".to_string())]),
-            Message::User(vec![InputContent::Text("current request".to_string())]),
-            Message::Assistant(vec![OutputContent::ToolCall(load_skill_call(
+            Message::system(vec![InputContent::Text("system".to_string())]),
+            Message::user(vec![InputContent::Text("current request".to_string())]),
+            Message::assistant(vec![OutputContent::ToolCall(load_skill_call(
                 "load_skill",
                 "test-skill",
             ))]),
@@ -199,7 +215,7 @@ fn load_skill_call(tool_name: &str, skill_name: &str) -> ToolCall {
 }
 
 fn load_skill_result() -> Message {
-    Message::Tool(ToolResult {
+    Message::tool(ToolResult {
         call_id: "call-1".into(),
         name: "load_skill".to_string(),
         status: ToolResultStatus::Success,
@@ -209,7 +225,7 @@ fn load_skill_result() -> Message {
 
 fn has_load_skill_tool_call(messages: &[Message]) -> bool {
     messages.iter().any(|message| match message {
-        Message::Assistant(content) => content.iter().any(|item| {
+        Message::Output(OutputMessage::Assistant(content)) => content.iter().any(|item| {
             matches!(
                 item,
                 OutputContent::ToolCall(tool_call) if tool_call.name == "load_skill"
@@ -223,7 +239,7 @@ fn has_load_skill_result(messages: &[Message]) -> bool {
     messages.iter().any(|message| {
         matches!(
             message,
-            Message::Tool(result) if result.name == "load_skill"
+            Message::Output(OutputMessage::Tool(result)) if result.name == "load_skill"
         )
     })
 }

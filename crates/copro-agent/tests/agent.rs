@@ -1,7 +1,8 @@
 use copro_agent::{
-    Agent, AgentAction, AgentCheckpoint, AgentContext, AgentControl, AgentEvent,
-    AgentInterruptReason, AgentOutcome, AgentTurnState, CancellationToken, ToolExecutionPolicy,
-    ToolResultReplacement, ToolRouter, async_trait,
+    AgentAction, AgentCheckpoint, AgentControl, AgentEvent, AgentHistory, AgentInterruptReason,
+    AgentOutcome, AgentTurnConfig, AgentTurnHandle, AgentTurnState, CancellationToken,
+    InputMessage, OutputMessage, ToolExecutionPolicy, ToolResultReplacement, ToolRouter,
+    async_trait, start_turn,
 };
 use copro_api::error::Result;
 use copro_api::message::{
@@ -17,6 +18,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Debug, Clone, PartialEq)]
 enum StreamEvent {
@@ -54,7 +56,112 @@ fn stream_events(events: &[AgentEvent]) -> Vec<StreamEvent> {
         .collect()
 }
 
-async fn collect_agent_events(agent: &Agent) -> Vec<AgentEvent> {
+#[derive(Clone)]
+struct TestSession {
+    history: Arc<AsyncMutex<AgentHistory>>,
+    config: Arc<AsyncMutex<AgentTurnConfig>>,
+    last_turn: Arc<AsyncMutex<Option<AgentTurnHandle>>>,
+    model: Arc<dyn Model>,
+    tools: Arc<dyn ToolRouter>,
+}
+
+impl TestSession {
+    fn new(model: Arc<dyn Model>, tools: Arc<dyn ToolRouter>) -> Self {
+        Self::from_history(AgentHistory::default(), model, tools)
+    }
+
+    fn from_history(
+        history: AgentHistory,
+        model: Arc<dyn Model>,
+        tools: Arc<dyn ToolRouter>,
+    ) -> Self {
+        Self::from_parts(history, AgentTurnConfig::default(), model, tools)
+    }
+
+    fn from_parts(
+        history: AgentHistory,
+        config: AgentTurnConfig,
+        model: Arc<dyn Model>,
+        tools: Arc<dyn ToolRouter>,
+    ) -> Self {
+        Self {
+            history: Arc::new(AsyncMutex::new(history)),
+            config: Arc::new(AsyncMutex::new(config)),
+            last_turn: Arc::new(AsyncMutex::new(None)),
+            model,
+            tools,
+        }
+    }
+
+    async fn start_turn(&self) -> Result<AgentTurnHandle> {
+        self.sync_history().await;
+        let history = self.history.lock().await.clone();
+        let config = self.config.lock().await.clone();
+        let turn = start_turn(
+            history,
+            config,
+            Arc::clone(&self.model),
+            Arc::clone(&self.tools),
+        );
+        *self.last_turn.lock().await = Some(turn.clone());
+        Ok(turn)
+    }
+
+    async fn push_input(&self, message: InputMessage) -> Result<()> {
+        self.sync_history().await;
+        self.history.lock().await.push_input(message);
+        Ok(())
+    }
+
+    async fn replace_messages(&self, messages: Vec<Message>) -> Result<()> {
+        self.sync_history().await;
+        *self.history.lock().await = AgentHistory::from_messages(messages);
+        Ok(())
+    }
+
+    async fn messages(&self) -> Result<Vec<Message>> {
+        self.sync_history().await;
+        Ok(self.history.lock().await.messages().to_vec())
+    }
+
+    async fn history(&self) -> Result<AgentHistory> {
+        self.sync_history().await;
+        Ok(self.history.lock().await.clone())
+    }
+
+    async fn config(&self) -> Result<AgentTurnConfig> {
+        Ok(self.config.lock().await.clone())
+    }
+
+    async fn set_options(&self, options: GenerateRequestOptions) -> Result<()> {
+        let mut config = self.config.lock().await;
+        *config = config.clone().with_options(options);
+        Ok(())
+    }
+
+    async fn set_tool_choice(&self, tool_choice: Option<ToolChoice>) -> Result<()> {
+        let mut config = self.config.lock().await;
+        *config = config.clone().with_tool_choice(tool_choice);
+        Ok(())
+    }
+
+    async fn set_hosted_tools(&self, hosted_tools: Vec<HostedToolSpec>) -> Result<()> {
+        let mut config = self.config.lock().await;
+        *config = config.clone().with_hosted_tools(hosted_tools);
+        Ok(())
+    }
+
+    async fn sync_history(&self) {
+        let last_turn = self.last_turn.lock().await.clone();
+        if let Some(turn) = last_turn {
+            let history = turn.into_history().await;
+            *self.history.lock().await = history;
+            *self.last_turn.lock().await = None;
+        }
+    }
+}
+
+async fn collect_agent_events(agent: &TestSession) -> Vec<AgentEvent> {
     let run = agent.start_turn().await.unwrap();
     run.events()
         .collect::<Vec<_>>()
@@ -77,7 +184,7 @@ async fn turn_events_commit_assistant_message() {
         },
     ]);
     agent
-        .replace_messages(vec![Message::User(vec![InputContent::Text(
+        .replace_messages(vec![Message::user(vec![InputContent::Text(
             "hi".to_string(),
         )])])
         .await
@@ -85,7 +192,7 @@ async fn turn_events_commit_assistant_message() {
 
     let events = collect_agent_events(&agent).await;
 
-    let assistant = Message::Assistant(vec![OutputContent::Text("Hello".to_string())]);
+    let assistant = Message::assistant(vec![OutputContent::Text("Hello".to_string())]);
     assert_eq!(
         stream_events(&events),
         vec![
@@ -100,7 +207,7 @@ async fn turn_events_commit_assistant_message() {
     assert_eq!(
         agent.messages().await.unwrap(),
         vec![
-            Message::User(vec![InputContent::Text("hi".to_string())]),
+            Message::user(vec![InputContent::Text("hi".to_string())]),
             assistant,
         ]
     );
@@ -228,7 +335,7 @@ async fn turn_events_expose_ready_state_before_step_starts() {
 
 #[tokio::test]
 async fn turn_events_await_async_tool_router() {
-    let agent = Agent::new(
+    let agent = TestSession::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
@@ -276,7 +383,7 @@ async fn turn_events_await_async_tool_router() {
 
 #[tokio::test]
 async fn tool_task_panic_is_committed_as_error_tool_result() {
-    let agent = Agent::new(
+    let agent = TestSession::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
@@ -308,14 +415,14 @@ async fn tool_task_panic_is_committed_as_error_tool_result() {
     assert!(matches!(
         agent.messages().await.unwrap().as_slice(),
         [
-            Message::Assistant(assistant_content),
-            Message::Tool(ToolResult {
+            Message::Output(OutputMessage::Assistant(assistant_content)),
+            Message::Output(OutputMessage::Tool(ToolResult {
                 call_id,
                 name,
                 status: ToolResultStatus::Error,
                 content,
-            }),
-            Message::Assistant(done_content),
+            })),
+            Message::Output(OutputMessage::Assistant(done_content)),
         ] if matches!(assistant_content.as_slice(), [OutputContent::ToolCall(ToolCall { id, name, .. })]
             if id.as_str() == "call-1" && name == "double")
             && call_id.as_str() == "call-1"
@@ -329,7 +436,7 @@ async fn tool_task_panic_is_committed_as_error_tool_result() {
 async fn turn_events_batch_parallel_tools_behind_serial_barriers() {
     let router = Arc::new(ConcurrentToolRouter::default());
     let tool_router: Arc<dyn ToolRouter> = router.clone();
-    let agent = Agent::new(
+    let agent = TestSession::new(
         Arc::new(MultiToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
@@ -465,7 +572,7 @@ async fn turn_handle_control_pause_emits_pause_and_resume_events() {
 
 #[tokio::test]
 async fn turn_handle_pause_request_waits_for_next_boundary() {
-    let agent = Agent::new(Arc::new(DelayedSecondDeltaModel), Arc::new(EmptyToolRouter));
+    let agent = TestSession::new(Arc::new(DelayedSecondDeltaModel), Arc::new(EmptyToolRouter));
     let run = agent.start_turn().await.unwrap();
 
     let first = loop {
@@ -586,7 +693,7 @@ async fn turn_handle_abort_turn_emits_turn_aborted() {
 
 #[tokio::test]
 async fn abort_turn_after_assistant_tool_call_recovers_tool_result() {
-    let agent = Agent::new(
+    let agent = TestSession::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
@@ -654,13 +761,13 @@ async fn abort_turn_after_assistant_tool_call_recovers_tool_result() {
     assert!(matches!(
         agent.messages().await.unwrap().as_slice(),
         [
-            Message::Assistant(content),
-            Message::Tool(ToolResult {
+            Message::Output(OutputMessage::Assistant(content)),
+            Message::Output(OutputMessage::Tool(ToolResult {
                 call_id,
                 name,
                 status: ToolResultStatus::Error,
                 content: result_content,
-            })
+            }))
         ] if matches!(content.as_slice(), [OutputContent::ToolCall(ToolCall { id, name, .. })]
             if id.as_str() == "call-1" && name == "double")
             && call_id.as_str() == "call-1"
@@ -671,7 +778,7 @@ async fn abort_turn_after_assistant_tool_call_recovers_tool_result() {
 
 #[tokio::test]
 async fn abort_turn_at_tool_started_recovers_tool_result() {
-    let agent = Agent::new(
+    let agent = TestSession::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
@@ -728,7 +835,7 @@ async fn abort_turn_at_tool_started_recovers_tool_result() {
 
 #[tokio::test]
 async fn turn_handle_preempt_inflight_model_stream_emits_turn_preempted() {
-    let agent = Agent::new(
+    let agent = TestSession::new(
         Arc::new(PendingAfterFirstDeltaModel),
         Arc::new(EmptyToolRouter),
     );
@@ -793,7 +900,7 @@ async fn turn_handle_preempt_inflight_model_stream_emits_turn_preempted() {
 
 #[tokio::test]
 async fn turn_handle_preempt_inflight_tool_execution_recovers_tool_result() {
-    let agent = Agent::new(
+    let agent = TestSession::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
@@ -1002,7 +1109,7 @@ async fn turn_handle_replaces_model_delta_before_history() {
         .unwrap();
     assert_eq!(
         agent.messages().await.unwrap(),
-        vec![Message::Assistant(vec![OutputContent::Text(
+        vec![Message::assistant(vec![OutputContent::Text(
             "redacted".to_string()
         )])]
     );
@@ -1130,7 +1237,7 @@ async fn turn_handle_drops_model_delta_before_history() {
     )));
     assert_eq!(
         agent.messages().await.unwrap(),
-        vec![Message::Assistant(Vec::new())]
+        vec![Message::assistant(Vec::new())]
     );
 }
 
@@ -1140,9 +1247,9 @@ async fn turn_handle_replaces_request_before_model_stream() {
     let model = Arc::new(CapturingModel {
         captured: Arc::clone(&captured),
     });
-    let agent = Agent::new(model, Arc::new(EmptyToolRouter));
+    let agent = TestSession::new(model, Arc::new(EmptyToolRouter));
     let replacement = GenerateRequest {
-        messages: vec![Message::System(vec![InputContent::Text(
+        messages: vec![Message::system(vec![InputContent::Text(
             "replacement".to_string(),
         )])],
         tools: Vec::new(),
@@ -1227,7 +1334,7 @@ async fn turn_handle_replaces_assistant_output_before_commit() {
         .unwrap();
     assert_eq!(
         agent.messages().await.unwrap(),
-        vec![Message::Assistant(vec![OutputContent::Text(
+        vec![Message::assistant(vec![OutputContent::Text(
             "redacted".to_string()
         )])]
     );
@@ -1235,7 +1342,7 @@ async fn turn_handle_replaces_assistant_output_before_commit() {
 
 #[tokio::test]
 async fn turn_handle_replaces_tool_result_before_commit() {
-    let agent = Agent::new(
+    let agent = TestSession::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
@@ -1293,13 +1400,13 @@ async fn turn_handle_replaces_tool_result_before_commit() {
             .await
             .unwrap()
             .iter()
-            .any(|message| matches!(message, Message::Tool(result) if result == &expected))
+            .any(|message| matches!(message, Message::Output(OutputMessage::Tool(result)) if result == &expected))
     );
 }
 
 #[tokio::test]
 async fn turn_handle_rejects_mismatched_tool_result_replacement_immediately() {
-    let agent = Agent::new(
+    let agent = TestSession::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
@@ -1339,7 +1446,7 @@ async fn turn_handle_rejects_mismatched_tool_result_replacement_immediately() {
 
 #[tokio::test]
 async fn turn_handle_rejects_duplicate_tool_call_replacement_immediately() {
-    let agent = Agent::new(
+    let agent = TestSession::new(
         Arc::new(MultiToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
@@ -1418,7 +1525,7 @@ async fn turn_handle_rejects_assistant_output_inconsistent_with_finish_reason() 
 
 #[tokio::test]
 async fn turn_handle_replaces_tool_call_before_execution() {
-    let agent = Agent::new(
+    let agent = TestSession::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
@@ -1480,14 +1587,14 @@ async fn turn_handle_replaces_tool_call_before_execution() {
     assert!(matches!(
         agent.messages().await.unwrap().as_slice(),
         [
-            Message::Assistant(content),
-            Message::Tool(ToolResult {
+            Message::Output(OutputMessage::Assistant(content)),
+            Message::Output(OutputMessage::Tool(ToolResult {
                 call_id,
                 name,
                 status: ToolResultStatus::Success,
                 content: result_content,
-            }),
-            Message::Assistant(done_content),
+            })),
+            Message::Output(OutputMessage::Assistant(done_content)),
         ] if matches!(content.as_slice(), [OutputContent::ToolCall(ToolCall { id, name, arguments })]
             if id.as_str() == "call-2"
                 && name == "double"
@@ -1501,7 +1608,7 @@ async fn turn_handle_replaces_tool_call_before_execution() {
 
 #[tokio::test]
 async fn turn_handle_rejects_tool_call_before_execution() {
-    let agent = Agent::new(
+    let agent = TestSession::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
@@ -1556,14 +1663,14 @@ async fn turn_handle_rejects_tool_call_before_execution() {
     assert!(matches!(
         agent.messages().await.unwrap().as_slice(),
         [
-            Message::Assistant(_),
-            Message::Tool(ToolResult {
+            Message::Output(OutputMessage::Assistant(_)),
+            Message::Output(OutputMessage::Tool(ToolResult {
                 call_id,
                 name,
                 status: ToolResultStatus::Error,
                 content,
-            }),
-            Message::Assistant(done_content),
+            })),
+            Message::Output(OutputMessage::Assistant(done_content)),
         ] if call_id.as_str() == "call-1"
             && name == "double"
             && content == &vec![InputContent::Text("blocked by policy".to_string())]
@@ -1571,8 +1678,8 @@ async fn turn_handle_rejects_tool_call_before_execution() {
     ));
 }
 
-fn test_agent(events: Vec<OutputStreamEvent>) -> Agent {
-    Agent::new(Arc::new(TestModel { events }), Arc::new(EmptyToolRouter))
+fn test_agent(events: Vec<OutputStreamEvent>) -> TestSession {
+    TestSession::new(Arc::new(TestModel { events }), Arc::new(EmptyToolRouter))
 }
 
 #[tokio::test]
@@ -1581,9 +1688,9 @@ async fn build_request_carries_agent_baseline_config() {
     let model = Arc::new(CapturingModel {
         captured: Arc::clone(&captured),
     });
-    let agent = Agent::new(model, Arc::new(EmptyToolRouter));
+    let agent = TestSession::new(model, Arc::new(EmptyToolRouter));
     agent
-        .replace_messages(vec![Message::User(vec![InputContent::Text(
+        .replace_messages(vec![Message::user(vec![InputContent::Text(
             "hi".to_string(),
         )])])
         .await
@@ -1618,7 +1725,7 @@ async fn build_request_carries_agent_baseline_config() {
 }
 
 #[tokio::test]
-async fn agent_context_round_trips_context_state() {
+async fn agent_history_and_turn_config_round_trip_state() {
     let mut options = GenerateRequestOptions {
         temperature: Some(0.7),
         max_tokens: Some(512),
@@ -1630,36 +1737,46 @@ async fn agent_context_round_trips_context_state() {
     let hosted_tool = HostedToolSpec::new("web_search")
         .with_parameters(serde_json::json!({"region": "global"}))
         .unwrap();
-    let expected = AgentContext::new(
-        vec![Message::User(vec![InputContent::Text("hi".to_string())])],
+    let expected_history =
+        AgentHistory::from_messages(vec![Message::user(vec![InputContent::Text(
+            "hi".to_string(),
+        )])]);
+    let expected_config = AgentTurnConfig::new(
         options,
         Some(ToolChoice::Specific {
             name: "double".to_string(),
         }),
         vec![hosted_tool],
     );
-    let agent = Agent::from_context(
-        expected.clone(),
+    let agent = TestSession::from_parts(
+        expected_history.clone(),
+        expected_config.clone(),
         Arc::new(TestModel { events: Vec::new() }),
         Arc::new(EmptyToolRouter),
     );
 
-    let context = agent.context().await.unwrap();
-    assert_eq!(context, expected);
-    assert_eq!(context.messages(), expected.messages());
-    assert_eq!(context.options(), expected.options());
-    assert_eq!(context.tool_choice(), expected.tool_choice());
-    assert_eq!(context.hosted_tools(), expected.hosted_tools());
-    let encoded = serde_json::to_value(&context).unwrap();
-    let decoded: AgentContext = serde_json::from_value(encoded).unwrap();
-    assert_eq!(decoded, context);
+    let history = agent.history().await.unwrap();
+    assert_eq!(history, expected_history);
+    assert_eq!(history.messages(), expected_history.messages());
+    let encoded_history = serde_json::to_value(&history).unwrap();
+    let decoded_history: AgentHistory = serde_json::from_value(encoded_history).unwrap();
+    assert_eq!(decoded_history, history);
+
+    let config = agent.config().await.unwrap();
+    assert_eq!(config, expected_config);
+    assert_eq!(config.options(), expected_config.options());
+    assert_eq!(config.tool_choice(), expected_config.tool_choice());
+    assert_eq!(config.hosted_tools(), expected_config.hosted_tools());
+    let encoded_config = serde_json::to_value(&config).unwrap();
+    let decoded_config: AgentTurnConfig = serde_json::from_value(encoded_config).unwrap();
+    assert_eq!(decoded_config, config);
 }
 
 #[tokio::test]
-async fn agent_from_context_restores_independent_context() {
+async fn agent_from_history_restores_independent_history() {
     let source = test_agent(Vec::new());
     source
-        .replace_messages(vec![Message::User(vec![InputContent::Text(
+        .replace_messages(vec![Message::user(vec![InputContent::Text(
             "source".to_string(),
         )])])
         .await
@@ -1668,20 +1785,24 @@ async fn agent_from_context_restores_independent_context() {
         .set_tool_choice(Some(ToolChoice::Required))
         .await
         .unwrap();
-    let context = source.context().await.unwrap();
-    let restored = Agent::from_context(
-        context.clone(),
+    let history = source.history().await.unwrap();
+    let config = source.config().await.unwrap();
+    let restored = TestSession::from_parts(
+        history.clone(),
+        config,
         Arc::new(TestModel { events: Vec::new() }),
         Arc::new(EmptyToolRouter),
     );
 
-    assert_eq!(restored.context().await.unwrap(), context);
+    assert_eq!(restored.history().await.unwrap(), history);
     restored
-        .push_message(Message::User(vec![InputContent::Text("child".to_string())]))
+        .push_input(InputMessage::User(vec![InputContent::Text(
+            "child".to_string(),
+        )]))
         .await
         .unwrap();
 
-    assert_eq!(source.context().await.unwrap(), context);
+    assert_eq!(source.history().await.unwrap(), history);
     assert_eq!(restored.messages().await.unwrap().len(), 2);
 }
 

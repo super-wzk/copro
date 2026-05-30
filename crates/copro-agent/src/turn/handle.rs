@@ -1,17 +1,17 @@
 use super::{
     AgentCheckpoint, AgentControl, AgentControlKind, AgentControlSignal, AgentOutcome, AgentStep,
-    AgentStepId, AgentStepReport, AgentTurnState,
+    AgentStepId, AgentStepReport, AgentStreamItem, AgentTurnState,
 };
 use crate::cancel::TurnCancellation;
-use crate::context::AgentStreamItem;
 use crate::event::{AgentEvent, AgentStream};
+use crate::history::AgentHistory;
 use copro_api::error::{Error, Result};
 use copro_api::message::{OutputContent, ToolCall, ToolCallId, ToolResult};
 use copro_api::response::FinishReason;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
 #[derive(Clone)]
 pub struct AgentTurnHandle {
@@ -19,6 +19,17 @@ pub struct AgentTurnHandle {
     state: Arc<Mutex<AgentTurnHandleState>>,
     cancellation: TurnCancellation,
     driver_active: Arc<AtomicBool>,
+    completion: AgentTurnCompletion,
+}
+
+#[derive(Clone)]
+pub(crate) struct AgentTurnCompletion {
+    inner: Arc<AgentTurnCompletionState>,
+}
+
+struct AgentTurnCompletionState {
+    history: Mutex<Option<AgentHistory>>,
+    ready: Notify,
 }
 
 struct AgentTurnDriverLease {
@@ -45,6 +56,7 @@ impl AgentTurnHandle {
     pub(crate) fn new(
         events: mpsc::Receiver<AgentStreamItem>,
         cancellation: TurnCancellation,
+        completion: AgentTurnCompletion,
     ) -> Self {
         Self {
             events: Arc::new(Mutex::new(events)),
@@ -59,6 +71,7 @@ impl AgentTurnHandle {
             })),
             cancellation,
             driver_active: Arc::new(AtomicBool::new(false)),
+            completion,
         }
     }
 
@@ -228,6 +241,10 @@ impl AgentTurnHandle {
             .ok_or_else(|| Error::client("agent turn has not started"))
     }
 
+    pub async fn into_history(self) -> AgentHistory {
+        self.completion.history().await
+    }
+
     fn try_acquire_driver(&self) -> Result<AgentTurnDriverLease> {
         self.driver_active
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -267,6 +284,31 @@ impl AgentTurnHandle {
                 Err(error)
             }
             None => Ok(None),
+        }
+    }
+}
+
+impl AgentTurnCompletion {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(AgentTurnCompletionState {
+                history: Mutex::new(None),
+                ready: Notify::new(),
+            }),
+        }
+    }
+
+    pub(crate) async fn complete(&self, history: AgentHistory) {
+        *self.inner.history.lock().await = Some(history);
+        self.inner.ready.notify_waiters();
+    }
+
+    async fn history(&self) -> AgentHistory {
+        loop {
+            if let Some(history) = self.inner.history.lock().await.clone() {
+                return history;
+            }
+            self.inner.ready.notified().await;
         }
     }
 }

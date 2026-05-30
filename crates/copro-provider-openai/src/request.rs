@@ -1,7 +1,8 @@
 use base64::Engine;
 use copro_api::error::{Error, Result};
 use copro_api::message::{
-    ImageContent, InputContent, Message, OutputContent, ToolResult, ToolResultStatus,
+    ImageContent, InputContent, InputMessage, Message, OutputContent, OutputMessage, ToolResult,
+    ToolResultStatus,
 };
 use copro_api::tool::{HostedToolSpec, ToolChoice, ToolDefinition};
 use serde::Serialize;
@@ -91,14 +92,18 @@ fn build_input_items(messages: Vec<Message>) -> Result<Vec<Value>> {
 
 fn build_message_items(message: Message) -> Result<Vec<Value>> {
     match message {
-        Message::System(content) => Ok(vec![message_item("system", input_content_parts(content))]),
-        Message::Developer(content) => Ok(vec![message_item(
+        Message::Input(InputMessage::System(content)) => {
+            Ok(vec![message_item("system", input_content_parts(content))])
+        }
+        Message::Input(InputMessage::Developer(content)) => Ok(vec![message_item(
             "developer",
             input_content_parts(content),
         )]),
-        Message::User(content) => Ok(vec![message_item("user", input_content_parts(content))]),
-        Message::Assistant(content) => build_output_items(content),
-        Message::Tool(result) => Ok(vec![tool_result_item(result)]),
+        Message::Input(InputMessage::User(content)) => {
+            Ok(vec![message_item("user", input_content_parts(content))])
+        }
+        Message::Output(OutputMessage::Assistant(content)) => build_output_items(content),
+        Message::Output(OutputMessage::Tool(result)) => Ok(vec![tool_result_item(result)]),
     }
 }
 
@@ -272,7 +277,7 @@ mod tests {
     #[test]
     fn builds_basic_text_request() {
         let request = copro_api::request::GenerateRequest {
-            messages: vec![Message::User(vec![InputContent::Text("hello".to_string())])],
+            messages: vec![Message::user(vec![InputContent::Text("hello".to_string())])],
             tools: Vec::new(),
             hosted_tools: Vec::new(),
             tool_choice: None,
@@ -302,7 +307,7 @@ mod tests {
     #[test]
     fn builds_developer_message_request() {
         let request = copro_api::request::GenerateRequest {
-            messages: vec![Message::Developer(vec![InputContent::Text(
+            messages: vec![Message::developer(vec![InputContent::Text(
                 "follow these instructions".to_string(),
             )])],
             tools: Vec::new(),
@@ -329,7 +334,7 @@ mod tests {
     #[test]
     fn builds_function_tools_and_choice() {
         let request = copro_api::request::GenerateRequest {
-            messages: vec![Message::User(vec![InputContent::Text(
+            messages: vec![Message::user(vec![InputContent::Text(
                 "weather".to_string(),
             )])],
             tools: vec![ToolDefinition {
@@ -367,7 +372,7 @@ mod tests {
             extra_body: Map::from_iter([("metadata".to_string(), json!({"trace_id": "req_123"}))]),
         };
         let request = copro_api::request::GenerateRequest {
-            messages: vec![Message::User(vec![InputContent::Text("hello".to_string())])],
+            messages: vec![Message::user(vec![InputContent::Text("hello".to_string())])],
             tools: Vec::new(),
             hosted_tools: Vec::new(),
             tool_choice: None,
@@ -395,7 +400,7 @@ mod tests {
             ..OpenAiResponsesModelConfig::default()
         };
         let request = copro_api::request::GenerateRequest {
-            messages: vec![Message::User(vec![InputContent::Text("hello".to_string())])],
+            messages: vec![Message::user(vec![InputContent::Text("hello".to_string())])],
             tools: Vec::new(),
             hosted_tools: Vec::new(),
             tool_choice: None,
@@ -429,7 +434,7 @@ mod tests {
             })
             .unwrap();
         let request = copro_api::request::GenerateRequest {
-            messages: vec![Message::User(vec![InputContent::Text("hello".to_string())])],
+            messages: vec![Message::user(vec![InputContent::Text("hello".to_string())])],
             tools: Vec::new(),
             hosted_tools: Vec::new(),
             tool_choice: None,
@@ -445,7 +450,7 @@ mod tests {
     #[test]
     fn maps_hosted_response_tools() {
         let request = copro_api::request::GenerateRequest {
-            messages: vec![Message::User(vec![InputContent::Text(
+            messages: vec![Message::user(vec![InputContent::Text(
                 "draw a cat".to_string(),
             )])],
             tools: Vec::new(),
@@ -470,7 +475,7 @@ mod tests {
 
     #[test]
     fn maps_tool_output_messages() {
-        let items = build_message_items(Message::Tool(ToolResult {
+        let items = build_message_items(Message::tool(ToolResult {
             call_id: "call_123".into(),
             name: "weather".to_string(),
             status: ToolResultStatus::Success,
@@ -486,7 +491,7 @@ mod tests {
 
     #[test]
     fn maps_multiple_text_tool_output_as_content_array() {
-        let items = build_message_items(Message::Tool(ToolResult {
+        let items = build_message_items(Message::tool(ToolResult {
             call_id: "call_123".into(),
             name: "multi_text".to_string(),
             status: ToolResultStatus::Success,
@@ -507,7 +512,7 @@ mod tests {
 
     #[test]
     fn maps_tool_output_images() {
-        let items = build_message_items(Message::Tool(ToolResult {
+        let items = build_message_items(Message::tool(ToolResult {
             call_id: "call_123".into(),
             name: "inspect_image".to_string(),
             status: ToolResultStatus::Success,

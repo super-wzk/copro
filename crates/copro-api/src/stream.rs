@@ -1,5 +1,5 @@
 use crate::error::*;
-use crate::message::{ImageContent, Message, OutputContent, ToolCall};
+use crate::message::{ImageContent, OutputContent, OutputMessage, ToolCall};
 use crate::request::GenerateRequest;
 use crate::response::*;
 use futures_util::Stream;
@@ -67,9 +67,10 @@ impl OutputStreamState {
             OutputStreamEvent::Finished { reason, usage } => {
                 self.finished = true;
                 Ok(Some(GenerateResponse {
-                    message: Message::Assistant(finish_output_content(mem::take(
+                    message: OutputMessage::Assistant(finish_output_content(mem::take(
                         &mut self.content,
-                    ))?),
+                    ))?)
+                    .into(),
                     reason,
                     usage,
                 }))
@@ -223,6 +224,7 @@ fn parse_arguments(arguments: &str) -> Result<Map<String, Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::Message;
 
     #[test]
     fn state_collects_text() {
@@ -251,7 +253,7 @@ mod tests {
 
         assert_eq!(
             response.message,
-            Message::Assistant(vec![OutputContent::Text("Hello".to_string())])
+            Message::assistant(vec![OutputContent::Text("Hello".to_string())])
         );
     }
 
@@ -286,7 +288,7 @@ mod tests {
 
         assert_eq!(
             response.message,
-            Message::Assistant(vec![OutputContent::Image(ImageContent::Url {
+            Message::assistant(vec![OutputContent::Image(ImageContent::Url {
                 url: "data:image/png;base64,final".to_string(),
             })])
         );
@@ -324,7 +326,7 @@ mod tests {
 
         assert_eq!(
             response.message,
-            Message::Assistant(vec![
+            Message::assistant(vec![
                 OutputContent::Image(ImageContent::Url {
                     url: "data:image/png;base64,first".to_string(),
                 }),

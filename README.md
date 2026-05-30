@@ -22,8 +22,8 @@ cargo run -p simple-cli
 Or start with a minimal no-tools agent:
 
 ```rust
-use copro_agent::{Agent, AgentEvent};
-use copro_api::message::{InputContent, Message};
+use copro_agent::{AgentEvent, AgentHistory, AgentTurnConfig, InputMessage, start_turn};
+use copro_api::message::InputContent;
 use copro_harness::tools::LocalToolRouter;
 use copro_provider_openai::{
     OpenAiResponsesModelConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
@@ -39,20 +39,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let model = provider.model("gpt-5.5", OpenAiResponsesModelConfig::default())?;
 
-    let agent = Agent::new(model, Arc::new(LocalToolRouter::default()));
-    agent
-        .push_message(Message::User(vec![InputContent::Text(
-            "Write one sentence about Rust agents.".to_string(),
-        )]))
-        .await?;
+    let mut history = AgentHistory::default();
+    history.push_input(InputMessage::User(vec![InputContent::Text(
+        "Write one sentence about Rust agents.".to_string(),
+    )]));
 
-    let turn = agent.start_turn().await?;
+    let turn = start_turn(
+        history,
+        AgentTurnConfig::default(),
+        model,
+        Arc::new(LocalToolRouter::default()),
+    );
+    let history_after_turn = turn.clone();
     let mut stream = turn.events();
     while let Some(event) = stream.next().await {
         if let AgentEvent::ModelDelta { delta, .. } = event? {
             print_delta(delta);
         }
     }
+    let _history = history_after_turn.into_history().await;
 
     Ok(())
 }
@@ -67,7 +72,7 @@ fn print_delta(delta: copro_api::stream::OutputContentDelta) {
 }
 ```
 
-Every execution starts with `Agent::start_turn()`. Use `AgentTurnHandle::events()` for automatic streaming, or drive `AgentTurnHandle::step_until_control()` manually, inspect the returned `AgentCheckpoint`, and resume with `AgentTurnHandle::control(step_id, AgentControl::Continue)` or a replacement control.
+Every execution starts with `start_turn(history, config, model, tools)`. The application owns `AgentHistory` between turns; each turn consumes a history value and `AgentTurnHandle::into_history().await` returns the updated history after the turn completes. Use `AgentTurnHandle::events()` for automatic streaming, or drive `AgentTurnHandle::step_until_control()` manually, inspect the returned `AgentCheckpoint`, and resume with `AgentTurnHandle::control(step_id, AgentControl::Continue)` or a replacement control.
 
 ## Pause And Resume
 

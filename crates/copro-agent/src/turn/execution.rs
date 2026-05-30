@@ -3,15 +3,14 @@ use super::machine::{
 };
 use super::{
     AgentAction, AgentControl, AgentControlSignal, AgentInterruptReason, AgentOutcome, AgentStep,
-    AgentStepId,
+    AgentStepId, AgentStreamItem, AgentTurnResources,
 };
 use crate::cancel::TurnCancellation;
-use crate::context::{AgentState, AgentStreamItem};
 use crate::event::AgentEvent;
 use crate::tools::ToolRouter;
 use copro_api::error::{Error, Result};
 use copro_api::message::{
-    InputContent, Message, OutputContent, ToolCall, ToolResult, ToolResultStatus,
+    InputContent, Message, OutputContent, OutputMessage, ToolCall, ToolResult, ToolResultStatus,
 };
 use copro_api::stream::ModelStream;
 use futures_util::StreamExt;
@@ -154,12 +153,12 @@ impl AgentTurnClock {
 }
 
 pub(crate) struct AgentTurn<'a> {
-    state: &'a mut AgentState,
+    state: &'a mut AgentTurnResources,
     cancellation: TurnCancellation,
 }
 
 impl<'a> AgentTurn<'a> {
-    pub(crate) fn new(state: &'a mut AgentState, cancellation: TurnCancellation) -> Self {
+    pub(crate) fn new(state: &'a mut AgentTurnResources, cancellation: TurnCancellation) -> Self {
         Self {
             state,
             cancellation,
@@ -278,11 +277,11 @@ impl<'a> AgentTurn<'a> {
             }
             AgentAction::BuildRequest { tools } => {
                 let request = turn.build_request(
-                    self.state.context.messages(),
+                    self.state.history.messages(),
                     tools.clone(),
-                    self.state.context.hosted_tools().to_vec(),
-                    self.state.context.tool_choice().cloned(),
-                    self.state.context.options().clone(),
+                    self.state.config.hosted_tools().to_vec(),
+                    self.state.config.tool_choice().cloned(),
+                    self.state.config.options().clone(),
                 );
                 Ok(ActionExecution::Outcome(AgentOutcome::RequestBuilt(
                     request,
@@ -316,10 +315,12 @@ impl<'a> AgentTurn<'a> {
                 reason,
                 usage,
             } => {
-                let message_index = self.state.context.messages().len();
+                let message_index = self.state.history.messages().len();
                 self.state
-                    .context
-                    .push_message(normalize_for_history(Message::Assistant(content.clone())));
+                    .history
+                    .push_output(normalize_for_history(OutputMessage::Assistant(
+                        content.clone(),
+                    )));
                 runtime.close_model_stream();
                 let outcome = AgentOutcome::AssistantCommitted {
                     message_index,
@@ -375,7 +376,7 @@ impl<'a> AgentTurn<'a> {
                 }))
             }
             AgentAction::CommitToolResult { tool, result } => {
-                let message_index = self.state.context.messages().len();
+                let message_index = self.state.history.messages().len();
                 Ok(ActionExecution::Outcome(
                     AgentOutcome::ToolResultCommitted {
                         message_index,
@@ -475,7 +476,7 @@ impl<'a> AgentTurn<'a> {
                 AgentControlSignal::Control(AgentControl::ReplaceToolCall(replacement)),
             ) => {
                 replace_tool_call_in_history(
-                    self.state.context.messages_mut(),
+                    self.state.history.messages_mut(),
                     &tool,
                     replacement.clone(),
                 );
@@ -606,8 +607,8 @@ impl<'a> AgentTurn<'a> {
                 },
             ) => {
                 self.state
-                    .context
-                    .push_message(Message::Tool(result.clone()));
+                    .history
+                    .push_output(OutputMessage::Tool(result.clone()));
                 if !emit(
                     events,
                     AgentEvent::ToolResultCommitted {
@@ -699,7 +700,7 @@ fn replace_tool_call_in_history(
     replacement: ToolCall,
 ) {
     for message in messages.iter_mut().rev() {
-        let Message::Assistant(content) = message else {
+        let Message::Output(OutputMessage::Assistant(content)) = message else {
             continue;
         };
         for content in content {

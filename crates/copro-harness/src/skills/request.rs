@@ -1,7 +1,7 @@
 use super::SkillRuntime;
 use super::tool::LOAD_SKILL_TOOL_NAME;
 use copro_api::error::Result;
-use copro_api::message::{InputContent, Message, OutputContent};
+use copro_api::message::{InputContent, InputMessage, Message, OutputContent, OutputMessage};
 use copro_api::request::GenerateRequest;
 use std::sync::Arc;
 
@@ -23,11 +23,17 @@ impl SkillRequestInjector {
             let insertion_index = request
                 .messages
                 .iter()
-                .take_while(|message| matches!(message, Message::System(_) | Message::Developer(_)))
+                .take_while(|message| {
+                    matches!(
+                        message,
+                        Message::Input(InputMessage::System(_))
+                            | Message::Input(InputMessage::Developer(_))
+                    )
+                })
                 .count();
             request.messages.insert(
                 insertion_index,
-                Message::Developer(vec![InputContent::Text(prompt)]),
+                Message::developer(vec![InputContent::Text(prompt)]),
             );
         }
         Ok(())
@@ -43,7 +49,7 @@ impl SkillRequestInjector {
 fn prune_stale_skill_loads(messages: &mut Vec<Message>) {
     let Some(last_user_index) = messages
         .iter()
-        .rposition(|message| matches!(message, Message::User(_)))
+        .rposition(|message| matches!(message, Message::Input(InputMessage::User(_))))
     else {
         return;
     };
@@ -58,7 +64,7 @@ fn prune_stale_skill_loads(messages: &mut Vec<Message>) {
         }
 
         match message {
-            Message::Assistant(content) => {
+            Message::Output(OutputMessage::Assistant(content)) => {
                 content.retain(|item| {
                     !matches!(
                         item,
@@ -68,7 +74,9 @@ fn prune_stale_skill_loads(messages: &mut Vec<Message>) {
                 });
                 !content.is_empty()
             }
-            Message::Tool(result) if result.name == LOAD_SKILL_TOOL_NAME => false,
+            Message::Output(OutputMessage::Tool(result)) if result.name == LOAD_SKILL_TOOL_NAME => {
+                false
+            }
             _ => true,
         }
     });
