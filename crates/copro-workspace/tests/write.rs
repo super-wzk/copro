@@ -298,7 +298,7 @@ async fn execute(
     router
         .execute(
             ToolCall {
-                id: "call-write".to_string(),
+                id: "call-write".into(),
                 name: "write".to_string(),
                 arguments,
             },

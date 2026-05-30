@@ -25,7 +25,7 @@ async fn fn_tool_wraps_async_functions() {
     let result = router
         .execute(
             ToolCall {
-                id: "call-echo".to_string(),
+                id: "call-echo".into(),
                 name: "echo".to_string(),
                 arguments: serde_json::Map::from_iter([("message".to_string(), json!("hello"))]),
             },
@@ -68,7 +68,7 @@ async fn fn_tool_wraps_async_closures() {
     let result = router
         .execute(
             ToolCall {
-                id: "call-length".to_string(),
+                id: "call-length".into(),
                 name: "length".to_string(),
                 arguments: serde_json::Map::from_iter([("message".to_string(), json!("hello"))]),
             },
@@ -208,7 +208,7 @@ impl ToolRouter for StaticRouter {
 
 fn call(name: &str) -> ToolCall {
     ToolCall {
-        id: format!("call-{name}"),
+        id: format!("call-{name}").into(),
         name: name.to_string(),
         arguments: serde_json::Map::new(),
     }

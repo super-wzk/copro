@@ -50,7 +50,7 @@ pub struct OpenAiResponsesModel {
 }
 
 impl Model for OpenAiResponsesModel {
-    fn stream(&self, request: GenerateRequest) -> ModelStream<'_> {
+    fn stream(&self, request: GenerateRequest) -> ModelStream {
         let body = match build_response_body(&self.model_id, &self.model_config, request) {
             Ok(body) => body,
             Err(error) => return Box::pin(futures_util::stream::once(async move { Err(error) })),

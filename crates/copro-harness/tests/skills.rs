@@ -135,7 +135,7 @@ async fn skill_tool_router_rejects_unknown_skill_tools() {
     let result = router
         .execute(
             ToolCall {
-                id: "call-2".to_string(),
+                id: "call-2".into(),
                 name: "echo".to_string(),
                 arguments: serde_json::Map::new(),
             },
@@ -189,7 +189,7 @@ fn skill(name: &str, description: &str) -> SkillDocument {
 
 fn load_skill_call(tool_name: &str, skill_name: &str) -> ToolCall {
     ToolCall {
-        id: "call-1".to_string(),
+        id: "call-1".into(),
         name: tool_name.to_string(),
         arguments: serde_json::Map::from_iter([(
             "name".to_string(),
@@ -200,7 +200,7 @@ fn load_skill_call(tool_name: &str, skill_name: &str) -> ToolCall {
 
 fn load_skill_result() -> Message {
     Message::Tool(ToolResult {
-        call_id: "call-1".to_string(),
+        call_id: "call-1".into(),
         name: "load_skill".to_string(),
         status: ToolResultStatus::Success,
         content: vec![InputContent::Text("full skill".to_string())],

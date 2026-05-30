@@ -67,12 +67,14 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let skill_tools = Arc::new(SkillToolRouter::new(Arc::clone(&skill_runtime)));
     let tool_router =
         CompositeToolRouter::new(vec![local_tools, workspace_tools.clone(), skill_tools]);
-    let mut agent = Agent::new(model, Arc::new(tool_router));
-    agent.hooks.push(Arc::new(SkillHook::new(skill_runtime)));
+    let agent = Agent::new(model, Arc::new(tool_router));
+    agent
+        .add_hook(Arc::new(SkillHook::new(skill_runtime)))
+        .await?;
 
     agent
-        .messages
-        .push(Message::System(vec![text(SYSTEM_PROMPT)]));
+        .push_message(Message::System(vec![text(SYSTEM_PROMPT)]))
+        .await?;
 
     println!("copro CLI — type /quit to exit, /clear to reset\n");
 
@@ -91,16 +93,18 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             break;
         }
         if input == "/clear" {
-            agent.messages.clear();
+            agent.clear_messages().await?;
             workspace_tools.clear_cache();
             agent
-                .messages
-                .push(Message::System(vec![text(SYSTEM_PROMPT)]));
+                .push_message(Message::System(vec![text(SYSTEM_PROMPT)]))
+                .await?;
             println!("[conversation cleared]\n");
             continue;
         }
 
-        agent.messages.push(Message::User(vec![text(&input)]));
+        agent
+            .push_message(Message::User(vec![text(&input)]))
+            .await?;
 
         let mut stream = agent.run_stream();
         let mut started_assistant = false;

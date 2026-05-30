@@ -252,7 +252,7 @@ fn call(args: serde_json::Value) -> ToolCall {
     };
 
     ToolCall {
-        id: "call-grep".to_string(),
+        id: "call-grep".into(),
         name: "grep".to_string(),
         arguments,
     }

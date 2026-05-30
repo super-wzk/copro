@@ -32,12 +32,12 @@ pub enum OutputContentDelta {
     },
 }
 
-pub type ModelStream<'a> = Pin<Box<dyn Stream<Item = Result<OutputStreamEvent>> + Send + 'a>>;
+pub type ModelStream = Pin<Box<dyn Stream<Item = Result<OutputStreamEvent>> + Send + 'static>>;
 
 /// A live model that can generate responses for requests.
 pub trait Model: Send + Sync {
     /// Starts a streaming generation request.
-    fn stream(&self, request: GenerateRequest) -> ModelStream<'_>;
+    fn stream(&self, request: GenerateRequest) -> ModelStream;
 }
 
 #[derive(Debug, Default)]
@@ -184,7 +184,9 @@ impl OutputContentState {
                 name,
                 arguments,
             } => Ok(OutputContent::ToolCall(ToolCall {
-                id: id.ok_or_else(|| Error::protocol("tool call is missing id"))?,
+                id: id
+                    .ok_or_else(|| Error::protocol("tool call is missing id"))?
+                    .into(),
                 name: name.ok_or_else(|| Error::protocol("tool call is missing name"))?,
                 arguments: parse_arguments(&arguments)?,
             })),

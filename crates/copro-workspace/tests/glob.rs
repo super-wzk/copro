@@ -129,7 +129,7 @@ fn call(args: serde_json::Value) -> ToolCall {
     };
 
     ToolCall {
-        id: "call-glob".to_string(),
+        id: "call-glob".into(),
         name: "glob".to_string(),
         arguments,
     }

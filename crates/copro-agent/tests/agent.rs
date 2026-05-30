@@ -19,7 +19,7 @@ use std::time::Duration;
 
 #[tokio::test]
 async fn run_stream_commits_assistant_message() {
-    let mut agent = test_agent(vec![
+    let agent = test_agent(vec![
         OutputStreamEvent::Delta {
             content_index: 0,
             delta: OutputContentDelta::Text("Hello".to_string()),
@@ -29,7 +29,12 @@ async fn run_stream_commits_assistant_message() {
             usage: None,
         },
     ]);
-    agent.messages = vec![Message::User(vec![InputContent::Text("hi".to_string())])];
+    agent
+        .replace_messages(vec![Message::User(vec![InputContent::Text(
+            "hi".to_string(),
+        )])])
+        .await
+        .unwrap();
 
     let events = agent
         .run_stream()
@@ -52,7 +57,7 @@ async fn run_stream_commits_assistant_message() {
         ]
     );
     assert_eq!(
-        agent.messages,
+        agent.messages().await.unwrap(),
         vec![
             Message::User(vec![InputContent::Text("hi".to_string())]),
             assistant,
@@ -62,7 +67,7 @@ async fn run_stream_commits_assistant_message() {
 
 #[tokio::test]
 async fn before_output_commit_hook_can_modify_output() {
-    let mut agent = test_agent(vec![
+    let agent = test_agent(vec![
         OutputStreamEvent::Delta {
             content_index: 0,
             delta: OutputContentDelta::Text("secret".to_string()),
@@ -72,7 +77,7 @@ async fn before_output_commit_hook_can_modify_output() {
             usage: None,
         },
     ]);
-    agent.hooks.push(Arc::new(RedactHook));
+    agent.add_hook(Arc::new(RedactHook)).await.unwrap();
 
     let events = agent
         .run_stream()
@@ -94,12 +99,15 @@ async fn before_output_commit_hook_can_modify_output() {
             },
         ]
     );
-    assert_eq!(agent.messages, vec![Message::Assistant(redacted)]);
+    assert_eq!(
+        agent.messages().await.unwrap(),
+        vec![Message::Assistant(redacted)]
+    );
 }
 
 #[tokio::test]
 async fn before_output_delta_hook_can_modify_stream_and_history() {
-    let mut agent = test_agent(vec![
+    let agent = test_agent(vec![
         OutputStreamEvent::Delta {
             content_index: 0,
             delta: OutputContentDelta::Text("secret".to_string()),
@@ -109,7 +117,7 @@ async fn before_output_delta_hook_can_modify_stream_and_history() {
             usage: None,
         },
     ]);
-    agent.hooks.push(Arc::new(DeltaRedactHook));
+    agent.add_hook(Arc::new(DeltaRedactHook)).await.unwrap();
 
     let events = agent
         .run_stream()
@@ -131,13 +139,16 @@ async fn before_output_delta_hook_can_modify_stream_and_history() {
             },
         ]
     );
-    assert_eq!(agent.messages, vec![Message::Assistant(redacted)]);
+    assert_eq!(
+        agent.messages().await.unwrap(),
+        vec![Message::Assistant(redacted)]
+    );
 }
 
 #[tokio::test]
 async fn after_turn_hook_runs_before_final_event_is_yielded() {
     let completed = Arc::new(AtomicUsize::new(0));
-    let mut agent = test_agent(vec![
+    let agent = test_agent(vec![
         OutputStreamEvent::Delta {
             content_index: 0,
             delta: OutputContentDelta::Text("done".to_string()),
@@ -147,9 +158,12 @@ async fn after_turn_hook_runs_before_final_event_is_yielded() {
             usage: None,
         },
     ]);
-    agent.hooks.push(Arc::new(TurnDoneHook {
-        completed: Arc::clone(&completed),
-    }));
+    agent
+        .add_hook(Arc::new(TurnDoneHook {
+            completed: Arc::clone(&completed),
+        }))
+        .await
+        .unwrap();
 
     let mut stream = agent.run_stream();
     assert!(matches!(
@@ -168,7 +182,7 @@ async fn after_turn_hook_runs_before_final_event_is_yielded() {
 #[tokio::test]
 async fn run_stream_stops_when_stop_signal_is_requested() {
     let completed = Arc::new(AtomicUsize::new(0));
-    let mut agent = test_agent(vec![
+    let agent = test_agent(vec![
         OutputStreamEvent::Delta {
             content_index: 0,
             delta: OutputContentDelta::Text("first".to_string()),
@@ -182,10 +196,13 @@ async fn run_stream_stops_when_stop_signal_is_requested() {
             usage: None,
         },
     ]);
-    agent.hooks.push(Arc::new(TurnDoneHook {
-        completed: Arc::clone(&completed),
-    }));
-    let stop_signal = agent.stop_signal.clone();
+    agent
+        .add_hook(Arc::new(TurnDoneHook {
+            completed: Arc::clone(&completed),
+        }))
+        .await
+        .unwrap();
+    let stop_signal = agent.stop_signal();
 
     {
         let mut stream = agent.run_stream();
@@ -201,20 +218,23 @@ async fn run_stream_stops_when_stop_signal_is_requested() {
     }
 
     assert_eq!(completed.load(Ordering::SeqCst), 1);
-    assert!(agent.messages.is_empty());
+    assert!(agent.messages().await.unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn run_stream_interrupts_pending_model_stream() {
     let completed = Arc::new(AtomicUsize::new(0));
-    let mut agent = Agent::new(
+    let agent = Agent::new(
         Arc::new(PendingAfterFirstDeltaModel),
         Arc::new(EmptyToolRouter),
     );
-    agent.hooks.push(Arc::new(TurnDoneHook {
-        completed: Arc::clone(&completed),
-    }));
-    let stop_signal = agent.stop_signal.clone();
+    agent
+        .add_hook(Arc::new(TurnDoneHook {
+            completed: Arc::clone(&completed),
+        }))
+        .await
+        .unwrap();
+    let stop_signal = agent.stop_signal();
 
     {
         let mut stream = agent.run_stream();
@@ -233,18 +253,18 @@ async fn run_stream_interrupts_pending_model_stream() {
     }
 
     assert_eq!(completed.load(Ordering::SeqCst), 1);
-    assert!(agent.messages.is_empty());
+    assert!(agent.messages().await.unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn stop_after_tool_call_commit_records_aborted_tool_result() {
-    let mut agent = Agent::new(
+    let agent = Agent::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
         Arc::new(DoubleToolRouter),
     );
-    let stop_signal = agent.stop_signal.clone();
+    let stop_signal = agent.stop_signal();
 
     {
         let mut stream = agent.run_stream();
@@ -275,7 +295,7 @@ async fn stop_after_tool_call_commit_records_aborted_tool_result() {
     }
 
     assert!(matches!(
-        agent.messages.as_slice(),
+        agent.messages().await.unwrap().as_slice(),
         [
             Message::Assistant(content),
             Message::Tool(ToolResult {
@@ -285,8 +305,8 @@ async fn stop_after_tool_call_commit_records_aborted_tool_result() {
                 content: result_content,
             })
         ] if matches!(content.as_slice(), [OutputContent::ToolCall(ToolCall { id, name, .. })]
-            if id == "call-1" && name == "double")
-            && call_id == "call-1"
+            if id.as_str() == "call-1" && name == "double")
+            && call_id.as_str() == "call-1"
             && name == "double"
             && result_content == &vec![InputContent::Text("aborted by user".to_string())]
     ));
@@ -298,13 +318,13 @@ async fn stop_during_tool_execution_still_commits_tool_result() {
         calls: AtomicUsize::new(0),
     });
     let stop_signal = StopSignal::new();
-    let mut agent = Agent::new(
+    let agent = Agent::with_stop_signal(
         model.clone(),
         Arc::new(StopDuringToolRouter {
             stop_signal: stop_signal.clone(),
         }),
+        stop_signal,
     );
-    agent.stop_signal = stop_signal;
 
     let events = agent
         .run_stream()
@@ -325,7 +345,7 @@ async fn stop_during_tool_execution_still_commits_tool_result() {
     )));
     assert_eq!(model.calls.load(Ordering::SeqCst), 1);
     assert!(matches!(
-        agent.messages.as_slice(),
+        agent.messages().await.unwrap().as_slice(),
         [
             Message::Assistant(_),
             Message::Tool(ToolResult {
@@ -338,7 +358,7 @@ async fn stop_during_tool_execution_still_commits_tool_result() {
 
 #[tokio::test]
 async fn run_stream_awaits_async_tool_router() {
-    let mut agent = Agent::new(
+    let agent = Agent::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
@@ -359,7 +379,7 @@ async fn run_stream_awaits_async_tool_router() {
             matches!(
                 event,
                 AgentEvent::ToolCallStarted(ToolCall { id, name, .. })
-                    if id == "call-1" && name == "double"
+                    if id.as_str() == "call-1" && name == "double"
             )
         })
         .unwrap();
@@ -391,7 +411,7 @@ async fn run_stream_awaits_async_tool_router() {
 
 #[tokio::test]
 async fn tool_task_panic_is_committed_as_error_tool_result() {
-    let mut agent = Agent::new(
+    let agent = Agent::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
@@ -413,7 +433,7 @@ async fn tool_task_panic_is_committed_as_error_tool_result() {
             name,
             status: ToolResultStatus::Error,
             content,
-        }) if call_id == "call-1"
+        }) if call_id.as_str() == "call-1"
             && name == "double"
             && content == &vec![InputContent::Text("tool task panicked: boom".to_string())]
     )));
@@ -426,7 +446,7 @@ async fn tool_task_panic_is_committed_as_error_tool_result() {
         }) if content == &vec![OutputContent::Text("done".to_string())]
     ));
     assert!(matches!(
-        agent.messages.as_slice(),
+        agent.messages().await.unwrap().as_slice(),
         [
             Message::Assistant(assistant_content),
             Message::Tool(ToolResult {
@@ -437,8 +457,8 @@ async fn tool_task_panic_is_committed_as_error_tool_result() {
             }),
             Message::Assistant(done_content),
         ] if matches!(assistant_content.as_slice(), [OutputContent::ToolCall(ToolCall { id, name, .. })]
-            if id == "call-1" && name == "double")
-            && call_id == "call-1"
+            if id.as_str() == "call-1" && name == "double")
+            && call_id.as_str() == "call-1"
             && name == "double"
             && content == &vec![InputContent::Text("tool task panicked: boom".to_string())]
             && done_content == &vec![OutputContent::Text("done".to_string())]
@@ -449,7 +469,7 @@ async fn tool_task_panic_is_committed_as_error_tool_result() {
 async fn run_stream_batches_parallel_tools_behind_serial_barriers() {
     let router = Arc::new(ConcurrentToolRouter::default());
     let tool_router: Arc<dyn ToolRouter> = router.clone();
-    let mut agent = Agent::new(
+    let agent = Agent::new(
         Arc::new(MultiToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
@@ -495,15 +515,29 @@ async fn build_request_carries_agent_baseline_config() {
     let model = Arc::new(CapturingModel {
         captured: Arc::clone(&captured),
     });
-    let mut agent = Agent::new(model, Arc::new(EmptyToolRouter));
-    agent.messages = vec![Message::User(vec![InputContent::Text("hi".to_string())])];
-    agent.options = GenerateRequestOptions {
-        temperature: Some(0.5),
-        max_tokens: Some(256),
-        ..GenerateRequestOptions::default()
-    };
-    agent.tool_choice = Some(ToolChoice::Required);
-    agent.hosted_tools = vec![HostedToolSpec::new("web_search")];
+    let agent = Agent::new(model, Arc::new(EmptyToolRouter));
+    agent
+        .replace_messages(vec![Message::User(vec![InputContent::Text(
+            "hi".to_string(),
+        )])])
+        .await
+        .unwrap();
+    agent
+        .set_options(GenerateRequestOptions {
+            temperature: Some(0.5),
+            max_tokens: Some(256),
+            ..GenerateRequestOptions::default()
+        })
+        .await
+        .unwrap();
+    agent
+        .set_tool_choice(Some(ToolChoice::Required))
+        .await
+        .unwrap();
+    agent
+        .set_hosted_tools(vec![HostedToolSpec::new("web_search")])
+        .await
+        .unwrap();
 
     agent
         .run_stream()
@@ -529,10 +563,21 @@ async fn before_request_hook_overrides_agent_baseline_config() {
     let model = Arc::new(CapturingModel {
         captured: Arc::clone(&captured),
     });
-    let mut agent = Agent::new(model, Arc::new(EmptyToolRouter));
-    agent.messages = vec![Message::User(vec![InputContent::Text("hi".to_string())])];
-    agent.tool_choice = Some(ToolChoice::Required);
-    agent.hooks.push(Arc::new(ToolChoiceOverrideHook));
+    let agent = Agent::new(model, Arc::new(EmptyToolRouter));
+    agent
+        .replace_messages(vec![Message::User(vec![InputContent::Text(
+            "hi".to_string(),
+        )])])
+        .await
+        .unwrap();
+    agent
+        .set_tool_choice(Some(ToolChoice::Required))
+        .await
+        .unwrap();
+    agent
+        .add_hook(Arc::new(ToolChoiceOverrideHook))
+        .await
+        .unwrap();
 
     agent
         .run_stream()
@@ -551,7 +596,7 @@ struct CapturingModel {
 }
 
 impl Model for CapturingModel {
-    fn stream(&self, request: GenerateRequest) -> ModelStream<'_> {
+    fn stream(&self, request: GenerateRequest) -> ModelStream {
         *self.captured.lock().unwrap() = Some(request);
         Box::pin(futures_util::stream::iter(
             vec![OutputStreamEvent::Finished {
@@ -773,7 +818,7 @@ struct ToolThenDoneModel {
 }
 
 impl Model for ToolThenDoneModel {
-    fn stream(&self, _request: GenerateRequest) -> ModelStream<'_> {
+    fn stream(&self, _request: GenerateRequest) -> ModelStream {
         let events = match self.calls.fetch_add(1, Ordering::SeqCst) {
             0 => vec![
                 OutputStreamEvent::Delta {
@@ -809,7 +854,7 @@ struct MultiToolThenDoneModel {
 }
 
 impl Model for MultiToolThenDoneModel {
-    fn stream(&self, _request: GenerateRequest) -> ModelStream<'_> {
+    fn stream(&self, _request: GenerateRequest) -> ModelStream {
         let events = match self.calls.fetch_add(1, Ordering::SeqCst) {
             0 => vec![
                 tool_call_delta(0, "call-p1", "p1"),
@@ -851,7 +896,7 @@ fn tool_call_delta(content_index: usize, id: &str, name: &str) -> OutputStreamEv
 struct PendingAfterFirstDeltaModel;
 
 impl Model for PendingAfterFirstDeltaModel {
-    fn stream(&self, _request: GenerateRequest) -> ModelStream<'_> {
+    fn stream(&self, _request: GenerateRequest) -> ModelStream {
         let first = futures_util::stream::once(async {
             Ok(OutputStreamEvent::Delta {
                 content_index: 0,
@@ -867,7 +912,7 @@ struct TestModel {
 }
 
 impl Model for TestModel {
-    fn stream(&self, _request: GenerateRequest) -> ModelStream<'_> {
+    fn stream(&self, _request: GenerateRequest) -> ModelStream {
         Box::pin(futures_util::stream::iter(
             self.events.clone().into_iter().map(Ok),
         ))

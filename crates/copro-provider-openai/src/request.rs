@@ -471,7 +471,7 @@ mod tests {
     #[test]
     fn maps_tool_output_messages() {
         let items = build_message_items(Message::Tool(ToolResult {
-            call_id: "call_123".to_string(),
+            call_id: "call_123".into(),
             name: "weather".to_string(),
             status: ToolResultStatus::Success,
             content: vec![InputContent::Text("sunny".to_string())],
@@ -487,7 +487,7 @@ mod tests {
     #[test]
     fn maps_multiple_text_tool_output_as_content_array() {
         let items = build_message_items(Message::Tool(ToolResult {
-            call_id: "call_123".to_string(),
+            call_id: "call_123".into(),
             name: "multi_text".to_string(),
             status: ToolResultStatus::Success,
             content: vec![
@@ -508,7 +508,7 @@ mod tests {
     #[test]
     fn maps_tool_output_images() {
         let items = build_message_items(Message::Tool(ToolResult {
-            call_id: "call_123".to_string(),
+            call_id: "call_123".into(),
             name: "inspect_image".to_string(),
             status: ToolResultStatus::Success,
             content: vec![

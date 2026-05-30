@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 copro-api.workspace = true
 async-stream.workspace = true
+derive_more.workspace = true
 futures-util.workspace = true
 serde.workspace = true
 tokio.workspace = true
