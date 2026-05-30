@@ -210,6 +210,8 @@ impl ToolResultControlPoint {
 
 `AgentTurn` 是单 turn 的纯状态机。
 
+当前实现保持同步、无 IO、无 cancellation token；完整 `next_action()` / `apply_outcome()` 拆分属于后续机械重构，不和本轮 control 语义迁移混在一起。
+
 职责：
 
 - 维护 turn 内部 pending 数据，例如 tools、request、model output、tool calls、tool results。

@@ -17,6 +17,7 @@
 - `Pause` / `Resume` 已形成 boundary 和 in-flight pause request 的 `RunPaused` -> `RunResumed` 事件链。
 - `AbortTurn` / `AbortRun` 已在事件层区分，in-flight `preempt()` 已产生 `RunPreempted`。
 - `AgentRunHandle` 已加入单 driver lease，避免 `events()` / `step()` 并发抢同一 receiver。
+- `AgentTurn` 纯状态机化已评估：当前已无 async/IO/cancellation token；进一步 `next_action()` / `apply_outcome()` 拆分暂缓为后续机械重构。
 - `run_stream()` 已基于 `AgentRunHandle` auto mode 实现。
 - `AgentControl` 已支持 request、model delta、assistant output、tool call、tool result 的改写/拒绝。
 - `AgentHook` / `AgentHooks` / `ToolCallDecision` 已从当前工作区代码中移除。
@@ -165,9 +166,9 @@
 - 测试覆盖合法和非法替换。
 - 常规 typed API 下无法构造 `call_id` / `name` 不匹配的 `ToolResult` replacement。
 
-### 7. AgentTurn 仍未完全纯状态机化
+### 7. AgentTurn 仍未完全纯状态机化（评估完成，暂缓大重构）
 
-问题：
+原问题：
 
 - `AgentRun` 仍直接驱动较多 phase 和执行编排逻辑。
 - 文档中的 `next_action()` / `apply_outcome()` 尚未成为实际实现。
