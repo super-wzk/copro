@@ -7,14 +7,12 @@ pub mod runtime;
 mod agent;
 mod context;
 mod event;
-mod hook;
 mod run;
 mod tools;
 mod turn;
 
 pub use agent::Agent;
 pub use event::{AgentEvent, AgentStream};
-pub use hook::{AgentHook, AgentHooks, ToolCallDecision};
 pub use run::{
     AgentAction, AgentControl, AgentControlKind, AgentControlPoint, AgentInterruptReason,
     AgentOutcome, AgentRunHandle, AgentRunId, AgentRunState, AgentStep, AgentStepId,

@@ -1,6 +1,5 @@
 use crate::context::{AgentCommand, AgentContext};
 use crate::event::AgentStream;
-use crate::hook::AgentHook;
 use crate::run::AgentRunHandle;
 use crate::runtime::StopSignal;
 use crate::tools::ToolRouter;
@@ -91,11 +90,6 @@ impl Agent {
 
     pub async fn messages(&self) -> Result<Vec<Message>> {
         self.call(|reply| AgentCommand::Messages { reply }).await
-    }
-
-    pub async fn add_hook(&self, hook: Arc<dyn AgentHook>) -> Result<()> {
-        self.call(|reply| AgentCommand::AddHook { hook, reply })
-            .await
     }
 
     pub async fn set_options(&self, options: GenerateRequestOptions) -> Result<()> {

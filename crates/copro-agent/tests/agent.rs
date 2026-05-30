@@ -1,6 +1,6 @@
 use copro_agent::{
-    Agent, AgentAction, AgentControl, AgentEvent, AgentHook, AgentOutcome, AgentRunState,
-    CancellationToken, StopSignal, ToolExecutionPolicy, ToolRouter, async_trait,
+    Agent, AgentAction, AgentControl, AgentEvent, AgentOutcome, AgentRunState, CancellationToken,
+    StopSignal, ToolExecutionPolicy, ToolRouter, async_trait,
 };
 use copro_api::error::Result;
 use copro_api::message::{
@@ -102,126 +102,7 @@ async fn run_stream_commits_assistant_message() {
 }
 
 #[tokio::test]
-async fn before_output_commit_hook_can_modify_output() {
-    let agent = test_agent(vec![
-        OutputStreamEvent::Delta {
-            content_index: 0,
-            delta: OutputContentDelta::Text("secret".to_string()),
-        },
-        OutputStreamEvent::Finished {
-            reason: FinishReason::Stop,
-            usage: None,
-        },
-    ]);
-    agent.add_hook(Arc::new(RedactHook)).await.unwrap();
-
-    let events = agent
-        .run_stream()
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
-
-    let redacted = vec![OutputContent::Text("redacted".to_string())];
-    assert_eq!(
-        stream_events(&events),
-        vec![
-            StreamEvent::ModelDelta(OutputContentDelta::Text("secret".to_string())),
-            StreamEvent::AssistantCommitted {
-                content: redacted.clone(),
-                reason: FinishReason::Stop,
-                usage: None,
-            },
-        ]
-    );
-    assert_eq!(
-        agent.messages().await.unwrap(),
-        vec![Message::Assistant(redacted)]
-    );
-}
-
-#[tokio::test]
-async fn before_output_delta_hook_can_modify_stream_and_history() {
-    let agent = test_agent(vec![
-        OutputStreamEvent::Delta {
-            content_index: 0,
-            delta: OutputContentDelta::Text("secret".to_string()),
-        },
-        OutputStreamEvent::Finished {
-            reason: FinishReason::Stop,
-            usage: None,
-        },
-    ]);
-    agent.add_hook(Arc::new(DeltaRedactHook)).await.unwrap();
-
-    let events = agent
-        .run_stream()
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
-
-    let redacted = vec![OutputContent::Text("redacted".to_string())];
-    assert_eq!(
-        stream_events(&events),
-        vec![
-            StreamEvent::ModelDelta(OutputContentDelta::Text("redacted".to_string())),
-            StreamEvent::AssistantCommitted {
-                content: redacted.clone(),
-                reason: FinishReason::Stop,
-                usage: None,
-            },
-        ]
-    );
-    assert_eq!(
-        agent.messages().await.unwrap(),
-        vec![Message::Assistant(redacted)]
-    );
-}
-
-#[tokio::test]
-async fn after_turn_hook_runs_before_final_event_is_yielded() {
-    let completed = Arc::new(AtomicUsize::new(0));
-    let agent = test_agent(vec![
-        OutputStreamEvent::Delta {
-            content_index: 0,
-            delta: OutputContentDelta::Text("done".to_string()),
-        },
-        OutputStreamEvent::Finished {
-            reason: FinishReason::Stop,
-            usage: None,
-        },
-    ]);
-    agent
-        .add_hook(Arc::new(TurnDoneHook {
-            completed: Arc::clone(&completed),
-        }))
-        .await
-        .unwrap();
-
-    let mut stream = agent.run_stream();
-    let mut saw_delta = false;
-    while let Some(event) = stream.next().await.transpose().unwrap() {
-        match event {
-            AgentEvent::ModelDelta { .. } => {
-                saw_delta = true;
-                assert_eq!(completed.load(Ordering::SeqCst), 0);
-            }
-            AgentEvent::AssistantCommitted { .. } => {
-                assert!(saw_delta);
-                assert_eq!(completed.load(Ordering::SeqCst), 1);
-                break;
-            }
-            _ => {}
-        }
-    }
-}
-
-#[tokio::test]
 async fn run_stream_stops_when_stop_signal_is_requested() {
-    let completed = Arc::new(AtomicUsize::new(0));
     let agent = test_agent(vec![
         OutputStreamEvent::Delta {
             content_index: 0,
@@ -236,12 +117,6 @@ async fn run_stream_stops_when_stop_signal_is_requested() {
             usage: None,
         },
     ]);
-    agent
-        .add_hook(Arc::new(TurnDoneHook {
-            completed: Arc::clone(&completed),
-        }))
-        .await
-        .unwrap();
     let stop_signal = agent.stop_signal();
 
     {
@@ -267,23 +142,15 @@ async fn run_stream_stops_when_stop_signal_is_requested() {
         assert!(stream_events(&remaining).is_empty());
     }
 
-    assert_eq!(completed.load(Ordering::SeqCst), 1);
     assert!(agent.messages().await.unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn run_stream_interrupts_pending_model_stream() {
-    let completed = Arc::new(AtomicUsize::new(0));
     let agent = Agent::new(
         Arc::new(PendingAfterFirstDeltaModel),
         Arc::new(EmptyToolRouter),
     );
-    agent
-        .add_hook(Arc::new(TurnDoneHook {
-            completed: Arc::clone(&completed),
-        }))
-        .await
-        .unwrap();
     let stop_signal = agent.stop_signal();
 
     {
@@ -308,7 +175,6 @@ async fn run_stream_interrupts_pending_model_stream() {
         assert!(stream_events(&remaining).is_empty());
     }
 
-    assert_eq!(completed.load(Ordering::SeqCst), 1);
     assert!(agent.messages().await.unwrap().is_empty());
 }
 
@@ -1143,40 +1009,6 @@ async fn build_request_carries_agent_baseline_config() {
     );
 }
 
-#[tokio::test]
-async fn before_request_hook_overrides_agent_baseline_config() {
-    let captured = Arc::new(Mutex::new(None));
-    let model = Arc::new(CapturingModel {
-        captured: Arc::clone(&captured),
-    });
-    let agent = Agent::new(model, Arc::new(EmptyToolRouter));
-    agent
-        .replace_messages(vec![Message::User(vec![InputContent::Text(
-            "hi".to_string(),
-        )])])
-        .await
-        .unwrap();
-    agent
-        .set_tool_choice(Some(ToolChoice::Required))
-        .await
-        .unwrap();
-    agent
-        .add_hook(Arc::new(ToolChoiceOverrideHook))
-        .await
-        .unwrap();
-
-    agent
-        .run_stream()
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
-
-    let request = captured.lock().unwrap().take().expect("request captured");
-    assert_eq!(request.tool_choice, Some(ToolChoice::None));
-}
-
 struct CapturingModel {
     captured: Arc<Mutex<Option<GenerateRequest>>>,
 }
@@ -1192,52 +1024,6 @@ impl Model for CapturingModel {
             .into_iter()
             .map(Ok),
         ))
-    }
-}
-
-struct ToolChoiceOverrideHook;
-
-#[async_trait]
-impl AgentHook for ToolChoiceOverrideHook {
-    async fn before_request(&self, request: &mut GenerateRequest) -> Result<()> {
-        request.tool_choice = Some(ToolChoice::None);
-        Ok(())
-    }
-}
-
-struct RedactHook;
-
-#[async_trait]
-impl AgentHook for RedactHook {
-    async fn before_output_commit(&self, content: &mut Vec<OutputContent>) -> Result<()> {
-        *content = vec![OutputContent::Text("redacted".to_string())];
-        Ok(())
-    }
-}
-
-struct DeltaRedactHook;
-
-#[async_trait]
-impl AgentHook for DeltaRedactHook {
-    async fn before_output_delta(
-        &self,
-        _content_index: usize,
-        delta: &mut OutputContentDelta,
-    ) -> Result<()> {
-        *delta = OutputContentDelta::Text("redacted".to_string());
-        Ok(())
-    }
-}
-
-struct TurnDoneHook {
-    completed: Arc<AtomicUsize>,
-}
-
-#[async_trait]
-impl AgentHook for TurnDoneHook {
-    async fn after_turn(&self, _messages: &[Message]) -> Result<()> {
-        self.completed.fetch_add(1, Ordering::SeqCst);
-        Ok(())
     }
 }
 

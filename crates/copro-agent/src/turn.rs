@@ -135,7 +135,6 @@ impl AgentTurn {
             content: output.content,
             reason: output.reason,
             usage: output.usage,
-            ends_turn,
         })
     }
 
@@ -238,7 +237,6 @@ pub(crate) struct CommittedOutput {
     pub(crate) content: Vec<OutputContent>,
     pub(crate) reason: FinishReason,
     pub(crate) usage: Option<Usage>,
-    pub(crate) ends_turn: bool,
 }
 
 pub(crate) struct PendingToolResults {

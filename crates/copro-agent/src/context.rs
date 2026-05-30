@@ -1,5 +1,4 @@
 use crate::event::AgentEvent;
-use crate::hook::{AgentHook, AgentHooks};
 use crate::run::{AgentControl, AgentRun, AgentRunId, AgentTurnId};
 use crate::runtime::StopSignal;
 use crate::tools::ToolRouter;
@@ -14,7 +13,6 @@ use tokio::sync::{mpsc, oneshot};
 pub(crate) struct AgentContext {
     pub(crate) model: Arc<dyn Model>,
     pub(crate) tools: Arc<dyn ToolRouter>,
-    pub(crate) hooks: AgentHooks,
     pub(crate) stop_signal: StopSignal,
     pub(crate) messages: Vec<Message>,
     pub(crate) tool_choice: Option<ToolChoice>,
@@ -33,7 +31,6 @@ impl AgentContext {
         Self {
             model,
             tools,
-            hooks: AgentHooks::new(),
             stop_signal,
             messages: Vec::new(),
             tool_choice: None,
@@ -77,10 +74,6 @@ impl AgentContext {
                 AgentCommand::Messages { reply } => {
                     let _ = reply.send(Ok(self.messages.clone()));
                 }
-                AgentCommand::AddHook { hook, reply } => {
-                    self.hooks.push(hook);
-                    let _ = reply.send(Ok(()));
-                }
                 AgentCommand::SetOptions { options, reply } => {
                     self.options = options;
                     let _ = reply.send(Ok(()));
@@ -119,10 +112,6 @@ pub(crate) enum AgentCommand {
     Messages {
         reply: oneshot::Sender<Result<Vec<Message>>>,
     },
-    AddHook {
-        hook: Arc<dyn AgentHook>,
-        reply: oneshot::Sender<Result<()>>,
-    },
     SetOptions {
         options: GenerateRequestOptions,
         reply: oneshot::Sender<Result<()>>,
@@ -138,6 +127,6 @@ pub(crate) enum AgentCommand {
 }
 
 pub(crate) enum AgentStreamItem {
-    Event(AgentEvent, oneshot::Sender<AgentControl>),
+    Event(Box<AgentEvent>, oneshot::Sender<AgentControl>),
     Error(copro_api::error::Error),
 }

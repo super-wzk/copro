@@ -1,6 +1,5 @@
 use crate::context::{AgentContext, AgentStreamItem};
 use crate::event::{AgentEvent, AgentStream};
-use crate::hook::ToolCallDecision;
 use crate::runtime::StopSignal;
 use crate::tools::{ToolExecutionPolicy, ToolRouter};
 use crate::turn::{
@@ -272,6 +271,7 @@ impl AgentRunHandle {
 
             match item {
                 AgentStreamItem::Event(event, ack) => {
+                    let event = *event;
                     events.push(event.clone());
                     if let AgentEvent::StepCompleted { step, outcome } = event {
                         let mut state_inner = self.state.lock().await;
@@ -387,6 +387,7 @@ impl AgentRunHandle {
 
         match self.events.lock().await.recv().await {
             Some(AgentStreamItem::Event(event, ack)) => {
+                let event = *event;
                 self.state.lock().await.observe_event(&event);
                 let _ = ack.send(AgentControl::Continue);
                 Ok(Some(event))
@@ -514,7 +515,6 @@ impl<'a> AgentRun<'a> {
     async fn run_turn_inner(&mut self, events: &mpsc::Sender<AgentStreamItem>) -> Result<()> {
         let model = Arc::clone(&self.context.model);
         let tools = Arc::clone(&self.context.tools);
-        let hooks = self.context.hooks.clone();
         let stop_signal = self.context.stop_signal.clone();
         let tool_choice = self.context.tool_choice.clone();
         let hosted_tools = self.context.hosted_tools.clone();
@@ -530,7 +530,6 @@ impl<'a> AgentRun<'a> {
             return Ok(());
         }
 
-        hooks.before_turn(&mut self.context.messages).await?;
         let mut turn = AgentTurn::new();
 
         loop {
@@ -538,7 +537,6 @@ impl<'a> AgentRun<'a> {
                 break;
             }
             if stop_signal.is_requested() && !turn.needs_tool_result_commit() {
-                hooks.after_turn(&self.context.messages).await?;
                 turn.finish();
                 break;
             }
@@ -574,7 +572,6 @@ impl<'a> AgentRun<'a> {
                         tool_choice.clone(),
                         options.clone(),
                     );
-                    hooks.before_request(&mut request).await?;
                     let step_id = step.id;
                     let Some(control) = emit_step_completed(
                         events,
@@ -647,7 +644,6 @@ impl<'a> AgentRun<'a> {
                         {
                             return Ok(());
                         }
-                        hooks.after_turn(&self.context.messages).await?;
                         turn.finish();
                         break;
                     };
@@ -655,9 +651,8 @@ impl<'a> AgentRun<'a> {
                     match event {
                         OutputStreamEvent::Delta {
                             content_index,
-                            mut delta,
+                            delta,
                         } => {
-                            hooks.before_output_delta(content_index, &mut delta).await?;
                             let step_id = step.id;
                             let Some(control) = emit_step_completed(
                                 events,
@@ -708,7 +703,7 @@ impl<'a> AgentRun<'a> {
                                 step,
                                 AgentOutcome::ModelOutputFinished {
                                     content: output.content.clone(),
-                                    reason: output.reason.clone(),
+                                    reason: output.reason,
                                     usage: output.usage.clone(),
                                 },
                             )
@@ -732,13 +727,12 @@ impl<'a> AgentRun<'a> {
 
                             let step = clock.next_step(AgentAction::CommitAssistant {
                                 content: output.content.clone(),
-                                reason: output.reason.clone(),
+                                reason: output.reason,
                                 usage: output.usage.clone(),
                             });
                             if !emit_step_started(events, &step).await {
                                 return Ok(());
                             }
-                            hooks.before_output_commit(&mut output.content).await?;
                             let committed = turn.commit_output(output)?;
                             let message_index = self.context.messages.len();
                             self.context
@@ -746,15 +740,11 @@ impl<'a> AgentRun<'a> {
                                 .push(normalize_for_history(Message::Assistant(
                                     committed.content.clone(),
                                 )));
-                            hooks.after_output_commit(&committed.content).await?;
-                            if committed.ends_turn {
-                                hooks.after_turn(&self.context.messages).await?;
-                            }
                             model_stream = None;
                             let outcome = AgentOutcome::AssistantCommitted {
                                 message_index,
                                 content: committed.content.clone(),
-                                reason: committed.reason.clone(),
+                                reason: committed.reason,
                                 usage: committed.usage.clone(),
                             };
                             if !emit(
@@ -783,28 +773,11 @@ impl<'a> AgentRun<'a> {
                     if stop_signal.is_requested() {
                         turn.abort_pending_tools()?;
                     } else {
-                        let mut tool_calls = turn.tool_calls()?;
-                        hooks.before_tool_plan(&mut tool_calls).await?;
                         let mut plan = Vec::new();
 
-                        for mut tool in tool_calls {
-                            let original_tool = tool.clone();
-                            let decision = hooks.before_tool_call(&mut tool).await?;
-                            replace_tool_call_in_history(
-                                &mut self.context.messages,
-                                &original_tool,
-                                tool.clone(),
-                            );
-                            let mut item = match decision {
-                                ToolCallDecision::Allow => {
-                                    let policy = tools.execution_policy(&tool).await?;
-                                    ToolPlanItem::pending(tool, policy)
-                                }
-                                ToolCallDecision::Reject { reason } => {
-                                    let result = rejected_tool_result(&tool, reason);
-                                    ToolPlanItem::completed(tool, result)
-                                }
-                            };
+                        for tool in turn.tool_calls()? {
+                            let policy = tools.execution_policy(&tool).await?;
+                            let mut item = ToolPlanItem::pending(tool, policy);
 
                             let step = clock.next_step(AgentAction::PlanTool {
                                 tool: item.tool.clone(),
@@ -1002,7 +975,6 @@ impl<'a> AgentRun<'a> {
                         if !emit_step_started(events, &step).await {
                             return Ok(());
                         }
-                        hooks.before_tool_result_commit(&tool, &mut result).await?;
                         let message_index = self.context.messages.len();
                         let step_id = step.id;
                         let Some(control) = emit_step_completed(
@@ -1030,7 +1002,6 @@ impl<'a> AgentRun<'a> {
                             }
                         }
                         self.context.messages.push(Message::Tool(result.clone()));
-                        hooks.after_tool_result_commit(&tool, &result).await?;
                         if !emit(
                             events,
                             AgentEvent::ToolResultCommitted {
@@ -1047,9 +1018,6 @@ impl<'a> AgentRun<'a> {
                     }
 
                     let finish_turn = pending.finish_after_commit || stop_signal.is_requested();
-                    if finish_turn {
-                        hooks.after_turn(&self.context.messages).await?;
-                    }
                     turn.finish_tool_result_commit(finish_turn);
                 }
                 AgentTurnPhase::Finished => break,
@@ -1230,7 +1198,7 @@ async fn emit_step_completed(
     let (ack, rx) = oneshot::channel();
     if events
         .send(AgentStreamItem::Event(
-            AgentEvent::StepCompleted { step, outcome },
+            Box::new(AgentEvent::StepCompleted { step, outcome }),
             ack,
         ))
         .await
@@ -1338,7 +1306,7 @@ async fn emit_tool_finished(
 async fn emit(events: &mpsc::Sender<AgentStreamItem>, event: AgentEvent) -> bool {
     let (ack, rx) = oneshot::channel();
     if events
-        .send(AgentStreamItem::Event(event, ack))
+        .send(AgentStreamItem::Event(Box::new(event), ack))
         .await
         .is_err()
     {

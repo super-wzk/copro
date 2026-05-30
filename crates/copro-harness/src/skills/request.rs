@@ -1,27 +1,22 @@
 use super::SkillRuntime;
 use super::tool::LOAD_SKILL_TOOL_NAME;
-use copro_agent::AgentHook;
-use copro_api::async_trait;
 use copro_api::error::Result;
 use copro_api::message::{InputContent, Message, OutputContent};
 use copro_api::request::GenerateRequest;
 use std::sync::Arc;
 
-/// Hook that injects the available-skills prompt into every model request.
+/// Applies skill context to model requests before they are submitted.
 #[derive(Clone)]
-pub struct SkillHook {
+pub struct SkillRequestInjector {
     runtime: Arc<SkillRuntime>,
 }
 
-impl SkillHook {
+impl SkillRequestInjector {
     pub fn new(runtime: Arc<SkillRuntime>) -> Self {
         Self { runtime }
     }
-}
 
-#[async_trait]
-impl AgentHook for SkillHook {
-    async fn before_request(&self, request: &mut GenerateRequest) -> Result<()> {
+    pub async fn prepare_request(&self, request: &mut GenerateRequest) -> Result<()> {
         prune_stale_skill_loads(&mut request.messages);
 
         if let Some(prompt) = self.runtime.available_skills_prompt().await? {

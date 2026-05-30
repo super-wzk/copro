@@ -1,4 +1,4 @@
-use copro_agent::{AgentHook, CancellationToken, ToolRouter};
+use copro_agent::{CancellationToken, ToolRouter};
 use copro_api::async_trait;
 use copro_api::error::{Error, Result};
 use copro_api::message::{
@@ -6,16 +6,16 @@ use copro_api::message::{
 };
 use copro_api::request::{GenerateRequest, GenerateRequestOptions};
 use copro_harness::skills::{
-    SkillDocument, SkillHook, SkillRuntime, SkillStore, SkillSummary, SkillToolRouter,
+    SkillDocument, SkillRequestInjector, SkillRuntime, SkillStore, SkillSummary, SkillToolRouter,
 };
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[tokio::test]
-async fn hook_injects_available_skills_after_initial_instructions() {
+async fn request_injector_adds_available_skills_after_initial_instructions() {
     let runtime = runtime_with(vec![skill("test-skill", "Use for testing.")]);
-    let hook = SkillHook::new(runtime);
+    let injector = SkillRequestInjector::new(runtime);
     let mut request = GenerateRequest {
         messages: vec![
             Message::System(vec![InputContent::Text("system".to_string())]),
@@ -27,7 +27,7 @@ async fn hook_injects_available_skills_after_initial_instructions() {
         options: GenerateRequestOptions::default(),
     };
 
-    hook.before_request(&mut request).await.unwrap();
+    injector.prepare_request(&mut request).await.unwrap();
 
     assert!(matches!(request.messages.first(), Some(Message::System(_))));
     assert!(matches!(
@@ -38,9 +38,9 @@ async fn hook_injects_available_skills_after_initial_instructions() {
 }
 
 #[tokio::test]
-async fn hook_prunes_loaded_skill_context_from_previous_turns() {
+async fn request_injector_prunes_loaded_skill_context_from_previous_turns() {
     let runtime = runtime_with(vec![skill("test-skill", "Use for testing.")]);
-    let hook = SkillHook::new(runtime);
+    let injector = SkillRequestInjector::new(runtime);
     let mut request = GenerateRequest {
         messages: vec![
             Message::System(vec![InputContent::Text("system".to_string())]),
@@ -59,7 +59,7 @@ async fn hook_prunes_loaded_skill_context_from_previous_turns() {
         options: GenerateRequestOptions::default(),
     };
 
-    hook.before_request(&mut request).await.unwrap();
+    injector.prepare_request(&mut request).await.unwrap();
 
     assert_eq!(request.messages.len(), 5);
     assert!(matches!(request.messages.first(), Some(Message::System(_))));
@@ -79,9 +79,9 @@ async fn hook_prunes_loaded_skill_context_from_previous_turns() {
 }
 
 #[tokio::test]
-async fn hook_keeps_loaded_skill_context_in_current_turn() {
+async fn request_injector_keeps_loaded_skill_context_in_current_turn() {
     let runtime = runtime_with(vec![skill("test-skill", "Use for testing.")]);
-    let hook = SkillHook::new(runtime);
+    let injector = SkillRequestInjector::new(runtime);
     let mut request = GenerateRequest {
         messages: vec![
             Message::System(vec![InputContent::Text("system".to_string())]),
@@ -98,7 +98,7 @@ async fn hook_keeps_loaded_skill_context_in_current_turn() {
         options: GenerateRequestOptions::default(),
     };
 
-    hook.before_request(&mut request).await.unwrap();
+    injector.prepare_request(&mut request).await.unwrap();
 
     assert!(has_load_skill_tool_call(&request.messages));
     assert!(has_load_skill_result(&request.messages));

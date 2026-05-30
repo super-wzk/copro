@@ -736,9 +736,9 @@ AgentStrategy   // 对 model/tool/memory 使用策略进行配置
 
 ### Phase 6: 替换 hook/control 模型
 
-- 不继续扩展传统 `AgentHook`。
+- 从 `copro-agent` 核心移除传统 `AgentHook`。
 - 在 step boundary 支持 `AgentControl`。
-- 迁移 request/output/tool/result 改写逻辑。
+- request/output/tool/result 改写逻辑通过 `AgentRunHandle` control 实现。
 - stale control 和非法 control 必须有测试。
 
 ### Phase 7: Pause / Resume / Preempt / Recovery
@@ -753,7 +753,7 @@ AgentStrategy   // 对 model/tool/memory 使用策略进行配置
 
 - `run_stream()` 直接输出核心 `AgentEvent`。
 - 移除旧事件兼容映射。
-- 旧 hook API 标记为 legacy 或移除。
+- 旧 hook API 已移除。
 
 ## 当前非目标
 

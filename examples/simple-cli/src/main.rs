@@ -1,7 +1,7 @@
-use copro_agent::{Agent, AgentEvent, ToolExecutionPolicy, ToolRouter};
+use copro_agent::{Agent, AgentControl, AgentEvent, AgentOutcome, ToolExecutionPolicy, ToolRouter};
 use copro_api::message::{InputContent, Message, OutputContent, ToolResultStatus};
 use copro_api::stream::OutputContentDelta;
-use copro_harness::skills::{SkillHook, SkillRuntime, SkillToolRouter};
+use copro_harness::skills::{SkillRequestInjector, SkillRuntime, SkillToolRouter};
 use copro_harness::tool;
 use copro_harness::tools::{CompositeToolRouter, LocalToolRouter};
 use copro_provider_openai::{
@@ -68,9 +68,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let tool_router =
         CompositeToolRouter::new(vec![local_tools, workspace_tools.clone(), skill_tools]);
     let agent = Agent::new(model, Arc::new(tool_router));
-    agent
-        .add_hook(Arc::new(SkillHook::new(skill_runtime)))
-        .await?;
+    let skill_request = SkillRequestInjector::new(skill_runtime);
 
     agent
         .push_message(Message::System(vec![text(SYSTEM_PROMPT)]))
@@ -106,96 +104,127 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             .push_message(Message::User(vec![text(&input)]))
             .await?;
 
-        let mut stream = agent.run_stream();
-        let mut started_assistant = false;
-        let mut streaming_thinking = false;
+        if let Err(error) = run_turn(&agent, &skill_request).await {
+            eprintln!("[error] {error}");
+        }
+        println!();
+    }
 
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(event) => match event {
-                    AgentEvent::ModelDelta { delta, .. } => match delta {
-                        OutputContentDelta::Text(text) => {
-                            if streaming_thinking {
-                                eprintln!();
-                                streaming_thinking = false;
-                            }
-                            if !started_assistant {
-                                print!("assistant: ");
-                                started_assistant = true;
-                            }
-                            print!("{text}");
-                            io::stdout().flush()?;
-                        }
-                        OutputContentDelta::Thinking(text) => {
-                            if !streaming_thinking {
-                                eprint!("[thinking] ");
-                                streaming_thinking = true;
-                            }
-                            eprint!("{text}");
-                            io::stderr().flush()?;
-                        }
-                        OutputContentDelta::Image(_) => {}
-                        OutputContentDelta::ToolCall { .. } => {}
-                    },
-                    AgentEvent::AssistantCommitted { content, .. } => {
-                        if streaming_thinking {
-                            eprintln!();
-                            streaming_thinking = false;
-                        }
-                        for item in content {
-                            match item {
-                                OutputContent::ToolCall(tool_call) => eprintln!(
-                                    "[tool call] {}({:?})",
-                                    tool_call.name, tool_call.arguments
-                                ),
-                                OutputContent::Image(image) => {
-                                    eprintln!("[image output] {image:?}")
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    AgentEvent::ToolStarted {
-                        tool: tool_call, ..
-                    } => {
-                        if streaming_thinking {
-                            eprintln!();
-                            streaming_thinking = false;
-                        }
-                        eprintln!("[tool started] {}", tool_call.name);
-                    }
-                    AgentEvent::ToolResultCommitted { result, .. } => {
-                        if streaming_thinking {
-                            eprintln!();
-                            streaming_thinking = false;
-                        }
-                        let label = match result.status {
-                            ToolResultStatus::Success => "output",
-                            ToolResultStatus::Error => "error",
-                        };
-                        eprintln!(
-                            "[tool {label}] {}: {}",
-                            result.name,
-                            input_content_text(&result.content)
-                        );
-                    }
-                    _ => {}
-                },
-                Err(e) => {
-                    if streaming_thinking {
-                        eprintln!();
-                        streaming_thinking = false;
-                    }
-                    eprintln!("[error] {e}");
-                    break;
-                }
+    Ok(())
+}
+
+async fn run_turn(
+    agent: &Agent,
+    skill_request: &SkillRequestInjector,
+) -> Result<(), Box<dyn StdError>> {
+    let run = agent.start_run().await?;
+    let mut started_assistant = false;
+    let mut streaming_thinking = false;
+
+    loop {
+        let report = run.step().await?;
+        for event in report.events {
+            handle_agent_event(event, &mut started_assistant, &mut streaming_thinking)?;
+        }
+
+        let step_id = report.step.id;
+        let finished = matches!(report.outcome, AgentOutcome::TurnFinished);
+        match report.outcome {
+            AgentOutcome::RequestBuilt(mut request) => {
+                skill_request.prepare_request(&mut request).await?;
+                run.control(step_id, AgentControl::ReplaceRequest(request))
+                    .await?;
+            }
+            _ => {
+                run.control(step_id, AgentControl::Continue).await?;
             }
         }
 
-        if streaming_thinking {
-            eprintln!();
+        if finished {
+            let mut stream = run.clone().events();
+            while let Some(result) = stream.next().await {
+                handle_agent_event(result?, &mut started_assistant, &mut streaming_thinking)?;
+            }
+            if streaming_thinking {
+                eprintln!();
+            }
+            break;
         }
-        println!();
+    }
+
+    Ok(())
+}
+
+fn handle_agent_event(
+    event: AgentEvent,
+    started_assistant: &mut bool,
+    streaming_thinking: &mut bool,
+) -> Result<(), Box<dyn StdError>> {
+    match event {
+        AgentEvent::ModelDelta { delta, .. } => match delta {
+            OutputContentDelta::Text(text) => {
+                if *streaming_thinking {
+                    eprintln!();
+                    *streaming_thinking = false;
+                }
+                if !*started_assistant {
+                    print!("assistant: ");
+                    *started_assistant = true;
+                }
+                print!("{text}");
+                io::stdout().flush()?;
+            }
+            OutputContentDelta::Thinking(text) => {
+                if !*streaming_thinking {
+                    eprint!("[thinking] ");
+                    *streaming_thinking = true;
+                }
+                eprint!("{text}");
+                io::stderr().flush()?;
+            }
+            OutputContentDelta::Image(_) => {}
+            OutputContentDelta::ToolCall { .. } => {}
+        },
+        AgentEvent::AssistantCommitted { content, .. } => {
+            if *streaming_thinking {
+                eprintln!();
+                *streaming_thinking = false;
+            }
+            for item in content {
+                match item {
+                    OutputContent::ToolCall(tool_call) => {
+                        eprintln!("[tool call] {}({:?})", tool_call.name, tool_call.arguments)
+                    }
+                    OutputContent::Image(image) => eprintln!("[image output] {image:?}"),
+                    _ => {}
+                }
+            }
+        }
+        AgentEvent::ToolStarted {
+            tool: tool_call, ..
+        } => {
+            if *streaming_thinking {
+                eprintln!();
+                *streaming_thinking = false;
+            }
+            eprintln!("[tool started] {}", tool_call.name);
+        }
+        AgentEvent::ToolResultCommitted { result, .. } => {
+            if *streaming_thinking {
+                eprintln!();
+                *streaming_thinking = false;
+            }
+            let label = match result.status {
+                ToolResultStatus::Success => "output",
+                ToolResultStatus::Error => "error",
+            };
+            eprintln!(
+                "[tool {label}] {}: {}",
+                result.name,
+                input_content_text(&result.content)
+            );
+        }
+        _ => {}
     }
 
     Ok(())
