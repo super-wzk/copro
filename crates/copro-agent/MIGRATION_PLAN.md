@@ -14,6 +14,7 @@
 - `AgentControlPoint` 已拆为 typed enum，并提供 `AgentControlDecision` / `apply_control()` 常规路径。
 - `control()` 已对非法 control kind 和 replacement invariant 做即时校验。
 - `ToolResultReplacement` 已用于 typed tool result replacement，由运行层自动填充 `call_id` / `name`。
+- `Pause` / `Resume` 已形成 boundary 和 in-flight pause request 的 `RunPaused` -> `RunResumed` 事件链。
 - `run_stream()` 已基于 `AgentRunHandle` auto mode 实现。
 - `AgentControl` 已支持 request、model delta、assistant output、tool call、tool result 的改写/拒绝。
 - `AgentHook` / `AgentHooks` / `ToolCallDecision` 已从当前工作区代码中移除。
@@ -73,9 +74,9 @@
 - 新增 typed control point compile-time API，常规调用路径不再需要手写 `AgentControl` enum。
 - 测试覆盖 typed control point 的合法路径，以及低层 API 的非法 control immediate error。
 
-### 3. Pause / Resume 语义不完整
+### 3. Pause / Resume 语义不完整（已完成）
 
-问题：
+原问题：
 
 - `RunPaused` / `RunResumed` 事件没有完整事件链。
 - `pause()` 当前只修改 handle 本地状态，不一定驱动 run 发出 pause event。

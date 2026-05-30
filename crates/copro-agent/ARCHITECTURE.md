@@ -273,6 +273,7 @@ clock 规则：
 - 一个 step 未完成前不能启动下一个 step。
 - step outcome commit 后 `tick += 1`。
 - `Pause` 不创建新的 hidden step；它在当前 boundary 生效，使 run 停在下一步之前。
+- 如果 pause request 发生在 in-flight action 期间，当前 action 不会被取消；run 会在下一次 boundary 发出 `RunPaused`，直到收到 resume 后发出 `RunResumed` 并继续。
 - `Preempt` 可以中断 in-flight step，但必须产生明确 interrupted outcome 或 recovery action。
 - 外部控制必须携带当前 `AgentStepId`，过期 step id 必须被拒绝。
 

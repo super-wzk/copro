@@ -498,7 +498,98 @@ async fn run_handle_pause_and_resume_at_boundary() {
 
     run.resume().await.unwrap();
     let second = run.step().await.unwrap();
+    assert!(second.events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RunPaused { at, .. } if *at == first.step.id
+    )));
+    assert!(second.events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RunResumed { at, .. } if *at == first.step.id
+    )));
     assert_eq!(second.step.id.tick, first.step.id.tick + 1);
+}
+
+#[tokio::test]
+async fn run_handle_control_pause_emits_pause_and_resume_events() {
+    let agent = test_agent(vec![OutputStreamEvent::Finished {
+        reason: FinishReason::Stop,
+        usage: None,
+    }]);
+    let run = agent.start_run().await.unwrap();
+
+    let first = run.step().await.unwrap();
+    run.control(first.step.id, AgentControl::Pause)
+        .await
+        .unwrap();
+    assert_eq!(
+        run.state().await.unwrap(),
+        AgentRunState::Paused { at: first.step.id }
+    );
+
+    run.resume().await.unwrap();
+    let second = run.step().await.unwrap();
+    assert!(second.events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RunPaused { at, .. } if *at == first.step.id
+    )));
+    assert!(second.events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RunResumed { at, .. } if *at == first.step.id
+    )));
+    assert_eq!(second.step.id.tick, first.step.id.tick + 1);
+}
+
+#[tokio::test]
+async fn run_handle_pause_request_waits_for_next_boundary() {
+    let agent = Agent::new(Arc::new(DelayedSecondDeltaModel), Arc::new(EmptyToolRouter));
+    let run = agent.start_run().await.unwrap();
+
+    let first = loop {
+        let report = run.step().await.unwrap();
+        if matches!(
+            report.outcome,
+            AgentOutcome::ModelDelta {
+                delta: OutputContentDelta::Text(ref text),
+                ..
+            } if text == "first"
+        ) {
+            break report;
+        }
+        run.control(report.step.id, AgentControl::Continue)
+            .await
+            .unwrap();
+    };
+    run.control(first.step.id, AgentControl::Continue)
+        .await
+        .unwrap();
+
+    let step_task = tokio::spawn({
+        let run = run.clone();
+        async move { run.step().await }
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    run.pause().await.unwrap();
+
+    let paused = step_task.await.unwrap().unwrap();
+    assert!(matches!(
+        paused.outcome,
+        AgentOutcome::ModelDelta {
+            delta: OutputContentDelta::Text(ref text),
+            ..
+        } if text == "second"
+    ));
+    assert_eq!(paused.state, AgentRunState::Paused { at: paused.step.id });
+
+    run.resume().await.unwrap();
+    let next = run.step().await.unwrap();
+    assert!(next.events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RunPaused { at, .. } if *at == paused.step.id
+    )));
+    assert!(next.events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RunResumed { at, .. } if *at == paused.step.id
+    )));
 }
 
 #[tokio::test]
@@ -1477,6 +1568,42 @@ impl Model for PendingAfterFirstDeltaModel {
             })
         });
         Box::pin(first.chain(futures_util::stream::pending()))
+    }
+}
+
+struct DelayedSecondDeltaModel;
+
+impl Model for DelayedSecondDeltaModel {
+    fn stream(&self, _request: GenerateRequest) -> ModelStream {
+        Box::pin(futures_util::stream::unfold(0, |index| async move {
+            match index {
+                0 => Some((
+                    Ok(OutputStreamEvent::Delta {
+                        content_index: 0,
+                        delta: OutputContentDelta::Text("first".to_string()),
+                    }),
+                    1,
+                )),
+                1 => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Some((
+                        Ok(OutputStreamEvent::Delta {
+                            content_index: 0,
+                            delta: OutputContentDelta::Text("second".to_string()),
+                        }),
+                        2,
+                    ))
+                }
+                2 => Some((
+                    Ok(OutputStreamEvent::Finished {
+                        reason: FinishReason::Stop,
+                        usage: None,
+                    }),
+                    3,
+                )),
+                _ => None,
+            }
+        }))
     }
 }
 

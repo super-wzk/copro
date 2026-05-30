@@ -1,5 +1,5 @@
 use crate::event::AgentEvent;
-use crate::run::{AgentControl, AgentRun, AgentRunId, AgentTurnId};
+use crate::run::{AgentControlSignal, AgentRun, AgentRunId, AgentTurnId};
 use crate::runtime::StopSignal;
 use crate::tools::ToolRouter;
 use copro_api::error::Result;
@@ -127,6 +127,6 @@ pub(crate) enum AgentCommand {
 }
 
 pub(crate) enum AgentStreamItem {
-    Event(Box<AgentEvent>, oneshot::Sender<AgentControl>),
+    Event(Box<AgentEvent>, oneshot::Sender<AgentControlSignal>),
     Error(copro_api::error::Error),
 }

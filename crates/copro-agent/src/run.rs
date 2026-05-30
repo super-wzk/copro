@@ -156,6 +156,28 @@ pub struct ToolResultReplacement {
     pub content: Vec<InputContent>,
 }
 
+pub(crate) enum AgentControlSignal {
+    Control(AgentControl),
+    Pause { resume: oneshot::Receiver<()> },
+}
+
+impl AgentControlSignal {
+    fn continue_run() -> Self {
+        Self::Control(AgentControl::Continue)
+    }
+
+    fn abort_run() -> Self {
+        Self::Control(AgentControl::AbortRun)
+    }
+
+    fn kind(&self) -> AgentControlKind {
+        match self {
+            AgentControlSignal::Control(control) => control.kind(),
+            AgentControlSignal::Pause { .. } => AgentControlKind::Pause,
+        }
+    }
+}
+
 impl AgentControl {
     pub fn kind(&self) -> AgentControlKind {
         match self {
@@ -574,7 +596,9 @@ pub struct AgentRunHandle {
 }
 
 struct AgentRunHandleState {
-    pending_control: Option<(AgentStepId, oneshot::Sender<AgentControl>)>,
+    pending_control: Option<(AgentStepId, oneshot::Sender<AgentControlSignal>)>,
+    pending_resume: Option<(AgentStepId, oneshot::Sender<()>)>,
+    pause_requested: bool,
     last_report: Option<AgentStepReport>,
     state: Option<AgentRunState>,
     active_tool_call_ids: HashSet<ToolCallId>,
@@ -586,6 +610,8 @@ impl AgentRunHandle {
             events: Arc::new(Mutex::new(events)),
             state: Arc::new(Mutex::new(AgentRunHandleState {
                 pending_control: None,
+                pending_resume: None,
+                pause_requested: false,
                 last_report: None,
                 state: None,
                 active_tool_call_ids: HashSet::new(),
@@ -625,12 +651,19 @@ impl AgentRunHandle {
                     events.push(event.clone());
                     if let AgentEvent::ControlRequired { step, outcome } = event {
                         let mut state_inner = self.state.lock().await;
-                        let state = AgentRunState::WaitingControl {
+                        let mut state = AgentRunState::WaitingControl {
                             step: step.clone(),
                             outcome: outcome.clone(),
                         };
                         state_inner.state = Some(state.clone());
-                        state_inner.pending_control = Some((step.id, ack));
+                        if state_inner.pause_requested {
+                            state_inner.pause_requested = false;
+                            state = AgentRunState::Paused { at: step.id };
+                            state_inner.state = Some(state.clone());
+                            let _ = ack.send(state_inner.make_pause_signal(step.id));
+                        } else {
+                            state_inner.pending_control = Some((step.id, ack));
+                        }
                         let report = AgentStepReport {
                             step,
                             outcome,
@@ -641,7 +674,7 @@ impl AgentRunHandle {
                         return Ok(report);
                     }
                     self.state.lock().await.observe_event(&event);
-                    let _ = ack.send(AgentControl::Continue);
+                    let _ = ack.send(AgentControlSignal::continue_run());
                 }
                 AgentStreamItem::Error(error) => {
                     self.state.lock().await.state = Some(AgentRunState::Aborted);
@@ -686,6 +719,7 @@ impl AgentRunHandle {
                 Ok(report)
             }
             AgentControl::Pause => {
+                inner.send_pause_control(step_id);
                 inner.state = Some(AgentRunState::Paused { at: step_id });
                 Ok(report)
             }
@@ -705,15 +739,22 @@ impl AgentRunHandle {
     pub async fn pause(&self) -> Result<()> {
         let mut inner = self.state.lock().await;
         let Some((step_id, _)) = &inner.pending_control else {
-            return Err(Error::client("agent run is not at a step boundary"));
+            inner.pause_requested = true;
+            return Ok(());
         };
-        inner.state = Some(AgentRunState::Paused { at: *step_id });
+        let step_id = *step_id;
+        inner.send_pause_control(step_id);
+        inner.state = Some(AgentRunState::Paused { at: step_id });
         Ok(())
     }
 
     pub async fn resume(&self) -> Result<()> {
         let mut inner = self.state.lock().await;
-        inner.continue_pending_control();
+        if let Some((_, resume)) = inner.pending_resume.take() {
+            let _ = resume.send(());
+        } else {
+            inner.continue_pending_control();
+        }
         Ok(())
     }
 
@@ -723,7 +764,7 @@ impl AgentRunHandle {
         if let Some((step_id, _)) = &inner.pending_control {
             inner.state = Some(AgentRunState::Preempting { step_id: *step_id });
         }
-        inner.send_pending_control(AgentControl::AbortRun);
+        inner.send_pending_signal(AgentControlSignal::abort_run());
         Ok(())
     }
 
@@ -741,8 +782,20 @@ impl AgentRunHandle {
         match self.events.lock().await.recv().await {
             Some(AgentStreamItem::Event(event, ack)) => {
                 let event = *event;
-                self.state.lock().await.observe_event(&event);
-                let _ = ack.send(AgentControl::Continue);
+                let mut state = self.state.lock().await;
+                state.observe_event(&event);
+                let signal = if let AgentEvent::ControlRequired { step, .. } = &event {
+                    if state.pause_requested {
+                        state.pause_requested = false;
+                        state.state = Some(AgentRunState::Paused { at: step.id });
+                        state.make_pause_signal(step.id)
+                    } else {
+                        AgentControlSignal::continue_run()
+                    }
+                } else {
+                    AgentControlSignal::continue_run()
+                };
+                let _ = ack.send(signal);
                 Ok(Some(event))
             }
             Some(AgentStreamItem::Error(error)) => {
@@ -792,13 +845,35 @@ impl AgentRunHandleState {
     }
 
     fn continue_pending_control(&mut self) {
-        self.send_pending_control(AgentControl::Continue);
+        if self.pending_resume.is_none() {
+            self.send_pending_control(AgentControl::Continue);
+        }
     }
 
     fn send_pending_control(&mut self, control: AgentControl) {
+        self.send_pending_signal(AgentControlSignal::Control(control));
+    }
+
+    fn send_pending_signal(&mut self, signal: AgentControlSignal) {
         if let Some((_, ack)) = self.pending_control.take() {
-            let _ = ack.send(control);
+            let _ = ack.send(signal);
         }
+    }
+
+    fn send_pause_control(&mut self, step_id: AgentStepId) {
+        let Some((_, ack)) = self.pending_control.take() else {
+            return;
+        };
+        let signal = self.make_pause_signal(step_id);
+        if ack.send(signal).is_err() {
+            self.pending_resume = None;
+        }
+    }
+
+    fn make_pause_signal(&mut self, step_id: AgentStepId) -> AgentControlSignal {
+        let (resume, rx) = oneshot::channel();
+        self.pending_resume = Some((step_id, resume));
+        AgentControlSignal::Pause { resume: rx }
     }
 
     fn observe_event(&mut self, event: &AgentEvent) {
@@ -1016,31 +1091,36 @@ impl<'a> AgentRun<'a> {
                     else {
                         return Ok(());
                     };
+                    let mut step_completed = false;
                     match control {
-                        AgentControl::Continue => {}
-                        AgentControl::ReplaceRequest(replacement) => {
+                        AgentControlSignal::Control(AgentControl::Continue) => {}
+                        AgentControlSignal::Control(AgentControl::ReplaceRequest(replacement)) => {
                             request = replacement;
                         }
                         other => {
-                            let _ = complete_step_after_control(
+                            if !complete_step_after_control(
                                 events,
                                 run_id,
-                                step,
+                                step.clone(),
                                 pending_outcome,
                                 other,
                             )
-                            .await?;
-                            return Ok(());
+                            .await?
+                            {
+                                return Ok(());
+                            }
+                            step_completed = true;
                         }
                     }
-                    if !complete_step_after_control(
-                        events,
-                        run_id,
-                        step,
-                        AgentOutcome::RequestBuilt(request.clone()),
-                        AgentControl::Continue,
-                    )
-                    .await?
+                    if !step_completed
+                        && !complete_step_after_control(
+                            events,
+                            run_id,
+                            step,
+                            AgentOutcome::RequestBuilt(request.clone()),
+                            AgentControlSignal::continue_run(),
+                        )
+                        .await?
                     {
                         return Ok(());
                     }
@@ -1117,22 +1197,25 @@ impl<'a> AgentRun<'a> {
                             else {
                                 return Ok(());
                             };
+                            let mut step_completed = false;
                             let (outcome, delta) = match control {
-                                AgentControl::Continue => (
+                                AgentControlSignal::Control(AgentControl::Continue) => (
                                     AgentOutcome::ModelDelta {
                                         content_index,
                                         delta: delta.clone(),
                                     },
                                     Some(delta),
                                 ),
-                                AgentControl::ReplaceModelDelta(replacement) => (
+                                AgentControlSignal::Control(AgentControl::ReplaceModelDelta(
+                                    replacement,
+                                )) => (
                                     AgentOutcome::ModelDelta {
                                         content_index,
                                         delta: replacement.clone(),
                                     },
                                     Some(replacement),
                                 ),
-                                AgentControl::DropModelDelta => (
+                                AgentControlSignal::Control(AgentControl::DropModelDelta) => (
                                     AgentOutcome::ModelDeltaDropped {
                                         content_index,
                                         delta,
@@ -1140,25 +1223,30 @@ impl<'a> AgentRun<'a> {
                                     None,
                                 ),
                                 other => {
-                                    let _ = complete_step_after_control(
+                                    if !complete_step_after_control(
                                         events,
                                         run_id,
-                                        step,
-                                        pending_outcome,
+                                        step.clone(),
+                                        pending_outcome.clone(),
                                         other,
                                     )
-                                    .await?;
-                                    return Ok(());
+                                    .await?
+                                    {
+                                        return Ok(());
+                                    }
+                                    step_completed = true;
+                                    (pending_outcome, Some(delta))
                                 }
                             };
-                            if !complete_step_after_control(
-                                events,
-                                run_id,
-                                step.clone(),
-                                outcome,
-                                AgentControl::Continue,
-                            )
-                            .await?
+                            if !step_completed
+                                && !complete_step_after_control(
+                                    events,
+                                    run_id,
+                                    step.clone(),
+                                    outcome,
+                                    AgentControlSignal::continue_run(),
+                                )
+                                .await?
                             {
                                 return Ok(());
                             }
@@ -1195,35 +1283,42 @@ impl<'a> AgentRun<'a> {
                             else {
                                 return Ok(());
                             };
+                            let mut step_completed = false;
                             match control {
-                                AgentControl::Continue => {}
-                                AgentControl::ReplaceAssistantOutput(replacement) => {
+                                AgentControlSignal::Control(AgentControl::Continue) => {}
+                                AgentControlSignal::Control(
+                                    AgentControl::ReplaceAssistantOutput(replacement),
+                                ) => {
                                     output.content = replacement;
                                 }
                                 other => {
-                                    let _ = complete_step_after_control(
+                                    if !complete_step_after_control(
                                         events,
                                         run_id,
-                                        step,
+                                        step.clone(),
                                         pending_outcome,
                                         other,
                                     )
-                                    .await?;
-                                    return Ok(());
+                                    .await?
+                                    {
+                                        return Ok(());
+                                    }
+                                    step_completed = true;
                                 }
                             }
-                            if !complete_step_after_control(
-                                events,
-                                run_id,
-                                step,
-                                AgentOutcome::ModelOutputFinished {
-                                    content: output.content.clone(),
-                                    reason: output.reason,
-                                    usage: output.usage.clone(),
-                                },
-                                AgentControl::Continue,
-                            )
-                            .await?
+                            if !step_completed
+                                && !complete_step_after_control(
+                                    events,
+                                    run_id,
+                                    step,
+                                    AgentOutcome::ModelOutputFinished {
+                                        content: output.content.clone(),
+                                        reason: output.reason,
+                                        usage: output.usage.clone(),
+                                    },
+                                    AgentControlSignal::continue_run(),
+                                )
+                                .await?
                             {
                                 return Ok(());
                             }
@@ -1309,8 +1404,9 @@ impl<'a> AgentRun<'a> {
                                 return Ok(());
                             };
                             let final_outcome;
+                            let mut step_completed = false;
                             match control {
-                                AgentControl::Continue => {
+                                AgentControlSignal::Control(AgentControl::Continue) => {
                                     final_outcome = match &item.completed_result {
                                         Some(result) => AgentOutcome::ToolRejected {
                                             tool: item.tool.clone(),
@@ -1322,7 +1418,9 @@ impl<'a> AgentRun<'a> {
                                         },
                                     };
                                 }
-                                AgentControl::ReplaceToolCall(replacement) => {
+                                AgentControlSignal::Control(AgentControl::ReplaceToolCall(
+                                    replacement,
+                                )) => {
                                     replace_tool_call_in_history(
                                         &mut self.context.messages,
                                         &item.tool,
@@ -1335,7 +1433,9 @@ impl<'a> AgentRun<'a> {
                                         policy: item.policy,
                                     };
                                 }
-                                AgentControl::RejectToolCall { reason } => {
+                                AgentControlSignal::Control(AgentControl::RejectToolCall {
+                                    reason,
+                                }) => {
                                     let result = rejected_tool_result(&item.tool, reason);
                                     item = ToolPlanItem::completed(item.tool, result);
                                     final_outcome = AgentOutcome::ToolRejected {
@@ -1347,25 +1447,30 @@ impl<'a> AgentRun<'a> {
                                     };
                                 }
                                 other => {
-                                    let _ = complete_step_after_control(
+                                    final_outcome = pending_outcome.clone();
+                                    if !complete_step_after_control(
                                         events,
                                         run_id,
-                                        step,
+                                        step.clone(),
                                         pending_outcome,
                                         other,
                                     )
-                                    .await?;
-                                    return Ok(());
+                                    .await?
+                                    {
+                                        return Ok(());
+                                    }
+                                    step_completed = true;
                                 }
                             }
-                            if !complete_step_after_control(
-                                events,
-                                run_id,
-                                step,
-                                final_outcome,
-                                AgentControl::Continue,
-                            )
-                            .await?
+                            if !step_completed
+                                && !complete_step_after_control(
+                                    events,
+                                    run_id,
+                                    step,
+                                    final_outcome,
+                                    AgentControlSignal::continue_run(),
+                                )
+                                .await?
                             {
                                 return Ok(());
                             }
@@ -1534,12 +1639,17 @@ impl<'a> AgentRun<'a> {
                         else {
                             return Ok(());
                         };
+                        let mut step_completed = false;
                         match control {
-                            AgentControl::Continue => {}
-                            AgentControl::ReplaceToolResult(replacement) => {
+                            AgentControlSignal::Control(AgentControl::Continue) => {}
+                            AgentControlSignal::Control(AgentControl::ReplaceToolResult(
+                                replacement,
+                            )) => {
                                 result = replacement;
                             }
-                            AgentControl::ReplaceToolResultContent(replacement) => {
+                            AgentControlSignal::Control(
+                                AgentControl::ReplaceToolResultContent(replacement),
+                            ) => {
                                 result = ToolResult {
                                     call_id: tool.id.clone(),
                                     name: tool.name.clone(),
@@ -1548,29 +1658,33 @@ impl<'a> AgentRun<'a> {
                                 };
                             }
                             other => {
-                                let _ = complete_step_after_control(
+                                if !complete_step_after_control(
                                     events,
                                     run_id,
-                                    step,
+                                    step.clone(),
                                     pending_outcome,
                                     other,
                                 )
-                                .await?;
-                                return Ok(());
+                                .await?
+                                {
+                                    return Ok(());
+                                }
+                                step_completed = true;
                             }
                         }
-                        if !complete_step_after_control(
-                            events,
-                            run_id,
-                            step,
-                            AgentOutcome::ToolResultCommitted {
-                                message_index,
-                                tool: tool.clone(),
-                                result: result.clone(),
-                            },
-                            AgentControl::Continue,
-                        )
-                        .await?
+                        if !step_completed
+                            && !complete_step_after_control(
+                                events,
+                                run_id,
+                                step,
+                                AgentOutcome::ToolResultCommitted {
+                                    message_index,
+                                    tool: tool.clone(),
+                                    result: result.clone(),
+                                },
+                                AgentControlSignal::continue_run(),
+                            )
+                            .await?
                         {
                             return Ok(());
                         }
@@ -1767,7 +1881,7 @@ async fn emit_control_required(
     events: &mpsc::Sender<AgentStreamItem>,
     step: AgentStep,
     outcome: AgentOutcome,
-) -> Option<AgentControl> {
+) -> Option<AgentControlSignal> {
     let (ack, rx) = oneshot::channel();
     if events
         .send(AgentStreamItem::Event(
@@ -1807,24 +1921,75 @@ async fn complete_step_after_control(
     run_id: AgentRunId,
     step: AgentStep,
     outcome: AgentOutcome,
-    control: AgentControl,
+    signal: AgentControlSignal,
 ) -> Result<bool> {
-    match control {
-        AgentControl::Continue
-        | AgentControl::Pause
-        | AgentControl::AbortTurn
-        | AgentControl::AbortRun => {
+    match signal {
+        AgentControlSignal::Control(
+            control @ (AgentControl::Continue | AgentControl::AbortTurn | AgentControl::AbortRun),
+        ) => {
             let step_id = step.id;
             if !emit_step_completed(events, step, outcome).await {
                 return Ok(false);
             }
             continue_after_control(events, run_id, step_id, control).await
         }
+        AgentControlSignal::Control(AgentControl::Pause) => {
+            let step_id = step.id;
+            if !emit_step_completed(events, step, outcome).await {
+                return Ok(false);
+            }
+            pause_after_control(events, run_id, step_id, None).await
+        }
+        AgentControlSignal::Pause { resume } => {
+            let step_id = step.id;
+            if !emit_step_completed(events, step, outcome).await {
+                return Ok(false);
+            }
+            pause_after_control(events, run_id, step_id, Some(resume)).await
+        }
         other => Err(Error::client(format!(
             "agent control {:?} is not valid for this step",
             other.kind()
         ))),
     }
+}
+
+async fn pause_after_control(
+    events: &mpsc::Sender<AgentStreamItem>,
+    run_id: AgentRunId,
+    step_id: AgentStepId,
+    resume: Option<oneshot::Receiver<()>>,
+) -> Result<bool> {
+    if !emit(
+        events,
+        AgentEvent::RunPaused {
+            run_id,
+            at: step_id,
+        },
+    )
+    .await
+    {
+        return Ok(false);
+    }
+
+    let Some(resume) = resume else {
+        return Ok(false);
+    };
+    if resume.await.is_err() {
+        return Ok(false);
+    }
+    if !emit(
+        events,
+        AgentEvent::RunResumed {
+            run_id,
+            at: step_id,
+        },
+    )
+    .await
+    {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 async fn continue_after_control(
