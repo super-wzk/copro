@@ -454,10 +454,10 @@ BuildRequest/RequestBuilt         -> Continue / Pause / AbortTurn / AbortRun / R
 ReadModelStream/ModelDelta        -> Continue / Pause / AbortTurn / AbortRun / ReplaceModelDelta / DropModelDelta
 ReadModelStream/ModelOutputFinished -> Continue / Pause / AbortTurn / AbortRun / ReplaceAssistantOutput
 PlanTool/ToolPlanned              -> Continue / Pause / AbortTurn / AbortRun / ReplaceToolCall / RejectToolCall
-PlanTool/ToolRejected             -> Continue / Pause / AbortTurn / AbortRun / ReplaceToolResult
-ReadTool/ToolFinished             -> Continue / Pause / AbortTurn / AbortRun / ReplaceToolResult
+PlanTool/ToolRejected             -> Continue / Pause / AbortTurn / AbortRun / ReplaceToolCall / RejectToolCall
+ReadTool/ToolFinished             -> Continue / Pause / AbortTurn / AbortRun
 CommitAssistant/AssistantCommitted -> Continue / Pause / AbortRun
-CommitToolResult/ToolResultCommitted -> Continue / Pause / AbortRun
+CommitToolResult/ToolResultCommitted -> Continue / Pause / AbortRun / ReplaceToolResult
 FinishTurn/TurnFinished           -> Continue
 ```
 
