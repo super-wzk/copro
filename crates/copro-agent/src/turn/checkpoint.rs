@@ -9,6 +9,12 @@ pub struct AgentStepReport {
     pub events: Vec<AgentEvent>,
 }
 
+impl AgentStepReport {
+    pub fn step_id(&self) -> AgentStepId {
+        self.step.id
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentCheckpoint {
     Basic(AgentStepReport),

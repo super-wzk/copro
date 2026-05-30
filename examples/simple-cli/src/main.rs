@@ -147,7 +147,7 @@ async fn drive_turn(
         let finished = matches!(point.pending_outcome(), AgentOutcome::TurnFinished);
         match point {
             AgentCheckpoint::RequestBuilt(report) => {
-                let step_id = report.step.id;
+                let step_id = report.step_id();
                 let AgentOutcome::RequestBuilt(mut request) = report.outcome else {
                     unreachable!("request checkpoint must carry a request outcome")
                 };

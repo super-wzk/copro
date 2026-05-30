@@ -242,12 +242,12 @@ async fn turn_handle_abort_turn_at_model_delta_does_not_commit_assistant_message
         ) {
             break report;
         }
-        run.control(report.step.id, AgentControl::Continue)
+        run.control(report.step_id(), AgentControl::Continue)
             .await
             .unwrap();
     };
 
-    run.control(report.step.id, AgentControl::AbortTurn)
+    run.control(report.step_id(), AgentControl::AbortTurn)
         .await
         .unwrap();
     let remaining = run
@@ -278,7 +278,7 @@ async fn abort_turn_does_not_cancel_later_runs() {
     let report = first.step().await.unwrap();
 
     first
-        .control(report.step.id, AgentControl::AbortTurn)
+        .control(report.step_id(), AgentControl::AbortTurn)
         .await
         .unwrap();
     let first_events = first
@@ -487,7 +487,7 @@ async fn start_turn_steps_to_model_delta_boundary() {
     }
 
     assert!(matches!(report.step.action, AgentAction::ReadModelStream));
-    assert_eq!(report.step.id.tick, 3);
+    assert_eq!(report.step_id().tick, 3);
     assert!(matches!(
         report.outcome,
         AgentOutcome::ModelDelta {
@@ -499,7 +499,7 @@ async fn start_turn_steps_to_model_delta_boundary() {
         run.state().await.unwrap(),
         AgentTurnState::WaitingControl { .. }
     ));
-    run.control(report.step.id, AgentControl::Continue)
+    run.control(report.step_id(), AgentControl::Continue)
         .await
         .unwrap();
     let next = run.step().await.unwrap();
@@ -524,20 +524,22 @@ async fn turn_handle_pause_and_resume_at_boundary() {
     run.pause().await.unwrap();
     assert_eq!(
         run.state().await.unwrap(),
-        AgentTurnState::Paused { at: first.step.id }
+        AgentTurnState::Paused {
+            at: first.step_id()
+        }
     );
 
     run.resume().await.unwrap();
     let second = run.step().await.unwrap();
     assert!(second.events.iter().any(|event| matches!(
         event,
-        AgentEvent::TurnPaused { at, .. } if *at == first.step.id
+        AgentEvent::TurnPaused { at, .. } if *at == first.step_id()
     )));
     assert!(second.events.iter().any(|event| matches!(
         event,
-        AgentEvent::TurnResumed { at, .. } if *at == first.step.id
+        AgentEvent::TurnResumed { at, .. } if *at == first.step_id()
     )));
-    assert_eq!(second.step.id.tick, first.step.id.tick + 1);
+    assert_eq!(second.step_id().tick, first.step_id().tick + 1);
 }
 
 #[tokio::test]
@@ -549,25 +551,27 @@ async fn turn_handle_control_pause_emits_pause_and_resume_events() {
     let run = agent.start_turn().await.unwrap();
 
     let first = run.step().await.unwrap();
-    run.control(first.step.id, AgentControl::Pause)
+    run.control(first.step_id(), AgentControl::Pause)
         .await
         .unwrap();
     assert_eq!(
         run.state().await.unwrap(),
-        AgentTurnState::Paused { at: first.step.id }
+        AgentTurnState::Paused {
+            at: first.step_id()
+        }
     );
 
     run.resume().await.unwrap();
     let second = run.step().await.unwrap();
     assert!(second.events.iter().any(|event| matches!(
         event,
-        AgentEvent::TurnPaused { at, .. } if *at == first.step.id
+        AgentEvent::TurnPaused { at, .. } if *at == first.step_id()
     )));
     assert!(second.events.iter().any(|event| matches!(
         event,
-        AgentEvent::TurnResumed { at, .. } if *at == first.step.id
+        AgentEvent::TurnResumed { at, .. } if *at == first.step_id()
     )));
-    assert_eq!(second.step.id.tick, first.step.id.tick + 1);
+    assert_eq!(second.step_id().tick, first.step_id().tick + 1);
 }
 
 #[tokio::test]
@@ -586,11 +590,11 @@ async fn turn_handle_pause_request_waits_for_next_boundary() {
         ) {
             break report;
         }
-        run.control(report.step.id, AgentControl::Continue)
+        run.control(report.step_id(), AgentControl::Continue)
             .await
             .unwrap();
     };
-    run.control(first.step.id, AgentControl::Continue)
+    run.control(first.step_id(), AgentControl::Continue)
         .await
         .unwrap();
 
@@ -609,17 +613,22 @@ async fn turn_handle_pause_request_waits_for_next_boundary() {
             ..
         } if text == "second"
     ));
-    assert_eq!(paused.state, AgentTurnState::Paused { at: paused.step.id });
+    assert_eq!(
+        paused.state,
+        AgentTurnState::Paused {
+            at: paused.step_id()
+        }
+    );
 
     run.resume().await.unwrap();
     let next = run.step().await.unwrap();
     assert!(next.events.iter().any(|event| matches!(
         event,
-        AgentEvent::TurnPaused { at, .. } if *at == paused.step.id
+        AgentEvent::TurnPaused { at, .. } if *at == paused.step_id()
     )));
     assert!(next.events.iter().any(|event| matches!(
         event,
-        AgentEvent::TurnResumed { at, .. } if *at == paused.step.id
+        AgentEvent::TurnResumed { at, .. } if *at == paused.step_id()
     )));
 }
 
@@ -632,7 +641,7 @@ async fn turn_handle_finish_turn_finishes_without_turn_aborted() {
     let run = agent.start_turn().await.unwrap();
     let report = run.step().await.unwrap();
 
-    run.control(report.step.id, AgentControl::FinishTurn)
+    run.control(report.step_id(), AgentControl::FinishTurn)
         .await
         .unwrap();
     let events = run
@@ -672,7 +681,7 @@ async fn turn_handle_abort_turn_emits_turn_aborted() {
     let run = agent.start_turn().await.unwrap();
     let report = run.step().await.unwrap();
 
-    run.control(report.step.id, AgentControl::AbortTurn)
+    run.control(report.step_id(), AgentControl::AbortTurn)
         .await
         .unwrap();
     let events = run
@@ -712,18 +721,18 @@ async fn abort_turn_after_assistant_tool_call_recovers_tool_result() {
         ) {
             break report;
         }
-        run.control(report.step.id, AgentControl::Continue)
+        run.control(report.step_id(), AgentControl::Continue)
             .await
             .unwrap();
     };
 
-    run.control(report.step.id, AgentControl::AbortTurn)
+    run.control(report.step_id(), AgentControl::AbortTurn)
         .await
         .unwrap();
     assert_eq!(
         run.state().await.unwrap(),
         AgentTurnState::Recovering {
-            after: report.step.id,
+            after: report.step_id(),
         }
     );
 
@@ -737,7 +746,7 @@ async fn abort_turn_after_assistant_tool_call_recovers_tool_result() {
         .unwrap();
     assert!(events.iter().any(|event| matches!(
         event,
-        AgentEvent::TurnRecovering { after, .. } if *after == report.step.id
+        AgentEvent::TurnRecovering { after, .. } if *after == report.step_id()
     )));
     assert!(events.iter().any(|event| matches!(
         event,
@@ -791,12 +800,12 @@ async fn abort_turn_at_tool_started_recovers_tool_result() {
         if matches!(report.outcome, AgentOutcome::ToolStarted { .. }) {
             break report;
         }
-        run.control(report.step.id, AgentControl::Continue)
+        run.control(report.step_id(), AgentControl::Continue)
             .await
             .unwrap();
     };
 
-    run.control(report.step.id, AgentControl::AbortTurn)
+    run.control(report.step_id(), AgentControl::AbortTurn)
         .await
         .unwrap();
     let events = run
@@ -810,7 +819,7 @@ async fn abort_turn_at_tool_started_recovers_tool_result() {
 
     assert!(events.iter().any(|event| matches!(
         event,
-        AgentEvent::TurnRecovering { after, .. } if *after == report.step.id
+        AgentEvent::TurnRecovering { after, .. } if *after == report.step_id()
     )));
     assert!(events.iter().any(|event| matches!(
         event,
@@ -852,11 +861,11 @@ async fn turn_handle_preempt_inflight_model_stream_emits_turn_preempted() {
         ) {
             break report;
         }
-        run.control(report.step.id, AgentControl::Continue)
+        run.control(report.step_id(), AgentControl::Continue)
             .await
             .unwrap();
     };
-    run.control(first.step.id, AgentControl::Continue)
+    run.control(first.step_id(), AgentControl::Continue)
         .await
         .unwrap();
 
@@ -913,11 +922,11 @@ async fn turn_handle_preempt_inflight_tool_execution_recovers_tool_result() {
         if matches!(report.outcome, AgentOutcome::ToolStarted { .. }) {
             break report;
         }
-        run.control(report.step.id, AgentControl::Continue)
+        run.control(report.step_id(), AgentControl::Continue)
             .await
             .unwrap();
     };
-    run.control(started.step.id, AgentControl::Continue)
+    run.control(started.step_id(), AgentControl::Continue)
         .await
         .unwrap();
 
@@ -1019,7 +1028,7 @@ async fn turn_handle_rejects_stale_control() {
     }]);
     let run = agent.start_turn().await.unwrap();
     let report = run.step().await.unwrap();
-    let mut stale_step_id = report.step.id;
+    let mut stale_step_id = report.step_id();
     stale_step_id.tick += 1;
 
     let error = run
@@ -1041,7 +1050,7 @@ async fn turn_handle_reports_illegal_control_for_step() {
 
     let error = run
         .control(
-            report.step.id,
+            report.step_id(),
             AgentControl::ReplaceRequest(GenerateRequest {
                 messages: Vec::new(),
                 tools: Vec::new(),
@@ -1053,7 +1062,7 @@ async fn turn_handle_reports_illegal_control_for_step() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("is not valid for this step"));
-    run.control(report.step.id, AgentControl::Continue)
+    run.control(report.step_id(), AgentControl::Continue)
         .await
         .unwrap();
 }
@@ -1077,13 +1086,13 @@ async fn turn_handle_replaces_model_delta_before_history() {
         if matches!(report.outcome, AgentOutcome::ModelDelta { .. }) {
             break report;
         }
-        run.control(report.step.id, AgentControl::Continue)
+        run.control(report.step_id(), AgentControl::Continue)
             .await
             .unwrap();
     };
 
     run.control(
-        report.step.id,
+        report.step_id(),
         AgentControl::ReplaceModelDelta(OutputContentDelta::Text("redacted".to_string())),
     )
     .await
@@ -1097,7 +1106,7 @@ async fn turn_handle_replaces_model_delta_before_history() {
         } if text == "redacted"
     )));
 
-    run.control(next.step.id, AgentControl::Continue)
+    run.control(next.step_id(), AgentControl::Continue)
         .await
         .unwrap();
     run.clone()
@@ -1134,7 +1143,7 @@ async fn control_required_precedes_final_step_completed() {
         if matches!(report.outcome, AgentOutcome::ModelDelta { .. }) {
             break report;
         }
-        run.control(report.step.id, AgentControl::Continue)
+        run.control(report.step_id(), AgentControl::Continue)
             .await
             .unwrap();
     };
@@ -1147,15 +1156,15 @@ async fn control_required_precedes_final_step_completed() {
                 delta: OutputContentDelta::Text(text),
                 ..
             },
-        } if step.id == report.step.id && text == "secret"
+        } if step.id == report.step_id() && text == "secret"
     )));
     assert!(!report.events.iter().any(|event| matches!(
         event,
-        AgentEvent::StepCompleted { step, .. } if step.id == report.step.id
+        AgentEvent::StepCompleted { step, .. } if step.id == report.step_id()
     )));
 
     run.control(
-        report.step.id,
+        report.step_id(),
         AgentControl::ReplaceModelDelta(OutputContentDelta::Text("redacted".to_string())),
     )
     .await
@@ -1173,7 +1182,7 @@ async fn control_required_precedes_final_step_completed() {
                         delta: OutputContentDelta::Text(text),
                         ..
                     },
-                } if step.id == report.step.id && text == "redacted"
+                } if step.id == report.step_id() && text == "redacted"
             )
         })
         .expect("final step completion emitted");
@@ -1212,12 +1221,12 @@ async fn turn_handle_drops_model_delta_before_history() {
         if matches!(report.outcome, AgentOutcome::ModelDelta { .. }) {
             break report;
         }
-        run.control(report.step.id, AgentControl::Continue)
+        run.control(report.step_id(), AgentControl::Continue)
             .await
             .unwrap();
     };
 
-    run.control(report.step.id, AgentControl::DropModelDelta)
+    run.control(report.step_id(), AgentControl::DropModelDelta)
         .await
         .unwrap();
     let events = run
@@ -1276,7 +1285,7 @@ async fn turn_handle_replaces_request_before_model_stream() {
     };
 
     run.control(
-        report.step.id,
+        report.step_id(),
         AgentControl::ReplaceRequest(replacement.clone()),
     )
     .await
@@ -1305,13 +1314,13 @@ async fn turn_handle_replaces_assistant_output_before_commit() {
         if matches!(report.outcome, AgentOutcome::ModelOutputFinished { .. }) {
             break report;
         }
-        run.control(report.step.id, AgentControl::Continue)
+        run.control(report.step_id(), AgentControl::Continue)
             .await
             .unwrap();
     };
 
     run.control(
-        report.step.id,
+        report.step_id(),
         AgentControl::ReplaceAssistantOutput(vec![OutputContent::Text("redacted".to_string())]),
     )
     .await
@@ -1322,7 +1331,7 @@ async fn turn_handle_replaces_assistant_output_before_commit() {
         AgentEvent::AssistantCommitted { content, .. }
             if content == &vec![OutputContent::Text("redacted".to_string())]
     )));
-    run.control(next.step.id, AgentControl::Continue)
+    run.control(next.step_id(), AgentControl::Continue)
         .await
         .unwrap();
     run.clone()
@@ -1374,7 +1383,7 @@ async fn turn_handle_replaces_tool_result_before_commit() {
     };
 
     run.control(
-        report.step.id,
+        report.step_id(),
         AgentControl::ReplaceToolResultContent(replacement),
     )
     .await
@@ -1384,7 +1393,7 @@ async fn turn_handle_replaces_tool_result_before_commit() {
         event,
         AgentEvent::ToolResultCommitted { result, .. } if result == &expected
     )));
-    run.control(next.step.id, AgentControl::Continue)
+    run.control(next.step_id(), AgentControl::Continue)
         .await
         .unwrap();
     run.clone()
@@ -1419,7 +1428,7 @@ async fn turn_handle_rejects_mismatched_tool_result_replacement_immediately() {
         if matches!(report.outcome, AgentOutcome::ToolResultCommitted { .. }) {
             break report;
         }
-        run.control(report.step.id, AgentControl::Continue)
+        run.control(report.step_id(), AgentControl::Continue)
             .await
             .unwrap();
     };
@@ -1431,7 +1440,10 @@ async fn turn_handle_rejects_mismatched_tool_result_replacement_immediately() {
     };
 
     let error = run
-        .control(report.step.id, AgentControl::ReplaceToolResult(replacement))
+        .control(
+            report.step_id(),
+            AgentControl::ReplaceToolResult(replacement),
+        )
         .await
         .unwrap_err();
     assert!(
@@ -1439,7 +1451,7 @@ async fn turn_handle_rejects_mismatched_tool_result_replacement_immediately() {
             .to_string()
             .contains("must keep the original call_id and name")
     );
-    run.control(report.step.id, AgentControl::Continue)
+    run.control(report.step_id(), AgentControl::Continue)
         .await
         .unwrap();
 }
@@ -1459,7 +1471,7 @@ async fn turn_handle_rejects_duplicate_tool_call_replacement_immediately() {
         if matches!(report.outcome, AgentOutcome::ToolPlanned { .. }) {
             break report;
         }
-        run.control(report.step.id, AgentControl::Continue)
+        run.control(report.step_id(), AgentControl::Continue)
             .await
             .unwrap();
     };
@@ -1470,7 +1482,7 @@ async fn turn_handle_rejects_duplicate_tool_call_replacement_immediately() {
     };
 
     let error = run
-        .control(report.step.id, AgentControl::ReplaceToolCall(replacement))
+        .control(report.step_id(), AgentControl::ReplaceToolCall(replacement))
         .await
         .unwrap_err();
     assert!(
@@ -1478,7 +1490,7 @@ async fn turn_handle_rejects_duplicate_tool_call_replacement_immediately() {
             .to_string()
             .contains("replacement tool call id must be unique")
     );
-    run.control(report.step.id, AgentControl::Continue)
+    run.control(report.step_id(), AgentControl::Continue)
         .await
         .unwrap();
 }
@@ -1496,7 +1508,7 @@ async fn turn_handle_rejects_assistant_output_inconsistent_with_finish_reason() 
         if matches!(report.outcome, AgentOutcome::ModelOutputFinished { .. }) {
             break report;
         }
-        run.control(report.step.id, AgentControl::Continue)
+        run.control(report.step_id(), AgentControl::Continue)
             .await
             .unwrap();
     };
@@ -1508,7 +1520,7 @@ async fn turn_handle_rejects_assistant_output_inconsistent_with_finish_reason() 
 
     let error = run
         .control(
-            report.step.id,
+            report.step_id(),
             AgentControl::ReplaceAssistantOutput(replacement),
         )
         .await
@@ -1518,7 +1530,7 @@ async fn turn_handle_rejects_assistant_output_inconsistent_with_finish_reason() 
             .to_string()
             .contains("finish reason Stop cannot contain tool calls")
     );
-    run.control(report.step.id, AgentControl::Continue)
+    run.control(report.step_id(), AgentControl::Continue)
         .await
         .unwrap();
 }
@@ -1545,13 +1557,13 @@ async fn turn_handle_replaces_tool_call_before_execution() {
         if matches!(report.outcome, AgentOutcome::ToolPlanned { .. }) {
             break report;
         }
-        run.control(report.step.id, AgentControl::Continue)
+        run.control(report.step_id(), AgentControl::Continue)
             .await
             .unwrap();
     };
 
     run.control(
-        report.step.id,
+        report.step_id(),
         AgentControl::ReplaceToolCall(replacement.clone()),
     )
     .await
@@ -1621,13 +1633,13 @@ async fn turn_handle_rejects_tool_call_before_execution() {
         if matches!(report.outcome, AgentOutcome::ToolPlanned { .. }) {
             break report;
         }
-        run.control(report.step.id, AgentControl::Continue)
+        run.control(report.step_id(), AgentControl::Continue)
             .await
             .unwrap();
     };
 
     run.control(
-        report.step.id,
+        report.step_id(),
         AgentControl::RejectToolCall {
             reason: "blocked by policy".to_string(),
         },
