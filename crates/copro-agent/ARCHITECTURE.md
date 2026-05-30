@@ -172,6 +172,7 @@ impl Agent {
 impl AgentRunHandle {
     pub async fn step(&self) -> Result<AgentStepReport>;
     pub async fn step_until_control(&self) -> Result<AgentControlPoint>;
+    pub async fn apply_control(&self, decision: AgentControlDecision) -> Result<AgentStepReport>;
     pub async fn control(&self, step_id: AgentStepId, control: AgentControl) -> Result<AgentStepReport>;
     pub async fn pause(&self) -> Result<()>;
     pub async fn resume(&self) -> Result<()>;
@@ -187,10 +188,21 @@ pub struct AgentStepReport {
     pub events: Vec<AgentEvent>,
 }
 
-pub struct AgentControlPoint {
-    pub step: AgentStep,
-    pub pending_outcome: AgentOutcome,
-    pub allowed_controls: Vec<AgentControlKind>,
+pub enum AgentControlPoint {
+    Basic(BasicControlPoint),
+    RequestBuilt(RequestControlPoint),
+    ModelDelta(ModelDeltaControlPoint),
+    AssistantOutput(AssistantOutputControlPoint),
+    ToolCall(ToolCallControlPoint),
+    ToolResult(ToolResultControlPoint),
+}
+
+impl RequestControlPoint {
+    pub fn replace_request(&self, request: GenerateRequest) -> AgentControlDecision;
+}
+
+impl ToolResultControlPoint {
+    pub fn replace_tool_result(&self, replacement: ToolResultReplacement) -> AgentControlDecision;
 }
 ```
 
@@ -480,8 +492,8 @@ pub enum AgentEvent {
     TurnFinished { run_id: AgentRunId, turn_id: AgentTurnId },
 
     StepStarted { step: AgentStep },
-    StepCompleted { step: AgentStep, outcome: AgentOutcome },
     ControlRequired { step: AgentStep, outcome: AgentOutcome },
+    StepCompleted { step: AgentStep, outcome: AgentOutcome },
 
     ModelDelta {
         step_id: AgentStepId,
@@ -512,6 +524,7 @@ event 规则：
 
 - `AgentEvent` 只描述已经发生或正在等待外部控制的事实。
 - `ControlRequired` 只表示 run 等待 `AgentControl`，不代表 control 本身。
+- `StepCompleted` 只表示 control 已应用后的 final outcome，不承载 pending outcome。
 - `ModelDelta` 必须是 `DropModelDelta` / `ReplaceModelDelta` 应用后的最终 delta。
 - `AssistantCommitted` 必须在 assistant message 已写入 context history 后发出。
 - `ToolResultCommitted` 必须在 tool result message 已写入 context history 后发出。
@@ -550,6 +563,7 @@ event 规则：
 - 调度器可以监听 `AgentEvent`，也可以在 `AgentControlPoint` 上改写 pending outcome。
 - 调度器不能直接修改 `AgentTurn`、`AgentRunState`、in-flight handle 或 `AgentContext` history。
 - 调度器不能提交 stale `AgentControl`；每次 control 必须携带当前 `AgentStepId`。
+- 常规路径应通过 typed control point 生成 `AgentControlDecision`；低层 `control()` 会立即拒绝非法 control kind 和非法 replacement invariant。
 - 调度器 trait 如果需要，放在上层 crate，例如 `AgentRunDriver` / `AgentOrchestrator`，不进入底层核心。
 
 示例 API：

@@ -8,7 +8,7 @@ use crate::turn::{
 };
 use copro_api::error::{Error, Result};
 use copro_api::message::{
-    InputContent, Message, OutputContent, ToolCall, ToolResult, ToolResultStatus,
+    InputContent, Message, OutputContent, ToolCall, ToolCallId, ToolResult, ToolResultStatus,
 };
 use copro_api::request::GenerateRequest;
 use copro_api::response::{FinishReason, Usage};
@@ -17,6 +17,7 @@ use copro_api::tool::ToolDefinition;
 use derive_more::{Deref, Display, From, Into};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::any::Any;
+use std::collections::HashSet;
 use std::mem;
 use std::result::Result as StdResult;
 use std::sync::Arc;
@@ -146,6 +147,13 @@ pub enum AgentControl {
     ReplaceToolCall(ToolCall),
     RejectToolCall { reason: String },
     ReplaceToolResult(ToolResult),
+    ReplaceToolResultContent(ToolResultReplacement),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResultReplacement {
+    pub status: ToolResultStatus,
+    pub content: Vec<InputContent>,
 }
 
 impl AgentControl {
@@ -161,7 +169,9 @@ impl AgentControl {
             AgentControl::ReplaceAssistantOutput(_) => AgentControlKind::ReplaceAssistantOutput,
             AgentControl::ReplaceToolCall(_) => AgentControlKind::ReplaceToolCall,
             AgentControl::RejectToolCall { .. } => AgentControlKind::RejectToolCall,
-            AgentControl::ReplaceToolResult(_) => AgentControlKind::ReplaceToolResult,
+            AgentControl::ReplaceToolResult(_) | AgentControl::ReplaceToolResultContent(_) => {
+                AgentControlKind::ReplaceToolResult
+            }
         }
     }
 }
@@ -216,10 +226,344 @@ pub struct AgentStepReport {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct AgentControlPoint {
-    pub step: AgentStep,
-    pub pending_outcome: AgentOutcome,
-    pub allowed_controls: Vec<AgentControlKind>,
+pub enum AgentControlPoint {
+    Basic(BasicControlPoint),
+    RequestBuilt(RequestControlPoint),
+    ModelDelta(ModelDeltaControlPoint),
+    AssistantOutput(AssistantOutputControlPoint),
+    ToolCall(ToolCallControlPoint),
+    ToolResult(ToolResultControlPoint),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BasicControlPoint {
+    data: AgentControlPointData,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestControlPoint {
+    data: AgentControlPointData,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelDeltaControlPoint {
+    data: AgentControlPointData,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssistantOutputControlPoint {
+    data: AgentControlPointData,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCallControlPoint {
+    data: AgentControlPointData,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolResultControlPoint {
+    data: AgentControlPointData,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct AgentControlPointData {
+    report: AgentStepReport,
+    allowed_controls: Vec<AgentControlKind>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentControlDecision {
+    step_id: AgentStepId,
+    control: AgentControl,
+}
+
+impl AgentControlDecision {
+    pub fn step_id(&self) -> AgentStepId {
+        self.step_id
+    }
+
+    pub fn kind(&self) -> AgentControlKind {
+        self.control.kind()
+    }
+
+    pub fn into_parts(self) -> (AgentStepId, AgentControl) {
+        (self.step_id, self.control)
+    }
+}
+
+impl AgentControlPoint {
+    fn from_report(report: AgentStepReport) -> Self {
+        let data = AgentControlPointData::new(report);
+        match &data.report.outcome {
+            AgentOutcome::RequestBuilt(_) => Self::RequestBuilt(RequestControlPoint { data }),
+            AgentOutcome::ModelDelta { .. } => Self::ModelDelta(ModelDeltaControlPoint { data }),
+            AgentOutcome::ModelOutputFinished { .. } => {
+                Self::AssistantOutput(AssistantOutputControlPoint { data })
+            }
+            AgentOutcome::ToolPlanned { .. } | AgentOutcome::ToolRejected { .. } => {
+                Self::ToolCall(ToolCallControlPoint { data })
+            }
+            AgentOutcome::ToolResultCommitted { .. } => {
+                Self::ToolResult(ToolResultControlPoint { data })
+            }
+            _ => Self::Basic(BasicControlPoint { data }),
+        }
+    }
+
+    fn data(&self) -> &AgentControlPointData {
+        match self {
+            AgentControlPoint::Basic(point) => &point.data,
+            AgentControlPoint::RequestBuilt(point) => &point.data,
+            AgentControlPoint::ModelDelta(point) => &point.data,
+            AgentControlPoint::AssistantOutput(point) => &point.data,
+            AgentControlPoint::ToolCall(point) => &point.data,
+            AgentControlPoint::ToolResult(point) => &point.data,
+        }
+    }
+
+    fn into_data(self) -> AgentControlPointData {
+        match self {
+            AgentControlPoint::Basic(point) => point.data,
+            AgentControlPoint::RequestBuilt(point) => point.data,
+            AgentControlPoint::ModelDelta(point) => point.data,
+            AgentControlPoint::AssistantOutput(point) => point.data,
+            AgentControlPoint::ToolCall(point) => point.data,
+            AgentControlPoint::ToolResult(point) => point.data,
+        }
+    }
+
+    pub fn step(&self) -> &AgentStep {
+        self.data().step()
+    }
+
+    pub fn pending_outcome(&self) -> &AgentOutcome {
+        self.data().pending_outcome()
+    }
+
+    pub fn allowed_controls(&self) -> &[AgentControlKind] {
+        self.data().allowed_controls()
+    }
+
+    pub fn events(&self) -> &[AgentEvent] {
+        self.data().events()
+    }
+
+    pub fn into_report(self) -> AgentStepReport {
+        self.into_data().report
+    }
+
+    pub fn continue_run(&self) -> AgentControlDecision {
+        self.data().decision(AgentControl::Continue)
+    }
+
+    pub fn pause(&self) -> AgentControlDecision {
+        self.data().decision(AgentControl::Pause)
+    }
+
+    pub fn abort_turn(&self) -> AgentControlDecision {
+        self.data().decision(AgentControl::AbortTurn)
+    }
+
+    pub fn abort_run(&self) -> AgentControlDecision {
+        self.data().decision(AgentControl::AbortRun)
+    }
+}
+
+impl AgentControlPointData {
+    fn new(report: AgentStepReport) -> Self {
+        let allowed_controls = allowed_controls_for_outcome(&report.outcome);
+        Self {
+            report,
+            allowed_controls,
+        }
+    }
+
+    fn step(&self) -> &AgentStep {
+        &self.report.step
+    }
+
+    fn pending_outcome(&self) -> &AgentOutcome {
+        &self.report.outcome
+    }
+
+    fn allowed_controls(&self) -> &[AgentControlKind] {
+        &self.allowed_controls
+    }
+
+    fn events(&self) -> &[AgentEvent] {
+        &self.report.events
+    }
+
+    fn decision(&self, control: AgentControl) -> AgentControlDecision {
+        AgentControlDecision {
+            step_id: self.report.step.id,
+            control,
+        }
+    }
+}
+
+macro_rules! impl_common_control_point_methods {
+    ($ty:ty) => {
+        impl $ty {
+            pub fn step(&self) -> &AgentStep {
+                self.data.step()
+            }
+
+            pub fn pending_outcome(&self) -> &AgentOutcome {
+                self.data.pending_outcome()
+            }
+
+            pub fn allowed_controls(&self) -> &[AgentControlKind] {
+                self.data.allowed_controls()
+            }
+
+            pub fn events(&self) -> &[AgentEvent] {
+                self.data.events()
+            }
+
+            pub fn into_report(self) -> AgentStepReport {
+                self.data.report
+            }
+
+            pub fn continue_run(&self) -> AgentControlDecision {
+                self.data.decision(AgentControl::Continue)
+            }
+
+            pub fn pause(&self) -> AgentControlDecision {
+                self.data.decision(AgentControl::Pause)
+            }
+
+            pub fn abort_turn(&self) -> AgentControlDecision {
+                self.data.decision(AgentControl::AbortTurn)
+            }
+
+            pub fn abort_run(&self) -> AgentControlDecision {
+                self.data.decision(AgentControl::AbortRun)
+            }
+        }
+    };
+}
+
+impl_common_control_point_methods!(BasicControlPoint);
+impl_common_control_point_methods!(RequestControlPoint);
+impl_common_control_point_methods!(ModelDeltaControlPoint);
+impl_common_control_point_methods!(AssistantOutputControlPoint);
+impl_common_control_point_methods!(ToolCallControlPoint);
+impl_common_control_point_methods!(ToolResultControlPoint);
+
+impl RequestControlPoint {
+    pub fn request(&self) -> &GenerateRequest {
+        let AgentOutcome::RequestBuilt(request) = self.data.pending_outcome() else {
+            unreachable!("request control point must carry a request outcome")
+        };
+        request
+    }
+
+    pub fn replace_request(&self, request: GenerateRequest) -> AgentControlDecision {
+        self.data.decision(AgentControl::ReplaceRequest(request))
+    }
+}
+
+impl ModelDeltaControlPoint {
+    pub fn content_index(&self) -> usize {
+        let AgentOutcome::ModelDelta { content_index, .. } = self.data.pending_outcome() else {
+            unreachable!("model delta control point must carry a model delta outcome")
+        };
+        *content_index
+    }
+
+    pub fn delta(&self) -> &OutputContentDelta {
+        let AgentOutcome::ModelDelta { delta, .. } = self.data.pending_outcome() else {
+            unreachable!("model delta control point must carry a model delta outcome")
+        };
+        delta
+    }
+
+    pub fn replace_delta(&self, delta: OutputContentDelta) -> AgentControlDecision {
+        self.data.decision(AgentControl::ReplaceModelDelta(delta))
+    }
+
+    pub fn drop_delta(&self) -> AgentControlDecision {
+        self.data.decision(AgentControl::DropModelDelta)
+    }
+}
+
+impl AssistantOutputControlPoint {
+    pub fn content(&self) -> &[OutputContent] {
+        let AgentOutcome::ModelOutputFinished { content, .. } = self.data.pending_outcome() else {
+            unreachable!("assistant output control point must carry a model output outcome")
+        };
+        content
+    }
+
+    pub fn reason(&self) -> FinishReason {
+        let AgentOutcome::ModelOutputFinished { reason, .. } = self.data.pending_outcome() else {
+            unreachable!("assistant output control point must carry a model output outcome")
+        };
+        *reason
+    }
+
+    pub fn usage(&self) -> Option<&Usage> {
+        let AgentOutcome::ModelOutputFinished { usage, .. } = self.data.pending_outcome() else {
+            unreachable!("assistant output control point must carry a model output outcome")
+        };
+        usage.as_ref()
+    }
+
+    pub fn replace_output(&self, content: Vec<OutputContent>) -> AgentControlDecision {
+        self.data
+            .decision(AgentControl::ReplaceAssistantOutput(content))
+    }
+}
+
+impl ToolCallControlPoint {
+    pub fn tool(&self) -> &ToolCall {
+        match self.data.pending_outcome() {
+            AgentOutcome::ToolPlanned { tool, .. } | AgentOutcome::ToolRejected { tool, .. } => {
+                tool
+            }
+            _ => unreachable!("tool call control point must carry a tool call outcome"),
+        }
+    }
+
+    pub fn policy(&self) -> Option<ToolExecutionPolicy> {
+        match self.data.pending_outcome() {
+            AgentOutcome::ToolPlanned { policy, .. } => Some(*policy),
+            AgentOutcome::ToolRejected { .. } => None,
+            _ => unreachable!("tool call control point must carry a tool call outcome"),
+        }
+    }
+
+    pub fn replace_tool_call(&self, tool: ToolCall) -> AgentControlDecision {
+        self.data.decision(AgentControl::ReplaceToolCall(tool))
+    }
+
+    pub fn reject_tool_call(&self, reason: impl Into<String>) -> AgentControlDecision {
+        self.data.decision(AgentControl::RejectToolCall {
+            reason: reason.into(),
+        })
+    }
+}
+
+impl ToolResultControlPoint {
+    pub fn tool(&self) -> &ToolCall {
+        let AgentOutcome::ToolResultCommitted { tool, .. } = self.data.pending_outcome() else {
+            unreachable!("tool result control point must carry a tool result outcome")
+        };
+        tool
+    }
+
+    pub fn result(&self) -> &ToolResult {
+        let AgentOutcome::ToolResultCommitted { result, .. } = self.data.pending_outcome() else {
+            unreachable!("tool result control point must carry a tool result outcome")
+        };
+        result
+    }
+
+    pub fn replace_tool_result(&self, replacement: ToolResultReplacement) -> AgentControlDecision {
+        self.data
+            .decision(AgentControl::ReplaceToolResultContent(replacement))
+    }
 }
 
 #[derive(Clone)]
@@ -233,6 +577,7 @@ struct AgentRunHandleState {
     pending_control: Option<(AgentStepId, oneshot::Sender<AgentControl>)>,
     last_report: Option<AgentStepReport>,
     state: Option<AgentRunState>,
+    active_tool_call_ids: HashSet<ToolCallId>,
 }
 
 impl AgentRunHandle {
@@ -243,6 +588,7 @@ impl AgentRunHandle {
                 pending_control: None,
                 last_report: None,
                 state: None,
+                active_tool_call_ids: HashSet::new(),
             })),
             stop_signal,
         }
@@ -307,11 +653,12 @@ impl AgentRunHandle {
 
     pub async fn step_until_control(&self) -> Result<AgentControlPoint> {
         let report = self.step().await?;
-        Ok(AgentControlPoint {
-            step: report.step,
-            allowed_controls: allowed_controls_for_outcome(&report.outcome),
-            pending_outcome: report.outcome,
-        })
+        Ok(AgentControlPoint::from_report(report))
+    }
+
+    pub async fn apply_control(&self, decision: AgentControlDecision) -> Result<AgentStepReport> {
+        let (step_id, control) = decision.into_parts();
+        self.control(step_id, control).await
     }
 
     pub async fn control(
@@ -330,6 +677,8 @@ impl AgentRunHandle {
         if *pending_step_id != step_id {
             return Err(Error::client("stale agent control step id"));
         }
+        inner.validate_control(&report.outcome, &control)?;
+        inner.observe_control(&report.outcome, &control);
 
         match control {
             AgentControl::Continue => {
@@ -406,6 +755,42 @@ impl AgentRunHandle {
 }
 
 impl AgentRunHandleState {
+    fn validate_control(&self, outcome: &AgentOutcome, control: &AgentControl) -> Result<()> {
+        if !allowed_controls_for_outcome(outcome).contains(&control.kind()) {
+            return Err(Error::client(format!(
+                "agent control {:?} is not valid for this step",
+                control.kind()
+            )));
+        }
+
+        match (outcome, control) {
+            (
+                AgentOutcome::ToolResultCommitted { tool, .. },
+                AgentControl::ReplaceToolResult(result),
+            ) => validate_tool_result_identity(tool, result),
+            (
+                AgentOutcome::ToolPlanned { tool, .. } | AgentOutcome::ToolRejected { tool, .. },
+                AgentControl::ReplaceToolCall(replacement),
+            ) => validate_tool_call_replacement(&self.active_tool_call_ids, tool, replacement),
+            (
+                AgentOutcome::ModelOutputFinished { reason, .. },
+                AgentControl::ReplaceAssistantOutput(content),
+            ) => validate_assistant_output_for_reason(*reason, content),
+            _ => Ok(()),
+        }
+    }
+
+    fn observe_control(&mut self, outcome: &AgentOutcome, control: &AgentControl) {
+        if let (
+            AgentOutcome::ToolPlanned { tool, .. } | AgentOutcome::ToolRejected { tool, .. },
+            AgentControl::ReplaceToolCall(replacement),
+        ) = (outcome, control)
+        {
+            self.active_tool_call_ids.remove(&tool.id);
+            self.active_tool_call_ids.insert(replacement.id.clone());
+        }
+    }
+
     fn continue_pending_control(&mut self) {
         self.send_pending_control(AgentControl::Continue);
     }
@@ -439,6 +824,15 @@ impl AgentRunHandleState {
             AgentEvent::RunAborted { .. } => {
                 self.state = Some(AgentRunState::Aborted);
             }
+            AgentEvent::AssistantCommitted { content, .. } => {
+                self.active_tool_call_ids = content
+                    .iter()
+                    .filter_map(|item| match item {
+                        OutputContent::ToolCall(tool) => Some(tool.id.clone()),
+                        _ => None,
+                    })
+                    .collect();
+            }
             _ => {}
         }
     }
@@ -470,6 +864,46 @@ fn allowed_controls_for_outcome(outcome: &AgentOutcome) -> Vec<AgentControlKind>
         _ => {}
     }
     controls
+}
+
+fn validate_tool_result_identity(tool: &ToolCall, result: &ToolResult) -> Result<()> {
+    if result.call_id.as_str() != tool.id.as_str() || result.name.as_str() != tool.name.as_str() {
+        return Err(Error::client(
+            "replacement tool result must keep the original call_id and name",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tool_call_replacement(
+    active_tool_call_ids: &HashSet<ToolCallId>,
+    original: &ToolCall,
+    replacement: &ToolCall,
+) -> Result<()> {
+    if replacement.id != original.id && active_tool_call_ids.contains(&replacement.id) {
+        return Err(Error::client(
+            "replacement tool call id must be unique in the current turn",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_assistant_output_for_reason(
+    reason: FinishReason,
+    content: &[OutputContent],
+) -> Result<()> {
+    let has_tool_call = content
+        .iter()
+        .any(|item| matches!(item, OutputContent::ToolCall(_)));
+    match reason {
+        FinishReason::Stop if has_tool_call => Err(Error::client(
+            "assistant output with finish reason Stop cannot contain tool calls",
+        )),
+        FinishReason::ToolCalls if !has_tool_call => Err(Error::client(
+            "assistant output with finish reason ToolCalls must contain a tool call",
+        )),
+        _ => Ok(()),
+    }
 }
 
 struct AgentRunClock {
@@ -1104,6 +1538,14 @@ impl<'a> AgentRun<'a> {
                             AgentControl::Continue => {}
                             AgentControl::ReplaceToolResult(replacement) => {
                                 result = replacement;
+                            }
+                            AgentControl::ReplaceToolResultContent(replacement) => {
+                                result = ToolResult {
+                                    call_id: tool.id.clone(),
+                                    name: tool.name.clone(),
+                                    status: replacement.status,
+                                    content: replacement.content,
+                                };
                             }
                             other => {
                                 let _ = complete_step_after_control(

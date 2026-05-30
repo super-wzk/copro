@@ -1,4 +1,6 @@
-use copro_agent::{Agent, AgentControl, AgentEvent, AgentOutcome, ToolExecutionPolicy, ToolRouter};
+use copro_agent::{
+    Agent, AgentControlPoint, AgentEvent, AgentOutcome, ToolExecutionPolicy, ToolRouter,
+};
 use copro_api::message::{InputContent, Message, OutputContent, ToolResultStatus};
 use copro_api::stream::OutputContentDelta;
 use copro_harness::skills::{SkillRequestInjector, SkillRuntime, SkillToolRouter};
@@ -122,21 +124,20 @@ async fn run_turn(
     let mut streaming_thinking = false;
 
     loop {
-        let report = run.step().await?;
-        for event in report.events {
+        let point = run.step_until_control().await?;
+        for event in point.events().iter().cloned() {
             handle_agent_event(event, &mut started_assistant, &mut streaming_thinking)?;
         }
 
-        let step_id = report.step.id;
-        let finished = matches!(report.outcome, AgentOutcome::TurnFinished);
-        match report.outcome {
-            AgentOutcome::RequestBuilt(mut request) => {
+        let finished = matches!(point.pending_outcome(), AgentOutcome::TurnFinished);
+        match point {
+            AgentControlPoint::RequestBuilt(point) => {
+                let mut request = point.request().clone();
                 skill_request.prepare_request(&mut request).await?;
-                run.control(step_id, AgentControl::ReplaceRequest(request))
-                    .await?;
+                run.apply_control(point.replace_request(request)).await?;
             }
-            _ => {
-                run.control(step_id, AgentControl::Continue).await?;
+            point => {
+                run.apply_control(point.continue_run()).await?;
             }
         }
 

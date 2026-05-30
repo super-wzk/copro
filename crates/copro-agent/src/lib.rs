@@ -14,9 +14,11 @@ mod turn;
 pub use agent::Agent;
 pub use event::{AgentEvent, AgentStream};
 pub use run::{
-    AgentAction, AgentControl, AgentControlKind, AgentControlPoint, AgentInterruptReason,
-    AgentOutcome, AgentRunHandle, AgentRunId, AgentRunState, AgentStep, AgentStepId,
-    AgentStepReport, AgentTurnId,
+    AgentAction, AgentControl, AgentControlDecision, AgentControlKind, AgentControlPoint,
+    AgentInterruptReason, AgentOutcome, AgentRunHandle, AgentRunId, AgentRunState, AgentStep,
+    AgentStepId, AgentStepReport, AgentTurnId, AssistantOutputControlPoint, BasicControlPoint,
+    ModelDeltaControlPoint, RequestControlPoint, ToolCallControlPoint, ToolResultControlPoint,
+    ToolResultReplacement,
 };
 pub use runtime::StopSignal;
 pub use tools::{ToolExecutionPolicy, ToolRouter};

@@ -10,6 +10,10 @@
 
 - `AgentRunHandle` 已提供 `step()`、`step_until_control()`、`control()`、`events()`、`pause()`、`resume()`、`preempt()`。
 - `AgentEvent` 已切换为核心 step-level 事件。
+- `ControlRequired` / `StepCompleted` 已分离：前者表示 pending boundary，后者只表示 control 应用后的 final outcome。
+- `AgentControlPoint` 已拆为 typed enum，并提供 `AgentControlDecision` / `apply_control()` 常规路径。
+- `control()` 已对非法 control kind 和 replacement invariant 做即时校验。
+- `ToolResultReplacement` 已用于 typed tool result replacement，由运行层自动填充 `call_id` / `name`。
 - `run_stream()` 已基于 `AgentRunHandle` auto mode 实现。
 - `AgentControl` 已支持 request、model delta、assistant output、tool call、tool result 的改写/拒绝。
 - `AgentHook` / `AgentHooks` / `ToolCallDecision` 已从当前工作区代码中移除。
@@ -17,17 +21,11 @@
 - `simple-cli` 已通过 `RequestBuilt` boundary 使用 `ReplaceRequest` 注入 skills request。
 - `cargo clippy`、`cargo test -p copro-agent`、`cargo test`、RustRover build 已在当前迁移过程中通过。
 
-当前未提交：
-
-- hook 移除和 skills injector 迁移。
-- clippy warning 修复。
-- 本计划文档。
-
 ## 剩余风险
 
-### 1. ControlRequired / StepCompleted 语义未分离
+### 1. ControlRequired / StepCompleted 语义未分离（已完成）
 
-问题：
+原问题：
 
 - 当前 `StepCompleted` 既表示 pending control boundary，又被外部当作 step 完成事件。
 - `Replace*` / `Drop*` control 后，已发出的 `StepCompleted` outcome 可能不是最终 outcome。
@@ -46,9 +44,9 @@
 - `step()` 返回 control point 时不再把 pending outcome 伪装成 completed。
 - 新增测试覆盖 `ControlRequired -> control -> StepCompleted` 顺序。
 
-### 2. control() 合法性校验滞后
+### 2. control() 合法性校验滞后（已完成）
 
-问题：
+原问题：
 
 - stale `AgentStepId` 已能立即拒绝。
 - 非法 `AgentControl` 仍可能在 `control()` 返回 `Ok` 后，由下一次 `step()` 暴露错误。
@@ -135,9 +133,9 @@
 - dropped consumer 能释放 driver lease。
 - 测试覆盖 `events()` 与 `step()` 并发/交替误用。
 
-### 6. 替换 control 缺少一致性校验
+### 6. 替换 control 缺少一致性校验（已完成）
 
-问题：
+原问题：
 
 - `ReplaceToolResult` 不验证 `call_id` / `name` 是否匹配原 tool。
 - `ReplaceToolCall` 不检查同 turn 内 `ToolCall.id` 唯一。

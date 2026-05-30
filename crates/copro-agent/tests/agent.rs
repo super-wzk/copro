@@ -1,6 +1,7 @@
 use copro_agent::{
-    Agent, AgentAction, AgentControl, AgentEvent, AgentOutcome, AgentRunState, CancellationToken,
-    StopSignal, ToolExecutionPolicy, ToolRouter, async_trait,
+    Agent, AgentAction, AgentControl, AgentControlPoint, AgentEvent, AgentOutcome, AgentRunState,
+    CancellationToken, StopSignal, ToolExecutionPolicy, ToolResultReplacement, ToolRouter,
+    async_trait,
 };
 use copro_api::error::Result;
 use copro_api::message::{
@@ -528,20 +529,23 @@ async fn run_handle_reports_illegal_control_for_step() {
     let report = run.step().await.unwrap();
     assert!(matches!(report.outcome, AgentOutcome::ToolsLoaded(_)));
 
-    run.control(
-        report.step.id,
-        AgentControl::ReplaceRequest(GenerateRequest {
-            messages: Vec::new(),
-            tools: Vec::new(),
-            hosted_tools: Vec::new(),
-            tool_choice: None,
-            options: GenerateRequestOptions::default(),
-        }),
-    )
-    .await
-    .unwrap();
-    let error = run.step().await.unwrap_err();
+    let error = run
+        .control(
+            report.step.id,
+            AgentControl::ReplaceRequest(GenerateRequest {
+                messages: Vec::new(),
+                tools: Vec::new(),
+                hosted_tools: Vec::new(),
+                tool_choice: None,
+                options: GenerateRequestOptions::default(),
+            }),
+        )
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("is not valid for this step"));
+    run.control(report.step.id, AgentControl::Continue)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -748,22 +752,20 @@ async fn run_handle_replaces_request_before_model_stream() {
     };
     let run = agent.start_run().await.unwrap();
 
-    let report = loop {
-        let report = run.step().await.unwrap();
-        if matches!(report.outcome, AgentOutcome::RequestBuilt(_)) {
-            break report;
+    let point = loop {
+        let point = run.step_until_control().await.unwrap();
+        if matches!(point, AgentControlPoint::RequestBuilt(_)) {
+            break point;
         }
-        run.control(report.step.id, AgentControl::Continue)
-            .await
-            .unwrap();
+        run.apply_control(point.continue_run()).await.unwrap();
+    };
+    let AgentControlPoint::RequestBuilt(point) = point else {
+        unreachable!("request control point expected")
     };
 
-    run.control(
-        report.step.id,
-        AgentControl::ReplaceRequest(replacement.clone()),
-    )
-    .await
-    .unwrap();
+    run.apply_control(point.replace_request(replacement.clone()))
+        .await
+        .unwrap();
     run.clone()
         .events()
         .collect::<Vec<_>>()
@@ -833,32 +835,34 @@ async fn run_handle_replaces_tool_result_before_commit() {
     );
     let run = agent.start_run().await.unwrap();
 
-    let report = loop {
-        let report = run.step().await.unwrap();
-        if matches!(report.outcome, AgentOutcome::ToolResultCommitted { .. }) {
-            break report;
+    let point = loop {
+        let point = run.step_until_control().await.unwrap();
+        if matches!(point, AgentControlPoint::ToolResult(_)) {
+            break point;
         }
-        run.control(report.step.id, AgentControl::Continue)
-            .await
-            .unwrap();
+        run.apply_control(point.continue_run()).await.unwrap();
     };
-    let replacement = ToolResult {
+    let AgentControlPoint::ToolResult(point) = point else {
+        unreachable!("tool result control point expected")
+    };
+    let replacement = ToolResultReplacement {
+        status: ToolResultStatus::Error,
+        content: vec![InputContent::Text("blocked".to_string())],
+    };
+    let expected = ToolResult {
         call_id: "call-1".into(),
         name: "double".to_string(),
         status: ToolResultStatus::Error,
         content: vec![InputContent::Text("blocked".to_string())],
     };
 
-    run.control(
-        report.step.id,
-        AgentControl::ReplaceToolResult(replacement.clone()),
-    )
-    .await
-    .unwrap();
+    run.apply_control(point.replace_tool_result(replacement))
+        .await
+        .unwrap();
     let next = run.step().await.unwrap();
     assert!(next.events.iter().any(|event| matches!(
         event,
-        AgentEvent::ToolResultCommitted { result, .. } if result == &replacement
+        AgentEvent::ToolResultCommitted { result, .. } if result == &expected
     )));
     run.control(next.step.id, AgentControl::Continue)
         .await
@@ -876,8 +880,127 @@ async fn run_handle_replaces_tool_result_before_commit() {
             .await
             .unwrap()
             .iter()
-            .any(|message| matches!(message, Message::Tool(result) if result == &replacement))
+            .any(|message| matches!(message, Message::Tool(result) if result == &expected))
     );
+}
+
+#[tokio::test]
+async fn run_handle_rejects_mismatched_tool_result_replacement_immediately() {
+    let agent = Agent::new(
+        Arc::new(ToolThenDoneModel {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(DoubleToolRouter),
+    );
+    let run = agent.start_run().await.unwrap();
+
+    let report = loop {
+        let report = run.step().await.unwrap();
+        if matches!(report.outcome, AgentOutcome::ToolResultCommitted { .. }) {
+            break report;
+        }
+        run.control(report.step.id, AgentControl::Continue)
+            .await
+            .unwrap();
+    };
+    let replacement = ToolResult {
+        call_id: "wrong-call".into(),
+        name: "double".to_string(),
+        status: ToolResultStatus::Error,
+        content: vec![InputContent::Text("blocked".to_string())],
+    };
+
+    let error = run
+        .control(report.step.id, AgentControl::ReplaceToolResult(replacement))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("must keep the original call_id and name")
+    );
+    run.control(report.step.id, AgentControl::Continue)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn run_handle_rejects_duplicate_tool_call_replacement_immediately() {
+    let agent = Agent::new(
+        Arc::new(MultiToolThenDoneModel {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(ConcurrentToolRouter::default()),
+    );
+    let run = agent.start_run().await.unwrap();
+
+    let report = loop {
+        let report = run.step().await.unwrap();
+        if matches!(report.outcome, AgentOutcome::ToolPlanned { .. }) {
+            break report;
+        }
+        run.control(report.step.id, AgentControl::Continue)
+            .await
+            .unwrap();
+    };
+    let replacement = ToolCall {
+        id: "call-p2".into(),
+        name: "p1".to_string(),
+        arguments: serde_json::Map::new(),
+    };
+
+    let error = run
+        .control(report.step.id, AgentControl::ReplaceToolCall(replacement))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("replacement tool call id must be unique")
+    );
+    run.control(report.step.id, AgentControl::Continue)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn run_handle_rejects_assistant_output_inconsistent_with_finish_reason() {
+    let agent = test_agent(vec![OutputStreamEvent::Finished {
+        reason: FinishReason::Stop,
+        usage: None,
+    }]);
+    let run = agent.start_run().await.unwrap();
+
+    let report = loop {
+        let report = run.step().await.unwrap();
+        if matches!(report.outcome, AgentOutcome::ModelOutputFinished { .. }) {
+            break report;
+        }
+        run.control(report.step.id, AgentControl::Continue)
+            .await
+            .unwrap();
+    };
+    let replacement = vec![OutputContent::ToolCall(ToolCall {
+        id: "call-1".into(),
+        name: "double".to_string(),
+        arguments: serde_json::Map::new(),
+    })];
+
+    let error = run
+        .control(
+            report.step.id,
+            AgentControl::ReplaceAssistantOutput(replacement),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("finish reason Stop cannot contain tool calls")
+    );
+    run.control(report.step.id, AgentControl::Continue)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
