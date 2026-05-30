@@ -1,8 +1,8 @@
 use super::{
-    AgentCheckpoint, AgentControl, AgentControlKind, AgentControlSignal, AgentOutcome,
-    AgentRunState, AgentStep, AgentStepId, AgentStepReport,
+    AgentCheckpoint, AgentControl, AgentControlKind, AgentControlSignal, AgentOutcome, AgentStep,
+    AgentStepId, AgentStepReport, AgentTurnState,
 };
-use crate::cancel::RunCancellation;
+use crate::cancel::TurnCancellation;
 use crate::context::AgentStreamItem;
 use crate::event::{AgentEvent, AgentStream};
 use copro_api::error::{Error, Result};
@@ -14,41 +14,41 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 #[derive(Clone)]
-pub struct AgentRunHandle {
+pub struct AgentTurnHandle {
     events: Arc<Mutex<mpsc::Receiver<AgentStreamItem>>>,
-    state: Arc<Mutex<AgentRunHandleState>>,
-    cancellation: RunCancellation,
+    state: Arc<Mutex<AgentTurnHandleState>>,
+    cancellation: TurnCancellation,
     driver_active: Arc<AtomicBool>,
 }
 
-struct AgentRunDriverLease {
+struct AgentTurnDriverLease {
     active: Arc<AtomicBool>,
 }
 
-impl Drop for AgentRunDriverLease {
+impl Drop for AgentTurnDriverLease {
     fn drop(&mut self) {
         self.active.store(false, Ordering::Release);
     }
 }
 
-struct AgentRunHandleState {
+struct AgentTurnHandleState {
     pending_control: Option<(AgentStepId, oneshot::Sender<AgentControlSignal>)>,
     pending_resume: Option<(AgentStepId, oneshot::Sender<()>)>,
     pause_requested: bool,
     preempt_requested: bool,
     last_report: Option<AgentStepReport>,
-    state: Option<AgentRunState>,
+    state: Option<AgentTurnState>,
     active_tool_call_ids: HashSet<ToolCallId>,
 }
 
-impl AgentRunHandle {
+impl AgentTurnHandle {
     pub(crate) fn new(
         events: mpsc::Receiver<AgentStreamItem>,
-        cancellation: RunCancellation,
+        cancellation: TurnCancellation,
     ) -> Self {
         Self {
             events: Arc::new(Mutex::new(events)),
-            state: Arc::new(Mutex::new(AgentRunHandleState {
+            state: Arc::new(Mutex::new(AgentTurnHandleState {
                 pending_control: None,
                 pending_resume: None,
                 pause_requested: false,
@@ -87,7 +87,7 @@ impl AgentRunHandle {
                 .await
                 .recv()
                 .await
-                .ok_or_else(|| Error::client("agent run finished"))?;
+                .ok_or_else(|| Error::client("agent turn finished"))?;
 
             match item {
                 AgentStreamItem::Event(event) => {
@@ -118,7 +118,7 @@ impl AgentRunHandle {
                     return Ok(report);
                 }
                 AgentStreamItem::Error(error) => {
-                    self.state.lock().await.state = Some(AgentRunState::Aborted);
+                    self.state.lock().await.state = Some(AgentTurnState::Aborted);
                     return Err(error);
                 }
             }
@@ -139,9 +139,9 @@ impl AgentRunHandle {
         let report = inner
             .last_report
             .clone()
-            .ok_or_else(|| Error::client("agent run is not waiting for control"))?;
+            .ok_or_else(|| Error::client("agent turn is not waiting for control"))?;
         let Some((pending_step_id, _)) = &inner.pending_control else {
-            return Err(Error::client("agent run is not waiting for control"));
+            return Err(Error::client("agent turn is not waiting for control"));
         };
         if *pending_step_id != step_id {
             return Err(Error::client("stale agent control step id"));
@@ -156,26 +156,26 @@ impl AgentRunHandle {
             }
             AgentControl::Pause => {
                 inner.send_pause_control(step_id);
-                inner.state = Some(AgentRunState::Paused { at: step_id });
+                inner.state = Some(AgentTurnState::Paused { at: step_id });
                 Ok(report)
             }
-            AgentControl::FinishRun => {
+            AgentControl::FinishTurn => {
                 self.cancellation.cancel();
                 inner.send_pending_control(control);
                 inner.state = if outcome_requires_recovery(&report.outcome) {
-                    Some(AgentRunState::Recovering { after: step_id })
+                    Some(AgentTurnState::Recovering { after: step_id })
                 } else {
-                    Some(AgentRunState::Finished)
+                    Some(AgentTurnState::Finished)
                 };
                 Ok(report)
             }
-            AgentControl::AbortRun => {
+            AgentControl::AbortTurn => {
                 self.cancellation.cancel();
                 inner.send_pending_control(control);
                 inner.state = if outcome_requires_recovery(&report.outcome) {
-                    Some(AgentRunState::Recovering { after: step_id })
+                    Some(AgentTurnState::Recovering { after: step_id })
                 } else {
-                    Some(AgentRunState::Aborted)
+                    Some(AgentTurnState::Aborted)
                 };
                 Ok(report)
             }
@@ -194,7 +194,7 @@ impl AgentRunHandle {
         };
         let step_id = *step_id;
         inner.send_pause_control(step_id);
-        inner.state = Some(AgentRunState::Paused { at: step_id });
+        inner.state = Some(AgentTurnState::Paused { at: step_id });
         Ok(())
     }
 
@@ -212,7 +212,7 @@ impl AgentRunHandle {
         self.cancellation.cancel();
         let mut inner = self.state.lock().await;
         if let Some((step_id, _)) = &inner.pending_control {
-            inner.state = Some(AgentRunState::Preempting { step_id: *step_id });
+            inner.state = Some(AgentTurnState::Preempting { step_id: *step_id });
             inner.send_pending_signal(AgentControlSignal::preempt());
         } else {
             inner.preempt_requested = true;
@@ -220,21 +220,21 @@ impl AgentRunHandle {
         Ok(())
     }
 
-    pub async fn state(&self) -> Result<AgentRunState> {
+    pub async fn state(&self) -> Result<AgentTurnState> {
         let inner = self.state.lock().await;
         inner
             .state
             .clone()
-            .ok_or_else(|| Error::client("agent run has not started"))
+            .ok_or_else(|| Error::client("agent turn has not started"))
     }
 
-    fn try_acquire_driver(&self) -> Result<AgentRunDriverLease> {
+    fn try_acquire_driver(&self) -> Result<AgentTurnDriverLease> {
         self.driver_active
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .map(|_| AgentRunDriverLease {
+            .map(|_| AgentTurnDriverLease {
                 active: Arc::clone(&self.driver_active),
             })
-            .map_err(|_| Error::client("agent run already has an active driver"))
+            .map_err(|_| Error::client("agent turn already has an active driver"))
     }
 
     async fn next_event(&self) -> Result<Option<AgentEvent>> {
@@ -263,7 +263,7 @@ impl AgentRunHandle {
                 Ok(Some(event))
             }
             Some(AgentStreamItem::Error(error)) => {
-                self.state.lock().await.state = Some(AgentRunState::Aborted);
+                self.state.lock().await.state = Some(AgentTurnState::Aborted);
                 Err(error)
             }
             None => Ok(None),
@@ -271,7 +271,7 @@ impl AgentRunHandle {
     }
 }
 
-impl AgentRunHandleState {
+impl AgentTurnHandleState {
     fn enter_auto_control_boundary(
         &mut self,
         step: &AgentStep,
@@ -281,7 +281,7 @@ impl AgentRunHandleState {
         self.enter_waiting_control(step, outcome);
         let signal = self
             .take_requested_control_signal(step.id)
-            .map_or_else(AgentControlSignal::continue_run, |(_, signal)| signal);
+            .map_or_else(AgentControlSignal::continue_turn, |(_, signal)| signal);
         let _ = reply.send(signal);
     }
 
@@ -290,7 +290,7 @@ impl AgentRunHandleState {
         step: &AgentStep,
         outcome: &AgentOutcome,
         reply: oneshot::Sender<AgentControlSignal>,
-    ) -> AgentRunState {
+    ) -> AgentTurnState {
         let mut state = self.enter_waiting_control(step, outcome);
         if let Some((requested_state, signal)) = self.take_requested_control_signal(step.id) {
             state = requested_state;
@@ -302,8 +302,12 @@ impl AgentRunHandleState {
         state
     }
 
-    fn enter_waiting_control(&mut self, step: &AgentStep, outcome: &AgentOutcome) -> AgentRunState {
-        let state = AgentRunState::WaitingControl {
+    fn enter_waiting_control(
+        &mut self,
+        step: &AgentStep,
+        outcome: &AgentOutcome,
+    ) -> AgentTurnState {
+        let state = AgentTurnState::WaitingControl {
             step: step.clone(),
             outcome: outcome.clone(),
         };
@@ -314,15 +318,15 @@ impl AgentRunHandleState {
     fn take_requested_control_signal(
         &mut self,
         step_id: AgentStepId,
-    ) -> Option<(AgentRunState, AgentControlSignal)> {
+    ) -> Option<(AgentTurnState, AgentControlSignal)> {
         if self.preempt_requested {
             self.preempt_requested = false;
-            let state = AgentRunState::Preempting { step_id };
+            let state = AgentTurnState::Preempting { step_id };
             self.state = Some(state.clone());
             Some((state, AgentControlSignal::preempt()))
         } else if self.pause_requested {
             self.pause_requested = false;
-            let state = AgentRunState::Paused { at: step_id };
+            let state = AgentTurnState::Paused { at: step_id };
             self.state = Some(state.clone());
             let signal = self.make_pause_signal(step_id);
             Some((state, signal))
@@ -402,28 +406,28 @@ impl AgentRunHandleState {
     fn observe_event(&mut self, event: &AgentEvent) {
         match event {
             AgentEvent::StepReady { step } => {
-                self.state = Some(AgentRunState::Ready {
+                self.state = Some(AgentTurnState::Ready {
                     next: step.action.clone(),
                     step_id: step.id,
                 });
             }
             AgentEvent::StepStarted { step } => {
-                self.state = Some(AgentRunState::InFlight { step: step.clone() });
+                self.state = Some(AgentTurnState::InFlight { step: step.clone() });
             }
-            AgentEvent::RunPaused { at, .. } => {
-                self.state = Some(AgentRunState::Paused { at: *at });
+            AgentEvent::TurnPaused { at, .. } => {
+                self.state = Some(AgentTurnState::Paused { at: *at });
             }
-            AgentEvent::RunPreempted { at, .. } => {
-                self.state = Some(AgentRunState::Preempting { step_id: *at });
+            AgentEvent::TurnPreempted { at, .. } => {
+                self.state = Some(AgentTurnState::Preempting { step_id: *at });
             }
-            AgentEvent::RunRecovering { after, .. } => {
-                self.state = Some(AgentRunState::Recovering { after: *after });
+            AgentEvent::TurnRecovering { after, .. } => {
+                self.state = Some(AgentTurnState::Recovering { after: *after });
             }
-            AgentEvent::RunFinished { .. } => {
-                self.state = Some(AgentRunState::Finished);
+            AgentEvent::TurnFinished => {
+                self.state = Some(AgentTurnState::Finished);
             }
-            AgentEvent::RunAborted { .. } => {
-                self.state = Some(AgentRunState::Aborted);
+            AgentEvent::TurnAborted => {
+                self.state = Some(AgentTurnState::Aborted);
             }
             AgentEvent::AssistantCommitted { content, .. } => {
                 self.active_tool_call_ids = content
@@ -443,8 +447,8 @@ fn allowed_controls_for_outcome(outcome: &AgentOutcome) -> Vec<AgentControlKind>
     let mut controls = vec![
         AgentControlKind::Continue,
         AgentControlKind::Pause,
-        AgentControlKind::FinishRun,
-        AgentControlKind::AbortRun,
+        AgentControlKind::FinishTurn,
+        AgentControlKind::AbortTurn,
     ];
     match outcome {
         AgentOutcome::RequestBuilt(_) => controls.push(AgentControlKind::ReplaceRequest),

@@ -1,14 +1,12 @@
-use crate::cancel::RunCancellation;
+use crate::cancel::TurnCancellation;
 use crate::context::{AgentCommand, AgentContext, AgentState};
-use crate::event::AgentStream;
-use crate::run::AgentRunHandle;
 use crate::tools::ToolRouter;
+use crate::turn::AgentTurnHandle;
 use copro_api::error::{Error, Result};
 use copro_api::message::Message;
 use copro_api::request::GenerateRequestOptions;
 use copro_api::stream::Model;
 use copro_api::tool::{HostedToolSpec, ToolChoice};
-use futures_util::StreamExt;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -38,30 +36,17 @@ impl Agent {
         Self { tx }
     }
 
-    pub async fn start_run(&self) -> Result<AgentRunHandle> {
+    pub async fn start_turn(&self) -> Result<AgentTurnHandle> {
         let (events, rx) = mpsc::channel(EVENT_BUFFER);
-        let cancellation = RunCancellation::new();
+        let cancellation = TurnCancellation::new();
         self.tx
-            .send(AgentCommand::RunTurn {
+            .send(AgentCommand::StartTurn {
                 events,
                 cancellation: cancellation.clone(),
             })
             .await
             .map_err(|_| agent_closed())?;
-        Ok(AgentRunHandle::new(rx, cancellation))
-    }
-
-    /// Run one turn and stream core agent events.
-    pub fn run_stream(&self) -> AgentStream {
-        let agent = self.clone();
-
-        Box::pin(async_stream::try_stream! {
-            let handle = agent.start_run().await?;
-            let mut stream = handle.events();
-            while let Some(event) = stream.next().await {
-                yield event?;
-            }
-        })
+        Ok(AgentTurnHandle::new(rx, cancellation))
     }
 
     pub async fn push_message(&self, message: Message) -> Result<()> {

@@ -7,8 +7,8 @@ use tokio::sync::oneshot;
 pub enum AgentControl {
     Continue,
     Pause,
-    FinishRun,
-    AbortRun,
+    FinishTurn,
+    AbortTurn,
     ReplaceRequest(GenerateRequest),
     ReplaceModelDelta(OutputContentDelta),
     DropModelDelta,
@@ -32,7 +32,7 @@ pub(crate) enum AgentControlSignal {
 }
 
 impl AgentControlSignal {
-    pub(crate) fn continue_run() -> Self {
+    pub(crate) fn continue_turn() -> Self {
         Self::Control(AgentControl::Continue)
     }
 
@@ -44,7 +44,7 @@ impl AgentControlSignal {
         match self {
             AgentControlSignal::Control(control) => control.kind(),
             AgentControlSignal::Pause { .. } => AgentControlKind::Pause,
-            AgentControlSignal::Preempt => AgentControlKind::AbortRun,
+            AgentControlSignal::Preempt => AgentControlKind::AbortTurn,
         }
     }
 }
@@ -54,8 +54,8 @@ impl AgentControl {
         match self {
             AgentControl::Continue => AgentControlKind::Continue,
             AgentControl::Pause => AgentControlKind::Pause,
-            AgentControl::FinishRun => AgentControlKind::FinishRun,
-            AgentControl::AbortRun => AgentControlKind::AbortRun,
+            AgentControl::FinishTurn => AgentControlKind::FinishTurn,
+            AgentControl::AbortTurn => AgentControlKind::AbortTurn,
             AgentControl::ReplaceRequest(_) => AgentControlKind::ReplaceRequest,
             AgentControl::ReplaceModelDelta(_) => AgentControlKind::ReplaceModelDelta,
             AgentControl::DropModelDelta => AgentControlKind::DropModelDelta,
@@ -73,8 +73,8 @@ impl AgentControl {
 pub enum AgentControlKind {
     Continue,
     Pause,
-    FinishRun,
-    AbortRun,
+    FinishTurn,
+    AbortTurn,
     ReplaceRequest,
     ReplaceModelDelta,
     DropModelDelta,

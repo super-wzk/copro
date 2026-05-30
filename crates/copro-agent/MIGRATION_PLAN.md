@@ -2,29 +2,29 @@
 
 ## 目标
 
-将 `copro-agent` 的执行模型收敛到 step-clock + `AgentRunHandle` + `AgentControl`，彻底脱离旧 streaming/hook 扩展模型，并保证外部 scheduler/UI/debugger 可以可靠地在 step boundary 驱动 agent run。
+将 `copro-agent` 的执行模型收敛到 step-clock + `AgentTurnHandle` + `AgentControl`，彻底脱离旧 streaming/hook 扩展模型，并保证外部 scheduler/UI/debugger 可以可靠地在 step boundary 驱动 agent turn。
 
 ## 当前状态
 
 已完成：
 
-- `AgentRunHandle` 已提供 `step()`、`step_until_control()`、`control()`、`events()`、`pause()`、`resume()`、`preempt()`。
+- `AgentTurnHandle` 已提供 `step()`、`step_until_control()`、`control()`、`events()`、`pause()`、`resume()`、`preempt()`。
 - `AgentEvent` 已切换为核心 step-level 事件。
 - `ControlRequired` / `StepCompleted` 已分离：前者表示 pending boundary，后者只表示 control 应用后的 final outcome。
 - typed control point façade 已收敛为单个 `AgentCheckpoint` enum，variant 保留细粒度切入点。
 - `control()` 已对非法 control kind 和 replacement invariant 做即时校验。
-- 普通 `AgentEvent` 内部投递已移除 ack；只有 `ControlRequired` 携带 reply 并阻塞 run 等待 `AgentControl`。
+- 普通 `AgentEvent` 内部投递已移除 ack；只有 `ControlRequired` 携带 reply 并阻塞 turn 等待 `AgentControl`。
 - `ToolResultReplacement` 已用于 typed tool result replacement，由运行层自动填充 `call_id` / `name`。
-- `Pause` / `Resume` 已形成 boundary 和 in-flight pause request 的 `RunPaused` -> `RunResumed` 事件链。
-- `FinishRun` / `AbortRun` 已在事件层区分，in-flight `preempt()` 已产生 `RunPreempted`。
-- `Ready` 已通过 `StepReady` 成为真实可观察状态，`Recovering` 已通过 `RunRecovering` 成为真实 recovery 状态。
+- `Pause` / `Resume` 已形成 boundary 和 in-flight pause request 的 `TurnPaused` -> `TurnResumed` 事件链。
+- `FinishTurn` / `AbortTurn` 已在事件层区分，in-flight `preempt()` 已产生 `TurnPreempted`。
+- `Ready` 已通过 `StepReady` 成为真实可观察状态，`Recovering` 已通过 `TurnRecovering` 成为真实 recovery 状态。
 - abort/preempt/stop 遇到已提交 tool call 或 tool execution boundary 时，会通过 recovery step 补齐 tool result。
-- `AgentRunHandle` 已加入单 driver lease，避免 `events()` / `step()` 并发抢同一 receiver。
-- `AgentTurn` 已收敛为 `next_action()` / `apply_outcome()` 纯同步状态机；`AgentRun` 统一按 action step loop 执行 async IO、control boundary、commit 和 event emission。
-- `run.rs` 已拆为 `run/{types,control,checkpoint,handle,execution}.rs`，`run/mod.rs` 只保留声明和 re-export。
-- `runtime` public namespace 已移除；`StopSignal` public API 已移除，取消能力收拢为每个 run 内部的 cancellation source，由 `AgentRunHandle` 的 `Abort*` / `preempt()` 驱动。
-- `AgentContext` 已作为 public 可序列化值对象加入 API，用于保存/恢复长期 context 状态；字段私有且只提供 getter，不包含 model/tools 或 in-flight run/runtime 对象。
-- `run_stream()` 已基于 `AgentRunHandle` auto mode 实现。
+- `AgentTurnHandle` 已加入单 driver lease，避免 `events()` / `step()` 并发抢同一 receiver。
+- `AgentTurnMachine` 已收敛为 `next_action()` / `apply_outcome()` 纯同步状态机；`AgentTurn` 统一按 action step loop 执行 async IO、control boundary、commit 和 event emission。
+- turn 执行模块已拆为 `turn/{types,control,checkpoint,handle,execution}.rs`，`turn/mod.rs` 只保留声明和 re-export。
+- `runtime` public namespace 已移除；`StopSignal` public API 已移除，取消能力收拢为每个 turn 内部的 cancellation source，由 `AgentTurnHandle` 的 `AbortTurn` / `preempt()` 驱动。
+- `AgentContext` 已作为 public 可序列化值对象加入 API，用于保存/恢复长期 context 状态；字段私有且只提供 getter，不包含 model/tools 或 in-flight turn/runtime 对象。
+- `AgentTurnHandle::events()` 已作为 core event stream，`run_stream()` convenience API 已移除，应用层统一通过 `Agent::start_turn()` 获取 handle。
 - `AgentControl` 已支持 request、model delta、assistant output、tool call、tool result 的改写/拒绝。
 - `AgentHook` / `AgentHooks` / `ToolCallDecision` 已从当前工作区代码中移除。
 - `copro-harness` 的 skills 注入已迁移为显式 `SkillRequestInjector`。
@@ -65,7 +65,7 @@
 目标：
 
 - 优先通过 Rust 类型系统防止 control kind 和 step outcome 的非法组合。
-- `AgentRunHandle::control()` 仍基于当前 pending outcome 的 allowed controls 立即拒绝绕过 typed API 的非法 control。
+- `AgentTurnHandle::control()` 仍基于当前 pending outcome 的 allowed controls 立即拒绝绕过 typed API 的非法 control。
 - 运行层仍保留防御性校验，避免绕过 handle 时进入非法状态。
 
 方向：
@@ -87,55 +87,55 @@
 
 原问题：
 
-- `RunPaused` / `RunResumed` 事件没有完整事件链。
-- `pause()` 当前只修改 handle 本地状态，不一定驱动 run 发出 pause event。
-- `resume()` 只是发送 `Continue`，没有 `RunResumed`。
+- `TurnPaused` / `TurnResumed` 事件没有完整事件链。
+- `pause()` 当前只修改 handle 本地状态，不一定驱动 turn 发出 pause event。
+- `resume()` 只是发送 `Continue`，没有 `TurnResumed`。
 - in-flight pause request 还没有实现。
 
 目标：
 
-- boundary pause 由 run 发出 `RunPaused`。
-- resume 发出 `RunResumed` 后继续运行。
-- 如果 run 正在 in-flight，pause request 在当前 step 完成后生效。
+- boundary pause 由 turn 发出 `TurnPaused`。
+- resume 发出 `TurnResumed` 后继续运行。
+- 如果 turn 正在 in-flight，pause request 在当前 step 完成后生效。
 
 验收：
 
-- `control(Pause)` 产生 `RunPaused`，run 停在当前 boundary 后。
-- `resume()` 产生 `RunResumed`，随后继续下一个 step。
+- `control(Pause)` 产生 `TurnPaused`，turn 停在当前 boundary 后。
+- `resume()` 产生 `TurnResumed`，随后继续下一个 step。
 - in-flight model stream/tool execution 场景下 pause 不取消当前 action，只在 boundary 停住。
 
 ### 4. Preempt / Abort / Recovery 语义较弱（已完成）
 
 原问题：
 
-- `RunPreempted` / `Recovering` 目前偏预留。
-- `FinishRun` 和 `AbortRun` 行为仍接近。
+- `TurnPreempted` / `Recovering` 目前偏预留。
+- `FinishTurn` 和 `AbortTurn` 行为仍接近。
 - assistant 已 commit tool call 后，如果 abort/preempt 发生在某些 boundary，可能留下无 tool result 的 history。
 
 目标：
 
-- `FinishRun` 只结束当前 run，并按需补齐 tool result recovery。
-- `AbortRun` 终止 run，并按需补齐 tool result recovery。
+- `FinishTurn` 只结束当前 turn，并按需补齐 tool result recovery。
+- `AbortTurn` 终止 turn，并按需补齐 tool result recovery。
 - `preempt()` 可中断 in-flight action，并发出明确 interrupted/recovery event。
 
 验收：
 
 - assistant tool call 已 commit 后，无论 abort/preempt 发生在哪里，history 中每个 tool call 都有对应 tool result。
-- `FinishRun` / `AbortRun` 事件顺序有测试覆盖。
+- `FinishTurn` / `AbortTurn` 事件顺序有测试覆盖。
 - in-flight model stream 和 tool execution 的 preempt 行为有测试覆盖。
 
-### 5. AgentRunHandle 缺少单 driver 保护（已完成）
+### 5. AgentTurnHandle 缺少单 driver 保护（已完成）
 
 原问题：
 
-- `AgentRunHandle` 可 clone。
+- `AgentTurnHandle` 可 clone。
 - `events()` / `step()` 共享同一个 receiver，多个消费者可能抢事件。
 - mutex 避免数据竞争，但不保证执行语义正确。
 
 目标：
 
-- 一个 run 同时只能有一个 active driver。
-- `events()` 和 `step()` 不能并发消费同一个 run。
+- 一个 turn 同时只能有一个 active driver。
+- `events()` 和 `step()` 不能并发消费同一个 turn。
 
 验收：
 
@@ -162,7 +162,7 @@
 - 对 `ReplaceToolResult` 优先提供 `ToolResultReplacement`，只让外部提供 `status` / `content`，由运行层从当前 tool 自动填充 `call_id` / `name`。
 - 对 `ReplaceToolCall` 提供专用 replacement builder 或 validator，运行时检查同 turn 内 `ToolCall.id` 唯一。
 - 对 `ReplaceAssistantOutput` 基于当前 `FinishReason` 做运行时校验，拒绝 `FinishReason::Stop` 搭配 tool call output 等不一致组合。
-- 类型系统负责“不能调用不适用的 replacement 方法”，运行时负责“replacement value 与当前 run state 一致”。
+- 类型系统负责“不能调用不适用的 replacement 方法”，运行时负责“replacement value 与当前 turn state 一致”。
 
 验收：
 
@@ -172,40 +172,41 @@
 - 测试覆盖合法和非法替换。
 - 常规 typed API 下无法构造 `call_id` / `name` 不匹配的 `ToolResult` replacement。
 
-### 7. AgentTurn 仍未完全纯状态机化（已完成）
+### 7. AgentTurnMachine 仍未完全纯状态机化（已完成）
 
 原问题：
 
-- 旧实现中 `AgentRun` 直接按 phase 驱动请求、模型流、工具规划、工具执行和结果提交。
+- 旧实现中 `AgentTurn` 直接按 phase 驱动请求、模型流、工具规划、工具执行和结果提交。
 - 文档中的 `next_action()` / `apply_outcome()` 尚未成为实际实现。
 
 目标：
 
-- `AgentTurn` 只负责纯状态推进。
-- `AgentRun` 负责 async IO、control、commit、event。
-- action 选择和 outcome 应用尽量收敛到 `AgentTurn`。
+- `AgentTurnMachine` 只负责纯状态推进。
+- `AgentTurn` 负责 async IO、control、commit、event。
+- action 选择和 outcome 应用尽量收敛到 `AgentTurnMachine`。
 
 验收：
 
-- `AgentTurn` 无 async、无 IO handle、无 cancellation token。
-- `AgentRun` 不再按 `AgentTurnPhase` dispatch；统一循环为 `next_action()` -> execute -> control -> commit/apply outcome。
+- `AgentTurnMachine` 无 async、无 IO handle、无 cancellation token。
+- `AgentTurn` 不再按 `AgentTurnMachinePhase` dispatch；统一循环为 `next_action()` -> execute -> control -> commit/apply outcome。
 - 现有行为测试继续通过。
 
-### 8. run_stream() 暴露 step-level event 的产品语义
+### 8. core event stream 的产品语义（已收敛）
 
-问题：
+原问题：
 
-- `run_stream()` 当前直接输出核心 `AgentEvent`，包含 `StepReady` / `StepStarted` / `ControlRequired` / `StepCompleted` 等 step-level 事件。
-- 这是破坏性迁移的一部分，但对普通 chat consumer 可能过于底层。
+- `run_stream()` 直接输出核心 `AgentEvent`，包含 `StepReady` / `StepStarted` / `ControlRequired` / `StepCompleted` 等 step-level 事件。
+- 该 convenience API 隐藏了 `AgentTurnHandle`，和应用层显式控制 turn 的模型冲突。
 
 目标：
 
-- 明确 `run_stream()` 是否继续作为 core stream。
+- 移除 `run_stream()`，统一通过 `Agent::start_turn()` 获取 `AgentTurnHandle`。
+- `AgentTurnHandle::events()` 作为 core stream 的自动驱动入口。
 - 如需 high-level chat stream，新增 adapter，而不是恢复旧兼容层。
 
 验收：
 
-- 文档明确 `run_stream()` 语义。
+- 文档明确 `start_turn()` / `events()` 语义。
 - CLI 和示例使用正确 stream 层级。
 - 如果新增 high-level adapter，确保不影响 core `AgentEvent`。
 
@@ -230,7 +231,7 @@
 
 - 修改事件发送 helper。
 - `emit_step_completed` 改为先发 `ControlRequired`，应用 control 后再发 `StepCompleted(final)`。
-- 调整 `AgentRunHandle::step()` 以 `ControlRequired` 作为 control point。
+- 调整 `AgentTurnHandle::step()` 以 `ControlRequired` 作为 control point。
 - `events()` auto mode 对 `ControlRequired` 自动 `Continue`。
 
 验收：
@@ -259,8 +260,8 @@
 内容：
 
 - 增加 pause request 状态。
-- run 在 boundary 发 `RunPaused`。
-- resume 发 `RunResumed`。
+- turn 在 boundary 发 `TurnPaused`。
+- resume 发 `TurnResumed`。
 
 验收：
 
@@ -270,7 +271,7 @@
 
 内容：
 
-- 区分 `FinishRun` 和 `AbortRun`。
+- 区分 `FinishTurn` 和 `AbortTurn`。
 - 对 pending tool calls 生成 recovery tool results。
 - preempt 支持 in-flight cancellation 和明确 event。
 
@@ -282,7 +283,7 @@
 
 内容：
 
-- 在 `AgentRunHandle` 中加入 driver lease。
+- 在 `AgentTurnHandle` 中加入 driver lease。
 - `step()` / `events()` 进入消费前获取 lease。
 - lease drop 后释放。
 
@@ -291,16 +292,16 @@
 - 并发消费会立即报错。
 - 正常单 driver 行为不变。
 
-### Phase G: AgentTurn 纯状态机收敛
+### Phase G: AgentTurnMachine 纯状态机收敛
 
 内容：
 
 - 引入 `next_action()` / `apply_outcome()`。
-- 移除 `AgentRun` 中的 phase dispatch，改为统一 action step loop。
+- 移除 `AgentTurn` 中的 phase dispatch，改为统一 action step loop。
 
 验收：
 
-- `AgentTurn` 保持纯同步状态机。
+- `AgentTurnMachine` 保持纯同步状态机。
 - 行为测试不回退。
 
 ## 每阶段固定验证

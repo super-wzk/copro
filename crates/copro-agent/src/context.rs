@@ -1,7 +1,7 @@
-use crate::cancel::RunCancellation;
+use crate::cancel::TurnCancellation;
 use crate::event::AgentEvent;
-use crate::run::{AgentControlSignal, AgentOutcome, AgentRun, AgentRunId, AgentStep};
 use crate::tools::ToolRouter;
+use crate::turn::{AgentControlSignal, AgentOutcome, AgentStep, AgentTurn};
 use copro_api::error::Result;
 use copro_api::message::Message;
 use copro_api::request::GenerateRequestOptions;
@@ -88,7 +88,6 @@ pub(crate) struct AgentState {
     pub(crate) model: Arc<dyn Model>,
     pub(crate) tools: Arc<dyn ToolRouter>,
     pub(crate) context: AgentContext,
-    next_run_id: AgentRunId,
 }
 
 impl AgentState {
@@ -101,14 +100,7 @@ impl AgentState {
             model,
             tools,
             context,
-            next_run_id: AgentRunId(0),
         }
-    }
-
-    pub(crate) fn allocate_run_id(&mut self) -> AgentRunId {
-        let run_id = self.next_run_id;
-        self.next_run_id = AgentRunId(self.next_run_id.0 + 1);
-        run_id
     }
 
     pub(crate) fn spawn(state: Self, rx: mpsc::Receiver<AgentCommand>) {
@@ -118,12 +110,12 @@ impl AgentState {
     async fn run(mut self, mut rx: mpsc::Receiver<AgentCommand>) {
         while let Some(command) = rx.recv().await {
             match command {
-                AgentCommand::RunTurn {
+                AgentCommand::StartTurn {
                     events,
                     cancellation,
                 } => {
-                    AgentRun::new(&mut self, cancellation)
-                        .run_turn(events)
+                    AgentTurn::new(&mut self, cancellation)
+                        .execute(events)
                         .await;
                 }
                 AgentCommand::PushMessage { message, reply } => {
@@ -165,9 +157,9 @@ impl AgentState {
 }
 
 pub(crate) enum AgentCommand {
-    RunTurn {
+    StartTurn {
         events: mpsc::Sender<AgentStreamItem>,
-        cancellation: RunCancellation,
+        cancellation: TurnCancellation,
     },
     PushMessage {
         message: Message,

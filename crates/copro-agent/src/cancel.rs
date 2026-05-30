@@ -1,12 +1,12 @@
 use tokio_util::sync::CancellationToken;
 
-/// Per-run cancellation source shared by the driver and in-flight model/tool work.
+/// Per-turn cancellation source shared by the driver and in-flight model/tool work.
 #[derive(Debug, Clone)]
-pub(crate) struct RunCancellation {
+pub(crate) struct TurnCancellation {
     token: CancellationToken,
 }
 
-impl RunCancellation {
+impl TurnCancellation {
     pub(crate) fn new() -> Self {
         Self {
             token: CancellationToken::new(),
@@ -28,11 +28,11 @@ impl RunCancellation {
 
 #[cfg(test)]
 mod tests {
-    use super::RunCancellation;
+    use super::TurnCancellation;
 
     #[test]
     fn cancellation_state_is_shared_across_clones() {
-        let cancellation = RunCancellation::new();
+        let cancellation = TurnCancellation::new();
         let clone = cancellation.clone();
 
         assert!(!cancellation.is_cancelled());

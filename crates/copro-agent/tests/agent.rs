@@ -1,6 +1,6 @@
 use copro_agent::{
     Agent, AgentAction, AgentCheckpoint, AgentContext, AgentControl, AgentEvent,
-    AgentInterruptReason, AgentOutcome, AgentRunState, CancellationToken, ToolExecutionPolicy,
+    AgentInterruptReason, AgentOutcome, AgentTurnState, CancellationToken, ToolExecutionPolicy,
     ToolResultReplacement, ToolRouter, async_trait,
 };
 use copro_api::error::Result;
@@ -54,8 +54,18 @@ fn stream_events(events: &[AgentEvent]) -> Vec<StreamEvent> {
         .collect()
 }
 
+async fn collect_agent_events(agent: &Agent) -> Vec<AgentEvent> {
+    let run = agent.start_turn().await.unwrap();
+    run.events()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap()
+}
+
 #[tokio::test]
-async fn run_stream_commits_assistant_message() {
+async fn turn_events_commit_assistant_message() {
     let agent = test_agent(vec![
         OutputStreamEvent::Delta {
             content_index: 0,
@@ -73,13 +83,7 @@ async fn run_stream_commits_assistant_message() {
         .await
         .unwrap();
 
-    let events = agent
-        .run_stream()
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
+    let events = collect_agent_events(&agent).await;
 
     let assistant = Message::Assistant(vec![OutputContent::Text("Hello".to_string())]);
     assert_eq!(
@@ -103,7 +107,7 @@ async fn run_stream_commits_assistant_message() {
 }
 
 #[tokio::test]
-async fn run_handle_abort_run_at_model_delta_does_not_commit_assistant_message() {
+async fn turn_handle_abort_turn_at_model_delta_does_not_commit_assistant_message() {
     let agent = test_agent(vec![
         OutputStreamEvent::Delta {
             content_index: 0,
@@ -118,7 +122,7 @@ async fn run_handle_abort_run_at_model_delta_does_not_commit_assistant_message()
             usage: None,
         },
     ]);
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let report = loop {
         let report = run.step().await.unwrap();
@@ -136,7 +140,7 @@ async fn run_handle_abort_run_at_model_delta_does_not_commit_assistant_message()
             .unwrap();
     };
 
-    run.control(report.step.id, AgentControl::AbortRun)
+    run.control(report.step.id, AgentControl::AbortTurn)
         .await
         .unwrap();
     let remaining = run
@@ -151,23 +155,23 @@ async fn run_handle_abort_run_at_model_delta_does_not_commit_assistant_message()
     assert!(
         remaining
             .iter()
-            .any(|event| matches!(event, AgentEvent::RunAborted { .. }))
+            .any(|event| matches!(event, AgentEvent::TurnAborted))
     );
 
     assert!(agent.messages().await.unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn abort_run_does_not_cancel_later_runs() {
+async fn abort_turn_does_not_cancel_later_runs() {
     let agent = test_agent(vec![OutputStreamEvent::Finished {
         reason: FinishReason::Stop,
         usage: None,
     }]);
-    let first = agent.start_run().await.unwrap();
+    let first = agent.start_turn().await.unwrap();
     let report = first.step().await.unwrap();
 
     first
-        .control(report.step.id, AgentControl::AbortRun)
+        .control(report.step.id, AgentControl::AbortTurn)
         .await
         .unwrap();
     let first_events = first
@@ -181,35 +185,29 @@ async fn abort_run_does_not_cancel_later_runs() {
     assert!(
         first_events
             .iter()
-            .any(|event| matches!(event, AgentEvent::RunAborted { .. }))
+            .any(|event| matches!(event, AgentEvent::TurnAborted))
     );
 
-    let second_events = agent
-        .run_stream()
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
+    let second_events = collect_agent_events(&agent).await;
     assert!(
         second_events
             .iter()
-            .any(|event| matches!(event, AgentEvent::RunFinished { .. }))
+            .any(|event| matches!(event, AgentEvent::TurnFinished))
     );
     assert!(
         !second_events
             .iter()
-            .any(|event| matches!(event, AgentEvent::RunAborted { .. }))
+            .any(|event| matches!(event, AgentEvent::TurnAborted))
     );
 }
 
 #[tokio::test]
-async fn run_stream_exposes_ready_state_before_step_starts() {
+async fn turn_events_expose_ready_state_before_step_starts() {
     let agent = test_agent(vec![OutputStreamEvent::Finished {
         reason: FinishReason::Stop,
         usage: None,
     }]);
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
     let mut stream = run.clone().events();
 
     loop {
@@ -218,7 +216,7 @@ async fn run_stream_exposes_ready_state_before_step_starts() {
             assert_eq!(step.action, AgentAction::LoadTools);
             assert_eq!(
                 run.state().await.unwrap(),
-                AgentRunState::Ready {
+                AgentTurnState::Ready {
                     next: AgentAction::LoadTools,
                     step_id: step.id,
                 }
@@ -229,7 +227,7 @@ async fn run_stream_exposes_ready_state_before_step_starts() {
 }
 
 #[tokio::test]
-async fn run_stream_awaits_async_tool_router() {
+async fn turn_events_await_async_tool_router() {
     let agent = Agent::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
@@ -237,13 +235,7 @@ async fn run_stream_awaits_async_tool_router() {
         Arc::new(DoubleToolRouter),
     );
 
-    let events = agent
-        .run_stream()
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
+    let events = collect_agent_events(&agent).await;
 
     let stream_events = stream_events(&events);
     let started_index = stream_events
@@ -291,13 +283,7 @@ async fn tool_task_panic_is_committed_as_error_tool_result() {
         Arc::new(PanicToolRouter),
     );
 
-    let events = agent
-        .run_stream()
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
+    let events = collect_agent_events(&agent).await;
 
     let stream_events = stream_events(&events);
     assert!(stream_events.iter().any(|event| matches!(
@@ -340,7 +326,7 @@ async fn tool_task_panic_is_committed_as_error_tool_result() {
 }
 
 #[tokio::test]
-async fn run_stream_batches_parallel_tools_behind_serial_barriers() {
+async fn turn_events_batch_parallel_tools_behind_serial_barriers() {
     let router = Arc::new(ConcurrentToolRouter::default());
     let tool_router: Arc<dyn ToolRouter> = router.clone();
     let agent = Agent::new(
@@ -350,13 +336,7 @@ async fn run_stream_batches_parallel_tools_behind_serial_barriers() {
         tool_router,
     );
 
-    let events = agent
-        .run_stream()
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
+    let events = collect_agent_events(&agent).await;
 
     let stream_events = stream_events(&events);
     let started_names = stream_events
@@ -381,7 +361,7 @@ async fn run_stream_batches_parallel_tools_behind_serial_barriers() {
 }
 
 #[tokio::test]
-async fn start_run_steps_to_model_delta_boundary() {
+async fn start_turn_steps_to_model_delta_boundary() {
     let agent = test_agent(vec![
         OutputStreamEvent::Delta {
             content_index: 0,
@@ -392,7 +372,7 @@ async fn start_run_steps_to_model_delta_boundary() {
             usage: None,
         },
     ]);
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let mut report = run.step().await.unwrap();
     while !matches!(report.outcome, AgentOutcome::ModelDelta { .. }) {
@@ -410,7 +390,7 @@ async fn start_run_steps_to_model_delta_boundary() {
     ));
     assert!(matches!(
         run.state().await.unwrap(),
-        AgentRunState::WaitingControl { .. }
+        AgentTurnState::WaitingControl { .. }
     ));
     run.control(report.step.id, AgentControl::Continue)
         .await
@@ -426,40 +406,40 @@ async fn start_run_steps_to_model_delta_boundary() {
 }
 
 #[tokio::test]
-async fn run_handle_pause_and_resume_at_boundary() {
+async fn turn_handle_pause_and_resume_at_boundary() {
     let agent = test_agent(vec![OutputStreamEvent::Finished {
         reason: FinishReason::Stop,
         usage: None,
     }]);
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let first = run.step().await.unwrap();
     run.pause().await.unwrap();
     assert_eq!(
         run.state().await.unwrap(),
-        AgentRunState::Paused { at: first.step.id }
+        AgentTurnState::Paused { at: first.step.id }
     );
 
     run.resume().await.unwrap();
     let second = run.step().await.unwrap();
     assert!(second.events.iter().any(|event| matches!(
         event,
-        AgentEvent::RunPaused { at, .. } if *at == first.step.id
+        AgentEvent::TurnPaused { at, .. } if *at == first.step.id
     )));
     assert!(second.events.iter().any(|event| matches!(
         event,
-        AgentEvent::RunResumed { at, .. } if *at == first.step.id
+        AgentEvent::TurnResumed { at, .. } if *at == first.step.id
     )));
     assert_eq!(second.step.id.tick, first.step.id.tick + 1);
 }
 
 #[tokio::test]
-async fn run_handle_control_pause_emits_pause_and_resume_events() {
+async fn turn_handle_control_pause_emits_pause_and_resume_events() {
     let agent = test_agent(vec![OutputStreamEvent::Finished {
         reason: FinishReason::Stop,
         usage: None,
     }]);
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let first = run.step().await.unwrap();
     run.control(first.step.id, AgentControl::Pause)
@@ -467,26 +447,26 @@ async fn run_handle_control_pause_emits_pause_and_resume_events() {
         .unwrap();
     assert_eq!(
         run.state().await.unwrap(),
-        AgentRunState::Paused { at: first.step.id }
+        AgentTurnState::Paused { at: first.step.id }
     );
 
     run.resume().await.unwrap();
     let second = run.step().await.unwrap();
     assert!(second.events.iter().any(|event| matches!(
         event,
-        AgentEvent::RunPaused { at, .. } if *at == first.step.id
+        AgentEvent::TurnPaused { at, .. } if *at == first.step.id
     )));
     assert!(second.events.iter().any(|event| matches!(
         event,
-        AgentEvent::RunResumed { at, .. } if *at == first.step.id
+        AgentEvent::TurnResumed { at, .. } if *at == first.step.id
     )));
     assert_eq!(second.step.id.tick, first.step.id.tick + 1);
 }
 
 #[tokio::test]
-async fn run_handle_pause_request_waits_for_next_boundary() {
+async fn turn_handle_pause_request_waits_for_next_boundary() {
     let agent = Agent::new(Arc::new(DelayedSecondDeltaModel), Arc::new(EmptyToolRouter));
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let first = loop {
         let report = run.step().await.unwrap();
@@ -522,30 +502,30 @@ async fn run_handle_pause_request_waits_for_next_boundary() {
             ..
         } if text == "second"
     ));
-    assert_eq!(paused.state, AgentRunState::Paused { at: paused.step.id });
+    assert_eq!(paused.state, AgentTurnState::Paused { at: paused.step.id });
 
     run.resume().await.unwrap();
     let next = run.step().await.unwrap();
     assert!(next.events.iter().any(|event| matches!(
         event,
-        AgentEvent::RunPaused { at, .. } if *at == paused.step.id
+        AgentEvent::TurnPaused { at, .. } if *at == paused.step.id
     )));
     assert!(next.events.iter().any(|event| matches!(
         event,
-        AgentEvent::RunResumed { at, .. } if *at == paused.step.id
+        AgentEvent::TurnResumed { at, .. } if *at == paused.step.id
     )));
 }
 
 #[tokio::test]
-async fn run_handle_finish_run_finishes_without_run_aborted() {
+async fn turn_handle_finish_turn_finishes_without_turn_aborted() {
     let agent = test_agent(vec![OutputStreamEvent::Finished {
         reason: FinishReason::Stop,
         usage: None,
     }]);
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
     let report = run.step().await.unwrap();
 
-    run.control(report.step.id, AgentControl::FinishRun)
+    run.control(report.step.id, AgentControl::FinishTurn)
         .await
         .unwrap();
     let events = run
@@ -567,25 +547,25 @@ async fn run_handle_finish_run_finishes_without_run_aborted() {
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, AgentEvent::RunFinished { .. }))
+            .any(|event| matches!(event, AgentEvent::TurnFinished))
     );
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, AgentEvent::RunAborted { .. }))
+            .any(|event| matches!(event, AgentEvent::TurnAborted))
     );
 }
 
 #[tokio::test]
-async fn run_handle_abort_run_emits_run_aborted() {
+async fn turn_handle_abort_turn_emits_turn_aborted() {
     let agent = test_agent(vec![OutputStreamEvent::Finished {
         reason: FinishReason::Stop,
         usage: None,
     }]);
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
     let report = run.step().await.unwrap();
 
-    run.control(report.step.id, AgentControl::AbortRun)
+    run.control(report.step.id, AgentControl::AbortTurn)
         .await
         .unwrap();
     let events = run
@@ -600,19 +580,19 @@ async fn run_handle_abort_run_emits_run_aborted() {
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, AgentEvent::RunAborted { .. }))
+            .any(|event| matches!(event, AgentEvent::TurnAborted))
     );
 }
 
 #[tokio::test]
-async fn abort_run_after_assistant_tool_call_recovers_tool_result() {
+async fn abort_turn_after_assistant_tool_call_recovers_tool_result() {
     let agent = Agent::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
         Arc::new(DoubleToolRouter),
     );
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let report = loop {
         let report = run.step().await.unwrap();
@@ -630,12 +610,12 @@ async fn abort_run_after_assistant_tool_call_recovers_tool_result() {
             .unwrap();
     };
 
-    run.control(report.step.id, AgentControl::AbortRun)
+    run.control(report.step.id, AgentControl::AbortTurn)
         .await
         .unwrap();
     assert_eq!(
         run.state().await.unwrap(),
-        AgentRunState::Recovering {
+        AgentTurnState::Recovering {
             after: report.step.id,
         }
     );
@@ -650,7 +630,7 @@ async fn abort_run_after_assistant_tool_call_recovers_tool_result() {
         .unwrap();
     assert!(events.iter().any(|event| matches!(
         event,
-        AgentEvent::RunRecovering { after, .. } if *after == report.step.id
+        AgentEvent::TurnRecovering { after, .. } if *after == report.step.id
     )));
     assert!(events.iter().any(|event| matches!(
         event,
@@ -669,7 +649,7 @@ async fn abort_run_after_assistant_tool_call_recovers_tool_result() {
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, AgentEvent::RunAborted { .. }))
+            .any(|event| matches!(event, AgentEvent::TurnAborted))
     );
     assert!(matches!(
         agent.messages().await.unwrap().as_slice(),
@@ -690,14 +670,14 @@ async fn abort_run_after_assistant_tool_call_recovers_tool_result() {
 }
 
 #[tokio::test]
-async fn abort_run_at_tool_started_recovers_tool_result() {
+async fn abort_turn_at_tool_started_recovers_tool_result() {
     let agent = Agent::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
         Arc::new(DoubleToolRouter),
     );
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let report = loop {
         let report = run.step().await.unwrap();
@@ -709,7 +689,7 @@ async fn abort_run_at_tool_started_recovers_tool_result() {
             .unwrap();
     };
 
-    run.control(report.step.id, AgentControl::AbortRun)
+    run.control(report.step.id, AgentControl::AbortTurn)
         .await
         .unwrap();
     let events = run
@@ -723,7 +703,7 @@ async fn abort_run_at_tool_started_recovers_tool_result() {
 
     assert!(events.iter().any(|event| matches!(
         event,
-        AgentEvent::RunRecovering { after, .. } if *after == report.step.id
+        AgentEvent::TurnRecovering { after, .. } if *after == report.step.id
     )));
     assert!(events.iter().any(|event| matches!(
         event,
@@ -742,17 +722,17 @@ async fn abort_run_at_tool_started_recovers_tool_result() {
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, AgentEvent::RunAborted { .. }))
+            .any(|event| matches!(event, AgentEvent::TurnAborted))
     );
 }
 
 #[tokio::test]
-async fn run_handle_preempt_inflight_model_stream_emits_run_preempted() {
+async fn turn_handle_preempt_inflight_model_stream_emits_turn_preempted() {
     let agent = Agent::new(
         Arc::new(PendingAfterFirstDeltaModel),
         Arc::new(EmptyToolRouter),
     );
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let first = loop {
         let report = run.step().await.unwrap();
@@ -807,19 +787,19 @@ async fn run_handle_preempt_inflight_model_stream_emits_run_preempted() {
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, AgentEvent::RunPreempted { .. }))
+            .any(|event| matches!(event, AgentEvent::TurnPreempted { .. }))
     );
 }
 
 #[tokio::test]
-async fn run_handle_preempt_inflight_tool_execution_recovers_tool_result() {
+async fn turn_handle_preempt_inflight_tool_execution_recovers_tool_result() {
     let agent = Agent::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
         Arc::new(PreemptibleToolRouter),
     );
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let started = loop {
         let report = run.step().await.unwrap();
@@ -857,7 +837,7 @@ async fn run_handle_preempt_inflight_tool_execution_recovers_tool_result() {
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, AgentEvent::RunRecovering { .. }))
+            .any(|event| matches!(event, AgentEvent::TurnRecovering { .. }))
     );
     assert!(events.iter().any(|event| matches!(
         event,
@@ -875,22 +855,22 @@ async fn run_handle_preempt_inflight_tool_execution_recovers_tool_result() {
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, AgentEvent::RunPreempted { .. }))
+            .any(|event| matches!(event, AgentEvent::TurnPreempted { .. }))
     );
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, AgentEvent::RunAborted { .. }))
+            .any(|event| matches!(event, AgentEvent::TurnAborted))
     );
 }
 
 #[tokio::test]
-async fn run_handle_rejects_step_while_events_driver_is_active() {
+async fn turn_handle_rejects_step_while_events_driver_is_active() {
     let agent = test_agent(vec![OutputStreamEvent::Finished {
         reason: FinishReason::Stop,
         usage: None,
     }]);
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
     let mut stream = run.clone().events();
 
     stream.next().await.unwrap().unwrap();
@@ -898,7 +878,7 @@ async fn run_handle_rejects_step_while_events_driver_is_active() {
     assert!(
         error
             .to_string()
-            .contains("agent run already has an active driver")
+            .contains("agent turn already has an active driver")
     );
 
     drop(stream);
@@ -906,12 +886,12 @@ async fn run_handle_rejects_step_while_events_driver_is_active() {
 }
 
 #[tokio::test]
-async fn run_handle_rejects_second_events_driver() {
+async fn turn_handle_rejects_second_events_driver() {
     let agent = test_agent(vec![OutputStreamEvent::Finished {
         reason: FinishReason::Stop,
         usage: None,
     }]);
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
     let mut first = run.clone().events();
     let mut second = run.clone().events();
 
@@ -920,17 +900,17 @@ async fn run_handle_rejects_second_events_driver() {
     assert!(
         error
             .to_string()
-            .contains("agent run already has an active driver")
+            .contains("agent turn already has an active driver")
     );
 }
 
 #[tokio::test]
-async fn run_handle_rejects_stale_control() {
+async fn turn_handle_rejects_stale_control() {
     let agent = test_agent(vec![OutputStreamEvent::Finished {
         reason: FinishReason::Stop,
         usage: None,
     }]);
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
     let report = run.step().await.unwrap();
     let mut stale_step_id = report.step.id;
     stale_step_id.tick += 1;
@@ -943,12 +923,12 @@ async fn run_handle_rejects_stale_control() {
 }
 
 #[tokio::test]
-async fn run_handle_reports_illegal_control_for_step() {
+async fn turn_handle_reports_illegal_control_for_step() {
     let agent = test_agent(vec![OutputStreamEvent::Finished {
         reason: FinishReason::Stop,
         usage: None,
     }]);
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
     let report = run.step().await.unwrap();
     assert!(matches!(report.outcome, AgentOutcome::ToolsLoaded(_)));
 
@@ -972,7 +952,7 @@ async fn run_handle_reports_illegal_control_for_step() {
 }
 
 #[tokio::test]
-async fn run_handle_replaces_model_delta_before_history() {
+async fn turn_handle_replaces_model_delta_before_history() {
     let agent = test_agent(vec![
         OutputStreamEvent::Delta {
             content_index: 0,
@@ -983,7 +963,7 @@ async fn run_handle_replaces_model_delta_before_history() {
             usage: None,
         },
     ]);
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let report = loop {
         let report = run.step().await.unwrap();
@@ -1040,7 +1020,7 @@ async fn control_required_precedes_final_step_completed() {
             usage: None,
         },
     ]);
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let report = loop {
         let report = run.step().await.unwrap();
@@ -1107,7 +1087,7 @@ async fn control_required_precedes_final_step_completed() {
 }
 
 #[tokio::test]
-async fn run_handle_drops_model_delta_before_history() {
+async fn turn_handle_drops_model_delta_before_history() {
     let agent = test_agent(vec![
         OutputStreamEvent::Delta {
             content_index: 0,
@@ -1118,7 +1098,7 @@ async fn run_handle_drops_model_delta_before_history() {
             usage: None,
         },
     ]);
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let report = loop {
         let report = run.step().await.unwrap();
@@ -1155,7 +1135,7 @@ async fn run_handle_drops_model_delta_before_history() {
 }
 
 #[tokio::test]
-async fn run_handle_replaces_request_before_model_stream() {
+async fn turn_handle_replaces_request_before_model_stream() {
     let captured = Arc::new(Mutex::new(None));
     let model = Arc::new(CapturingModel {
         captured: Arc::clone(&captured),
@@ -1173,7 +1153,7 @@ async fn run_handle_replaces_request_before_model_stream() {
             ..GenerateRequestOptions::default()
         },
     };
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let point = loop {
         let point = run.step_until_control().await.unwrap();
@@ -1206,12 +1186,12 @@ async fn run_handle_replaces_request_before_model_stream() {
 }
 
 #[tokio::test]
-async fn run_handle_replaces_assistant_output_before_commit() {
+async fn turn_handle_replaces_assistant_output_before_commit() {
     let agent = test_agent(vec![OutputStreamEvent::Finished {
         reason: FinishReason::Stop,
         usage: None,
     }]);
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let report = loop {
         let report = run.step().await.unwrap();
@@ -1254,14 +1234,14 @@ async fn run_handle_replaces_assistant_output_before_commit() {
 }
 
 #[tokio::test]
-async fn run_handle_replaces_tool_result_before_commit() {
+async fn turn_handle_replaces_tool_result_before_commit() {
     let agent = Agent::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
         Arc::new(DoubleToolRouter),
     );
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let point = loop {
         let point = run.step_until_control().await.unwrap();
@@ -1318,14 +1298,14 @@ async fn run_handle_replaces_tool_result_before_commit() {
 }
 
 #[tokio::test]
-async fn run_handle_rejects_mismatched_tool_result_replacement_immediately() {
+async fn turn_handle_rejects_mismatched_tool_result_replacement_immediately() {
     let agent = Agent::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
         Arc::new(DoubleToolRouter),
     );
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let report = loop {
         let report = run.step().await.unwrap();
@@ -1358,14 +1338,14 @@ async fn run_handle_rejects_mismatched_tool_result_replacement_immediately() {
 }
 
 #[tokio::test]
-async fn run_handle_rejects_duplicate_tool_call_replacement_immediately() {
+async fn turn_handle_rejects_duplicate_tool_call_replacement_immediately() {
     let agent = Agent::new(
         Arc::new(MultiToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
         Arc::new(ConcurrentToolRouter::default()),
     );
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let report = loop {
         let report = run.step().await.unwrap();
@@ -1397,12 +1377,12 @@ async fn run_handle_rejects_duplicate_tool_call_replacement_immediately() {
 }
 
 #[tokio::test]
-async fn run_handle_rejects_assistant_output_inconsistent_with_finish_reason() {
+async fn turn_handle_rejects_assistant_output_inconsistent_with_finish_reason() {
     let agent = test_agent(vec![OutputStreamEvent::Finished {
         reason: FinishReason::Stop,
         usage: None,
     }]);
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let report = loop {
         let report = run.step().await.unwrap();
@@ -1437,7 +1417,7 @@ async fn run_handle_rejects_assistant_output_inconsistent_with_finish_reason() {
 }
 
 #[tokio::test]
-async fn run_handle_replaces_tool_call_before_execution() {
+async fn turn_handle_replaces_tool_call_before_execution() {
     let agent = Agent::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
@@ -1451,7 +1431,7 @@ async fn run_handle_replaces_tool_call_before_execution() {
         name: "double".to_string(),
         arguments: replacement_arguments.clone(),
     };
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let report = loop {
         let report = run.step().await.unwrap();
@@ -1520,14 +1500,14 @@ async fn run_handle_replaces_tool_call_before_execution() {
 }
 
 #[tokio::test]
-async fn run_handle_rejects_tool_call_before_execution() {
+async fn turn_handle_rejects_tool_call_before_execution() {
     let agent = Agent::new(
         Arc::new(ToolThenDoneModel {
             calls: AtomicUsize::new(0),
         }),
         Arc::new(DoubleToolRouter),
     );
-    let run = agent.start_run().await.unwrap();
+    let run = agent.start_turn().await.unwrap();
 
     let report = loop {
         let report = run.step().await.unwrap();
@@ -1625,13 +1605,7 @@ async fn build_request_carries_agent_baseline_config() {
         .await
         .unwrap();
 
-    agent
-        .run_stream()
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()
-        .unwrap();
+    collect_agent_events(&agent).await;
 
     let request = captured.lock().unwrap().take().expect("request captured");
     assert_eq!(request.options.temperature, Some(0.5));

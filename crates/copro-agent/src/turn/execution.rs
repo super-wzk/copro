@@ -1,12 +1,14 @@
-use super::{
-    AgentAction, AgentControl, AgentControlSignal, AgentInterruptReason, AgentOutcome, AgentRunId,
-    AgentStep, AgentStepId,
+use super::machine::{
+    AgentTurnMachine, aborted_tool_result, normalize_for_history, rejected_tool_result,
 };
-use crate::cancel::RunCancellation;
+use super::{
+    AgentAction, AgentControl, AgentControlSignal, AgentInterruptReason, AgentOutcome, AgentStep,
+    AgentStepId,
+};
+use crate::cancel::TurnCancellation;
 use crate::context::{AgentState, AgentStreamItem};
 use crate::event::AgentEvent;
 use crate::tools::ToolRouter;
-use crate::turn::{AgentTurn, aborted_tool_result, normalize_for_history, rejected_tool_result};
 use copro_api::error::{Error, Result};
 use copro_api::message::{
     InputContent, Message, OutputContent, ToolCall, ToolResult, ToolResultStatus,
@@ -25,8 +27,8 @@ use tokio_util::task::AbortOnDropHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryTerminal {
-    FinishRun,
-    AbortRun,
+    FinishTurn,
+    AbortTurn,
     Preempted { at: AgentStepId },
 }
 
@@ -38,7 +40,7 @@ enum RecoverableStepFlow {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentRunStepFlow {
+enum AgentTurnStepFlow {
     Continue,
     Stop,
     Recover(RecoveryTerminal),
@@ -55,7 +57,7 @@ enum ControlledStepFlow {
     Recover(AgentOutcome, RecoveryTerminal),
 }
 
-struct AgentRunRuntime {
+struct AgentTurnRuntime {
     model_stream: Option<ModelStream>,
     running_tools: VecDeque<RunningTool>,
 }
@@ -65,7 +67,7 @@ struct RunningTool {
     handle: AbortOnDropHandle<Result<ToolResult>>,
 }
 
-impl AgentRunRuntime {
+impl AgentTurnRuntime {
     fn new() -> Self {
         Self {
             model_stream: None,
@@ -121,16 +123,14 @@ impl AgentRunRuntime {
     }
 }
 
-struct AgentRunClock {
-    run_id: AgentRunId,
+struct AgentTurnClock {
     next_tick: u64,
     last_step_id: Option<AgentStepId>,
 }
 
-impl AgentRunClock {
-    fn new(run_id: AgentRunId) -> Self {
+impl AgentTurnClock {
+    fn new() -> Self {
         Self {
-            run_id,
             next_tick: 0,
             last_step_id: None,
         }
@@ -139,7 +139,6 @@ impl AgentRunClock {
     fn next_step(&mut self, action: AgentAction) -> AgentStep {
         let step = AgentStep {
             id: AgentStepId {
-                run_id: self.run_id,
                 tick: self.next_tick,
             },
             action,
@@ -154,36 +153,35 @@ impl AgentRunClock {
     }
 }
 
-pub(crate) struct AgentRun<'a> {
+pub(crate) struct AgentTurn<'a> {
     state: &'a mut AgentState,
-    cancellation: RunCancellation,
+    cancellation: TurnCancellation,
 }
 
-impl<'a> AgentRun<'a> {
-    pub(crate) fn new(state: &'a mut AgentState, cancellation: RunCancellation) -> Self {
+impl<'a> AgentTurn<'a> {
+    pub(crate) fn new(state: &'a mut AgentState, cancellation: TurnCancellation) -> Self {
         Self {
             state,
             cancellation,
         }
     }
 
-    pub(crate) async fn run_turn(&mut self, events: mpsc::Sender<AgentStreamItem>) {
-        if let Err(error) = self.run_turn_inner(&events).await {
+    pub(crate) async fn execute(&mut self, events: mpsc::Sender<AgentStreamItem>) {
+        if let Err(error) = self.execute_inner(&events).await {
             let _ = events.send(AgentStreamItem::Error(error)).await;
         }
     }
 
-    async fn run_turn_inner(&mut self, events: &mpsc::Sender<AgentStreamItem>) -> Result<()> {
-        let run_id = self.state.allocate_run_id();
-        let mut clock = AgentRunClock::new(run_id);
-        let mut runtime = AgentRunRuntime::new();
+    async fn execute_inner(&mut self, events: &mpsc::Sender<AgentStreamItem>) -> Result<()> {
+        let mut clock = AgentTurnClock::new();
+        let mut runtime = AgentTurnRuntime::new();
         let mut terminal_after_recovery = None;
 
-        if !emit(events, AgentEvent::RunStarted { run_id }).await {
+        if !emit(events, AgentEvent::TurnStarted).await {
             return Ok(());
         }
 
-        let mut turn = AgentTurn::new();
+        let mut turn = AgentTurnMachine::new();
 
         loop {
             if turn.is_finished() {
@@ -195,12 +193,12 @@ impl<'a> AgentRun<'a> {
                 && !turn.is_finishing()
             {
                 if turn.needs_tool_result_commit() {
-                    if !emit_recovering_after_last_step(events, run_id, &clock).await {
+                    if !emit_recovering_after_last_step(events, &clock).await {
                         return Ok(());
                     }
                     runtime.clear_running_tools();
                     turn.recover_pending_tools()?;
-                    terminal_after_recovery = Some(RecoveryTerminal::FinishRun);
+                    terminal_after_recovery = Some(RecoveryTerminal::FinishTurn);
                 } else {
                     turn.finish();
                 }
@@ -209,43 +207,42 @@ impl<'a> AgentRun<'a> {
             let action = turn.next_action()?;
             let step = clock.next_step(action);
             match self
-                .run_action_step(events, run_id, &mut turn, &mut runtime, step)
+                .execute_action_step(events, &mut turn, &mut runtime, step)
                 .await?
             {
-                AgentRunStepFlow::Continue => {}
-                AgentRunStepFlow::Stop => return Ok(()),
-                AgentRunStepFlow::Recover(terminal) => {
+                AgentTurnStepFlow::Continue => {}
+                AgentTurnStepFlow::Stop => return Ok(()),
+                AgentTurnStepFlow::Recover(terminal) => {
                     terminal_after_recovery = Some(terminal);
                 }
             }
         }
 
         if let Some(terminal) = terminal_after_recovery {
-            return finish_recovered_run(events, run_id, terminal).await;
+            return finish_recovered_turn(events, terminal).await;
         }
 
         Ok(())
     }
 
-    async fn run_action_step(
+    async fn execute_action_step(
         &mut self,
         events: &mpsc::Sender<AgentStreamItem>,
-        run_id: AgentRunId,
-        turn: &mut AgentTurn,
-        runtime: &mut AgentRunRuntime,
+        turn: &mut AgentTurnMachine,
+        runtime: &mut AgentTurnRuntime,
         step: AgentStep,
-    ) -> Result<AgentRunStepFlow> {
+    ) -> Result<AgentTurnStepFlow> {
         if !emit_step_started(events, &step).await {
-            return Ok(AgentRunStepFlow::Stop);
+            return Ok(AgentTurnStepFlow::Stop);
         }
 
         let pending_outcome = match self.execute_action(events, turn, runtime, &step).await? {
             ActionExecution::Outcome(outcome) => outcome,
-            ActionExecution::Stop => return Ok(AgentRunStepFlow::Stop),
+            ActionExecution::Stop => return Ok(AgentTurnStepFlow::Stop),
         };
 
         match self
-            .resolve_controlled_step(events, run_id, step.clone(), pending_outcome)
+            .resolve_controlled_step(events, step.clone(), pending_outcome)
             .await?
         {
             ControlledStepFlow::Continue(outcome) => {
@@ -253,16 +250,16 @@ impl<'a> AgentRun<'a> {
                     .commit_step_outcome(events, turn, runtime, &step, outcome)
                     .await?
                 {
-                    return Ok(AgentRunStepFlow::Stop);
+                    return Ok(AgentTurnStepFlow::Stop);
                 }
-                Ok(AgentRunStepFlow::Continue)
+                Ok(AgentTurnStepFlow::Continue)
             }
-            ControlledStepFlow::Stop => Ok(AgentRunStepFlow::Stop),
+            ControlledStepFlow::Stop => Ok(AgentTurnStepFlow::Stop),
             ControlledStepFlow::Recover(outcome, terminal) => {
                 self.apply_outcome_before_recovery(turn, runtime, &step, outcome)?;
                 runtime.clear_running_tools();
                 turn.recover_pending_tools()?;
-                Ok(AgentRunStepFlow::Recover(terminal))
+                Ok(AgentTurnStepFlow::Recover(terminal))
             }
         }
     }
@@ -270,8 +267,8 @@ impl<'a> AgentRun<'a> {
     async fn execute_action(
         &mut self,
         events: &mpsc::Sender<AgentStreamItem>,
-        turn: &mut AgentTurn,
-        runtime: &mut AgentRunRuntime,
+        turn: &mut AgentTurnMachine,
+        runtime: &mut AgentTurnRuntime,
         step: &AgentStep,
     ) -> Result<ActionExecution> {
         match &step.action {
@@ -387,14 +384,13 @@ impl<'a> AgentRun<'a> {
                     },
                 ))
             }
-            AgentAction::FinishRun => Ok(ActionExecution::Outcome(AgentOutcome::RunFinished)),
+            AgentAction::FinishTurn => Ok(ActionExecution::Outcome(AgentOutcome::TurnFinished)),
         }
     }
 
     async fn resolve_controlled_step(
         &mut self,
         events: &mpsc::Sender<AgentStreamItem>,
-        run_id: AgentRunId,
         step: AgentStep,
         pending_outcome: AgentOutcome,
     ) -> Result<ControlledStepFlow> {
@@ -408,14 +404,8 @@ impl<'a> AgentRun<'a> {
             .await?;
 
         if outcome_allows_recovery(&outcome) {
-            match complete_recoverable_step_after_control(
-                events,
-                run_id,
-                step,
-                outcome.clone(),
-                control,
-            )
-            .await?
+            match complete_recoverable_step_after_control(events, step, outcome.clone(), control)
+                .await?
             {
                 RecoverableStepFlow::Continue => Ok(ControlledStepFlow::Continue(outcome)),
                 RecoverableStepFlow::Stop => Ok(ControlledStepFlow::Stop),
@@ -423,9 +413,7 @@ impl<'a> AgentRun<'a> {
                     Ok(ControlledStepFlow::Recover(outcome, terminal))
                 }
             }
-        } else if complete_step_after_control(events, run_id, step, outcome.clone(), control)
-            .await?
-        {
+        } else if complete_step_after_control(events, step, outcome.clone(), control).await? {
             Ok(ControlledStepFlow::Continue(outcome))
         } else {
             Ok(ControlledStepFlow::Stop)
@@ -443,7 +431,7 @@ impl<'a> AgentRun<'a> {
                 AgentControlSignal::Control(AgentControl::ReplaceRequest(request)),
             ) => Ok((
                 AgentOutcome::RequestBuilt(request),
-                AgentControlSignal::continue_run(),
+                AgentControlSignal::continue_turn(),
             )),
             (
                 AgentOutcome::ModelDelta {
@@ -456,7 +444,7 @@ impl<'a> AgentRun<'a> {
                     content_index,
                     delta,
                 },
-                AgentControlSignal::continue_run(),
+                AgentControlSignal::continue_turn(),
             )),
             (
                 AgentOutcome::ModelDelta {
@@ -469,7 +457,7 @@ impl<'a> AgentRun<'a> {
                     content_index,
                     delta,
                 },
-                AgentControlSignal::continue_run(),
+                AgentControlSignal::continue_turn(),
             )),
             (
                 AgentOutcome::ModelOutputFinished { reason, usage, .. },
@@ -480,7 +468,7 @@ impl<'a> AgentRun<'a> {
                     reason,
                     usage,
                 },
-                AgentControlSignal::continue_run(),
+                AgentControlSignal::continue_turn(),
             )),
             (
                 AgentOutcome::ToolPlanned { tool, .. } | AgentOutcome::ToolRejected { tool, .. },
@@ -497,7 +485,7 @@ impl<'a> AgentRun<'a> {
                         tool: replacement,
                         policy,
                     },
-                    AgentControlSignal::continue_run(),
+                    AgentControlSignal::continue_turn(),
                 ))
             }
             (
@@ -507,7 +495,7 @@ impl<'a> AgentRun<'a> {
                 let result = rejected_tool_result(&tool, reason);
                 Ok((
                     AgentOutcome::ToolRejected { tool, result },
-                    AgentControlSignal::continue_run(),
+                    AgentControlSignal::continue_turn(),
                 ))
             }
             (
@@ -523,7 +511,7 @@ impl<'a> AgentRun<'a> {
                     tool,
                     result,
                 },
-                AgentControlSignal::continue_run(),
+                AgentControlSignal::continue_turn(),
             )),
             (
                 AgentOutcome::ToolResultCommitted {
@@ -545,7 +533,7 @@ impl<'a> AgentRun<'a> {
                         tool,
                         result,
                     },
-                    AgentControlSignal::continue_run(),
+                    AgentControlSignal::continue_turn(),
                 ))
             }
             (outcome, control) => Ok((outcome, control)),
@@ -555,8 +543,8 @@ impl<'a> AgentRun<'a> {
     async fn commit_step_outcome(
         &mut self,
         events: &mpsc::Sender<AgentStreamItem>,
-        turn: &mut AgentTurn,
-        runtime: &mut AgentRunRuntime,
+        turn: &mut AgentTurnMachine,
+        runtime: &mut AgentTurnRuntime,
         step: &AgentStep,
         outcome: AgentOutcome,
     ) -> Result<bool> {
@@ -643,15 +631,8 @@ impl<'a> AgentRun<'a> {
                 )?;
                 Ok(true)
             }
-            (AgentAction::FinishRun, outcome @ AgentOutcome::RunFinished) => {
-                if !emit(
-                    events,
-                    AgentEvent::RunFinished {
-                        run_id: step.id.run_id,
-                    },
-                )
-                .await
-                {
+            (AgentAction::FinishTurn, outcome @ AgentOutcome::TurnFinished) => {
+                if !emit(events, AgentEvent::TurnFinished).await {
                     return Ok(false);
                 }
                 turn.apply_outcome(&step.action, outcome)?;
@@ -666,8 +647,8 @@ impl<'a> AgentRun<'a> {
 
     fn apply_outcome_before_recovery(
         &mut self,
-        turn: &mut AgentTurn,
-        _runtime: &mut AgentRunRuntime,
+        turn: &mut AgentTurnMachine,
+        _runtime: &mut AgentTurnRuntime,
         step: &AgentStep,
         outcome: AgentOutcome,
     ) -> Result<()> {
@@ -780,7 +761,6 @@ fn panic_payload_to_string(payload: Box<dyn Any + Send + 'static>) -> String {
 
 async fn complete_recoverable_step_after_control(
     events: &mpsc::Sender<AgentStreamItem>,
-    run_id: AgentRunId,
     step: AgentStep,
     outcome: AgentOutcome,
     signal: AgentControlSignal,
@@ -790,13 +770,13 @@ async fn complete_recoverable_step_after_control(
         if !emit_step_completed(events, step.clone(), outcome).await {
             return Ok(RecoverableStepFlow::Stop);
         }
-        if !emit_run_recovering(events, run_id, step.id).await {
+        if !emit_turn_recovering(events, step.id).await {
             return Ok(RecoverableStepFlow::Stop);
         }
         return Ok(RecoverableStepFlow::Recover(terminal));
     }
 
-    if complete_step_after_control(events, run_id, step, outcome, signal).await? {
+    if complete_step_after_control(events, step, outcome, signal).await? {
         Ok(RecoverableStepFlow::Continue)
     } else {
         Ok(RecoverableStepFlow::Stop)
@@ -808,8 +788,8 @@ fn recovery_terminal_for_signal(
     step_id: AgentStepId,
 ) -> Option<RecoveryTerminal> {
     match signal {
-        AgentControlSignal::Control(AgentControl::FinishRun) => Some(RecoveryTerminal::FinishRun),
-        AgentControlSignal::Control(AgentControl::AbortRun) => Some(RecoveryTerminal::AbortRun),
+        AgentControlSignal::Control(AgentControl::FinishTurn) => Some(RecoveryTerminal::FinishTurn),
+        AgentControlSignal::Control(AgentControl::AbortTurn) => Some(RecoveryTerminal::AbortTurn),
         AgentControlSignal::Preempt => Some(RecoveryTerminal::Preempted { at: step_id }),
         _ => None,
     }
@@ -830,42 +810,36 @@ fn outcome_after_recovery_signal(
     }
 }
 
-async fn emit_run_recovering(
-    events: &mpsc::Sender<AgentStreamItem>,
-    run_id: AgentRunId,
-    after: AgentStepId,
-) -> bool {
-    emit(events, AgentEvent::RunRecovering { run_id, after }).await
+async fn emit_turn_recovering(events: &mpsc::Sender<AgentStreamItem>, after: AgentStepId) -> bool {
+    emit(events, AgentEvent::TurnRecovering { after }).await
 }
 
 async fn emit_recovering_after_last_step(
     events: &mpsc::Sender<AgentStreamItem>,
-    run_id: AgentRunId,
-    clock: &AgentRunClock,
+    clock: &AgentTurnClock,
 ) -> bool {
     match clock.last_step_id() {
-        Some(after) => emit_run_recovering(events, run_id, after).await,
+        Some(after) => emit_turn_recovering(events, after).await,
         None => true,
     }
 }
 
-async fn finish_recovered_run(
+async fn finish_recovered_turn(
     events: &mpsc::Sender<AgentStreamItem>,
-    run_id: AgentRunId,
     terminal: RecoveryTerminal,
 ) -> Result<()> {
     match terminal {
-        RecoveryTerminal::FinishRun => {
-            let _ = emit(events, AgentEvent::RunFinished { run_id }).await;
+        RecoveryTerminal::FinishTurn => {
+            let _ = emit(events, AgentEvent::TurnFinished).await;
         }
-        RecoveryTerminal::AbortRun => {
-            let _ = emit(events, AgentEvent::RunAborted { run_id }).await;
+        RecoveryTerminal::AbortTurn => {
+            let _ = emit(events, AgentEvent::TurnAborted).await;
         }
         RecoveryTerminal::Preempted { at } => {
-            if !emit(events, AgentEvent::RunPreempted { run_id, at }).await {
+            if !emit(events, AgentEvent::TurnPreempted { at }).await {
                 return Ok(());
             }
-            let _ = emit(events, AgentEvent::RunAborted { run_id }).await;
+            let _ = emit(events, AgentEvent::TurnAborted).await;
         }
     }
     Ok(())
@@ -908,34 +882,33 @@ async fn emit_step_completed(
 
 async fn complete_step_after_control(
     events: &mpsc::Sender<AgentStreamItem>,
-    run_id: AgentRunId,
     step: AgentStep,
     outcome: AgentOutcome,
     signal: AgentControlSignal,
 ) -> Result<bool> {
     match signal {
         AgentControlSignal::Control(
-            control @ (AgentControl::Continue | AgentControl::FinishRun | AgentControl::AbortRun),
+            control @ (AgentControl::Continue | AgentControl::FinishTurn | AgentControl::AbortTurn),
         ) => {
             let step_id = step.id;
             if !emit_step_completed(events, step, outcome).await {
                 return Ok(false);
             }
-            continue_after_control(events, run_id, step_id, control).await
+            continue_after_control(events, step_id, control).await
         }
         AgentControlSignal::Control(AgentControl::Pause) => {
             let step_id = step.id;
             if !emit_step_completed(events, step, outcome).await {
                 return Ok(false);
             }
-            pause_after_control(events, run_id, step_id, None).await
+            pause_after_control(events, step_id, None).await
         }
         AgentControlSignal::Pause { resume } => {
             let step_id = step.id;
             if !emit_step_completed(events, step, outcome).await {
                 return Ok(false);
             }
-            pause_after_control(events, run_id, step_id, Some(resume)).await
+            pause_after_control(events, step_id, Some(resume)).await
         }
         AgentControlSignal::Preempt => {
             let step_id = step.id;
@@ -948,18 +921,10 @@ async fn complete_step_after_control(
             if !emit_step_completed(events, step, outcome).await {
                 return Ok(false);
             }
-            if !emit(
-                events,
-                AgentEvent::RunPreempted {
-                    run_id,
-                    at: step_id,
-                },
-            )
-            .await
-            {
+            if !emit(events, AgentEvent::TurnPreempted { at: step_id }).await {
                 return Ok(false);
             }
-            let _ = emit(events, AgentEvent::RunAborted { run_id }).await;
+            let _ = emit(events, AgentEvent::TurnAborted).await;
             Ok(false)
         }
         other => Err(Error::client(format!(
@@ -971,19 +936,10 @@ async fn complete_step_after_control(
 
 async fn pause_after_control(
     events: &mpsc::Sender<AgentStreamItem>,
-    run_id: AgentRunId,
     step_id: AgentStepId,
     resume: Option<oneshot::Receiver<()>>,
 ) -> Result<bool> {
-    if !emit(
-        events,
-        AgentEvent::RunPaused {
-            run_id,
-            at: step_id,
-        },
-    )
-    .await
-    {
+    if !emit(events, AgentEvent::TurnPaused { at: step_id }).await {
         return Ok(false);
     }
 
@@ -993,15 +949,7 @@ async fn pause_after_control(
     if resume.await.is_err() {
         return Ok(false);
     }
-    if !emit(
-        events,
-        AgentEvent::RunResumed {
-            run_id,
-            at: step_id,
-        },
-    )
-    .await
-    {
+    if !emit(events, AgentEvent::TurnResumed { at: step_id }).await {
         return Ok(false);
     }
     Ok(true)
@@ -1009,29 +957,21 @@ async fn pause_after_control(
 
 async fn continue_after_control(
     events: &mpsc::Sender<AgentStreamItem>,
-    run_id: AgentRunId,
     step_id: AgentStepId,
     control: AgentControl,
 ) -> Result<bool> {
     match control {
         AgentControl::Continue => Ok(true),
         AgentControl::Pause => {
-            let _ = emit(
-                events,
-                AgentEvent::RunPaused {
-                    run_id,
-                    at: step_id,
-                },
-            )
-            .await;
+            let _ = emit(events, AgentEvent::TurnPaused { at: step_id }).await;
             Ok(false)
         }
-        AgentControl::FinishRun => {
-            let _ = emit(events, AgentEvent::RunFinished { run_id }).await;
+        AgentControl::FinishTurn => {
+            let _ = emit(events, AgentEvent::TurnFinished).await;
             Ok(false)
         }
-        AgentControl::AbortRun => {
-            let _ = emit(events, AgentEvent::RunAborted { run_id }).await;
+        AgentControl::AbortTurn => {
+            let _ = emit(events, AgentEvent::TurnAborted).await;
             Ok(false)
         }
         other => Err(Error::client(format!(

@@ -4,14 +4,9 @@ use copro_api::request::GenerateRequest;
 use copro_api::response::{FinishReason, Usage};
 use copro_api::stream::OutputContentDelta;
 use copro_api::tool::ToolDefinition;
-use derive_more::{Deref, Display, From, Into};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deref, Display, From, Into)]
-pub struct AgentRunId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AgentStepId {
-    pub run_id: AgentRunId,
     pub tick: u64,
 }
 
@@ -50,7 +45,7 @@ pub enum AgentAction {
         tool: ToolCall,
         result: ToolResult,
     },
-    FinishRun,
+    FinishTurn,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,7 +92,7 @@ pub enum AgentOutcome {
         tool: ToolCall,
         result: ToolResult,
     },
-    RunFinished,
+    TurnFinished,
     ActionInterrupted {
         reason: AgentInterruptReason,
     },
@@ -110,7 +105,7 @@ pub enum AgentInterruptReason {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum AgentRunState {
+pub enum AgentTurnState {
     Ready {
         next: AgentAction,
         step_id: AgentStepId,

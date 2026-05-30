@@ -106,7 +106,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             .push_message(Message::User(vec![text(&input)]))
             .await?;
 
-        if let Err(error) = run_turn(&agent, &skill_request).await {
+        if let Err(error) = drive_turn(&agent, &skill_request).await {
             eprintln!("[error] {error}");
         }
         println!();
@@ -115,11 +115,11 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     Ok(())
 }
 
-async fn run_turn(
+async fn drive_turn(
     agent: &Agent,
     skill_request: &SkillRequestInjector,
 ) -> Result<(), Box<dyn StdError>> {
-    let run = agent.start_run().await?;
+    let run = agent.start_turn().await?;
     let mut started_assistant = false;
     let mut streaming_thinking = false;
 
@@ -129,7 +129,7 @@ async fn run_turn(
             handle_agent_event(event, &mut started_assistant, &mut streaming_thinking)?;
         }
 
-        let finished = matches!(point.pending_outcome(), AgentOutcome::RunFinished);
+        let finished = matches!(point.pending_outcome(), AgentOutcome::TurnFinished);
         match point {
             AgentCheckpoint::RequestBuilt(report) => {
                 let step_id = report.step.id;

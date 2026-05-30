@@ -1,11 +1,11 @@
-use super::types::{AgentOutcome, AgentRunState, AgentStep, AgentStepId};
+use super::types::{AgentOutcome, AgentStep, AgentStepId, AgentTurnState};
 use crate::event::AgentEvent;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentStepReport {
     pub step: AgentStep,
     pub outcome: AgentOutcome,
-    pub state: AgentRunState,
+    pub state: AgentTurnState,
     pub events: Vec<AgentEvent>,
 }
 
@@ -53,7 +53,7 @@ impl AgentCheckpoint {
         self.step().id
     }
 
-    pub fn state(&self) -> &AgentRunState {
+    pub fn state(&self) -> &AgentTurnState {
         &self.report().state
     }
 
