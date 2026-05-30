@@ -11,10 +11,11 @@ mod tools;
 mod turn;
 
 pub use agent::Agent;
+pub use context::AgentContext;
 pub use event::{AgentEvent, AgentStream};
 pub use run::{
     AgentAction, AgentCheckpoint, AgentControl, AgentControlKind, AgentInterruptReason,
     AgentOutcome, AgentRunHandle, AgentRunId, AgentRunState, AgentStep, AgentStepId,
-    AgentStepReport, AgentTurnId, ToolResultReplacement,
+    AgentStepReport, ToolResultReplacement,
 };
 pub use tools::{ToolExecutionPolicy, ToolRouter};

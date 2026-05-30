@@ -1,7 +1,7 @@
 use copro_agent::{
-    Agent, AgentAction, AgentCheckpoint, AgentControl, AgentEvent, AgentInterruptReason,
-    AgentOutcome, AgentRunState, CancellationToken, ToolExecutionPolicy, ToolResultReplacement,
-    ToolRouter, async_trait,
+    Agent, AgentAction, AgentCheckpoint, AgentContext, AgentControl, AgentEvent,
+    AgentInterruptReason, AgentOutcome, AgentRunState, CancellationToken, ToolExecutionPolicy,
+    ToolResultReplacement, ToolRouter, async_trait,
 };
 use copro_api::error::Result;
 use copro_api::message::{
@@ -537,7 +537,7 @@ async fn run_handle_pause_request_waits_for_next_boundary() {
 }
 
 #[tokio::test]
-async fn run_handle_abort_turn_finishes_without_run_aborted() {
+async fn run_handle_finish_run_finishes_without_run_aborted() {
     let agent = test_agent(vec![OutputStreamEvent::Finished {
         reason: FinishReason::Stop,
         usage: None,
@@ -545,7 +545,7 @@ async fn run_handle_abort_turn_finishes_without_run_aborted() {
     let run = agent.start_run().await.unwrap();
     let report = run.step().await.unwrap();
 
-    run.control(report.step.id, AgentControl::AbortTurn)
+    run.control(report.step.id, AgentControl::FinishRun)
         .await
         .unwrap();
     let events = run
@@ -559,7 +559,10 @@ async fn run_handle_abort_turn_finishes_without_run_aborted() {
 
     assert!(events.iter().any(|event| matches!(
         event,
-        AgentEvent::TurnFinished { turn_id, .. } if *turn_id == report.step.id.turn_id
+        AgentEvent::StepCompleted {
+            outcome: AgentOutcome::ToolsLoaded(_),
+            ..
+        }
     )));
     assert!(
         events
@@ -1638,6 +1641,74 @@ async fn build_request_carries_agent_baseline_config() {
         request.hosted_tools,
         vec![HostedToolSpec::new("web_search")]
     );
+}
+
+#[tokio::test]
+async fn agent_context_round_trips_context_state() {
+    let mut options = GenerateRequestOptions {
+        temperature: Some(0.7),
+        max_tokens: Some(512),
+        ..GenerateRequestOptions::default()
+    };
+    options
+        .insert_extra(serde_json::json!({"provider": "test"}))
+        .unwrap();
+    let hosted_tool = HostedToolSpec::new("web_search")
+        .with_parameters(serde_json::json!({"region": "global"}))
+        .unwrap();
+    let expected = AgentContext::new(
+        vec![Message::User(vec![InputContent::Text("hi".to_string())])],
+        options,
+        Some(ToolChoice::Specific {
+            name: "double".to_string(),
+        }),
+        vec![hosted_tool],
+    );
+    let agent = Agent::from_context(
+        expected.clone(),
+        Arc::new(TestModel { events: Vec::new() }),
+        Arc::new(EmptyToolRouter),
+    );
+
+    let context = agent.context().await.unwrap();
+    assert_eq!(context, expected);
+    assert_eq!(context.messages(), expected.messages());
+    assert_eq!(context.options(), expected.options());
+    assert_eq!(context.tool_choice(), expected.tool_choice());
+    assert_eq!(context.hosted_tools(), expected.hosted_tools());
+    let encoded = serde_json::to_value(&context).unwrap();
+    let decoded: AgentContext = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded, context);
+}
+
+#[tokio::test]
+async fn agent_from_context_restores_independent_context() {
+    let source = test_agent(Vec::new());
+    source
+        .replace_messages(vec![Message::User(vec![InputContent::Text(
+            "source".to_string(),
+        )])])
+        .await
+        .unwrap();
+    source
+        .set_tool_choice(Some(ToolChoice::Required))
+        .await
+        .unwrap();
+    let context = source.context().await.unwrap();
+    let restored = Agent::from_context(
+        context.clone(),
+        Arc::new(TestModel { events: Vec::new() }),
+        Arc::new(EmptyToolRouter),
+    );
+
+    assert_eq!(restored.context().await.unwrap(), context);
+    restored
+        .push_message(Message::User(vec![InputContent::Text("child".to_string())]))
+        .await
+        .unwrap();
+
+    assert_eq!(source.context().await.unwrap(), context);
+    assert_eq!(restored.messages().await.unwrap().len(), 2);
 }
 
 struct CapturingModel {

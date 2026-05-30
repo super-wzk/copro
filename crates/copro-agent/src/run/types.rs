@@ -9,13 +9,9 @@ use derive_more::{Deref, Display, From, Into};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deref, Display, From, Into)]
 pub struct AgentRunId(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deref, Display, From, Into)]
-pub struct AgentTurnId(pub u64);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AgentStepId {
     pub run_id: AgentRunId,
-    pub turn_id: AgentTurnId,
     pub tick: u64,
 }
 
@@ -54,7 +50,7 @@ pub enum AgentAction {
         tool: ToolCall,
         result: ToolResult,
     },
-    FinishTurn,
+    FinishRun,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,7 +97,7 @@ pub enum AgentOutcome {
         tool: ToolCall,
         result: ToolResult,
     },
-    TurnFinished,
+    RunFinished,
     ActionInterrupted {
         reason: AgentInterruptReason,
     },

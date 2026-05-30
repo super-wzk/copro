@@ -129,7 +129,7 @@ async fn run_turn(
             handle_agent_event(event, &mut started_assistant, &mut streaming_thinking)?;
         }
 
-        let finished = matches!(point.pending_outcome(), AgentOutcome::TurnFinished);
+        let finished = matches!(point.pending_outcome(), AgentOutcome::RunFinished);
         match point {
             AgentCheckpoint::RequestBuilt(report) => {
                 let step_id = report.step.id;

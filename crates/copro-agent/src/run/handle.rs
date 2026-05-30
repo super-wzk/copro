@@ -167,7 +167,7 @@ impl AgentRunHandle {
                 inner.state = Some(AgentRunState::Paused { at: step_id });
                 Ok(report)
             }
-            AgentControl::AbortTurn => {
+            AgentControl::FinishRun => {
                 self.cancellation.cancel();
                 inner.send_pending_control(control);
                 inner.state = if outcome_requires_recovery(&report.outcome) {
@@ -399,7 +399,7 @@ fn allowed_controls_for_outcome(outcome: &AgentOutcome) -> Vec<AgentControlKind>
     let mut controls = vec![
         AgentControlKind::Continue,
         AgentControlKind::Pause,
-        AgentControlKind::AbortTurn,
+        AgentControlKind::FinishRun,
         AgentControlKind::AbortRun,
     ];
     match outcome {

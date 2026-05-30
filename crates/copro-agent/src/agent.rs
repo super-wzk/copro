@@ -1,5 +1,5 @@
 use crate::cancel::RunCancellation;
-use crate::context::{AgentCommand, AgentContext};
+use crate::context::{AgentCommand, AgentContext, AgentState};
 use crate::event::AgentStream;
 use crate::run::AgentRunHandle;
 use crate::tools::ToolRouter;
@@ -23,9 +23,17 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(model: Arc<dyn Model>, tools: Arc<dyn ToolRouter>) -> Self {
+        Self::from_context(AgentContext::default(), model, tools)
+    }
+
+    pub fn from_context(
+        context: AgentContext,
+        model: Arc<dyn Model>,
+        tools: Arc<dyn ToolRouter>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(COMMAND_BUFFER);
-        let context = AgentContext::new(model, tools);
-        AgentContext::spawn(context, rx);
+        let state = AgentState::new(context, model, tools);
+        AgentState::spawn(state, rx);
 
         Self { tx }
     }
@@ -73,6 +81,10 @@ impl Agent {
 
     pub async fn messages(&self) -> Result<Vec<Message>> {
         self.call(|reply| AgentCommand::Messages { reply }).await
+    }
+
+    pub async fn context(&self) -> Result<AgentContext> {
+        self.call(|reply| AgentCommand::Context { reply }).await
     }
 
     pub async fn set_options(&self, options: GenerateRequestOptions) -> Result<()> {

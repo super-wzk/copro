@@ -1,9 +1,9 @@
 use super::{
     AgentAction, AgentControl, AgentControlSignal, AgentInterruptReason, AgentOutcome, AgentRunId,
-    AgentStep, AgentStepId, AgentTurnId,
+    AgentStep, AgentStepId,
 };
 use crate::cancel::RunCancellation;
-use crate::context::{AgentContext, AgentStreamItem};
+use crate::context::{AgentState, AgentStreamItem};
 use crate::event::AgentEvent;
 use crate::tools::{ToolExecutionPolicy, ToolRouter};
 use crate::turn::{
@@ -29,7 +29,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryTerminal {
-    AbortTurn,
+    FinishRun,
     AbortRun,
     Preempted { at: AgentStepId },
 }
@@ -43,16 +43,14 @@ enum RecoverableStepFlow {
 
 struct AgentRunClock {
     run_id: AgentRunId,
-    turn_id: AgentTurnId,
     next_tick: u64,
     last_step_id: Option<AgentStepId>,
 }
 
 impl AgentRunClock {
-    fn new(run_id: AgentRunId, turn_id: AgentTurnId) -> Self {
+    fn new(run_id: AgentRunId) -> Self {
         Self {
             run_id,
-            turn_id,
             next_tick: 0,
             last_step_id: None,
         }
@@ -62,7 +60,6 @@ impl AgentRunClock {
         let step = AgentStep {
             id: AgentStepId {
                 run_id: self.run_id,
-                turn_id: self.turn_id,
                 tick: self.next_tick,
             },
             action,
@@ -78,14 +75,14 @@ impl AgentRunClock {
 }
 
 pub(crate) struct AgentRun<'a> {
-    context: &'a mut AgentContext,
+    state: &'a mut AgentState,
     cancellation: RunCancellation,
 }
 
 impl<'a> AgentRun<'a> {
-    pub(crate) fn new(context: &'a mut AgentContext, cancellation: RunCancellation) -> Self {
+    pub(crate) fn new(state: &'a mut AgentState, cancellation: RunCancellation) -> Self {
         Self {
-            context,
+            state,
             cancellation,
         }
     }
@@ -97,21 +94,18 @@ impl<'a> AgentRun<'a> {
     }
 
     async fn run_turn_inner(&mut self, events: &mpsc::Sender<AgentStreamItem>) -> Result<()> {
-        let model = Arc::clone(&self.context.model);
-        let tools = Arc::clone(&self.context.tools);
+        let model = Arc::clone(&self.state.model);
+        let tools = Arc::clone(&self.state.tools);
         let cancellation = self.cancellation.clone();
-        let tool_choice = self.context.tool_choice.clone();
-        let hosted_tools = self.context.hosted_tools.clone();
-        let options = self.context.options.clone();
+        let tool_choice = self.state.context.tool_choice().cloned();
+        let hosted_tools = self.state.context.hosted_tools().to_vec();
+        let options = self.state.context.options().clone();
         let mut model_stream: Option<ModelStream> = None;
-        let (run_id, turn_id) = self.context.allocate_run_ids();
-        let mut clock = AgentRunClock::new(run_id, turn_id);
+        let run_id = self.state.allocate_run_id();
+        let mut clock = AgentRunClock::new(run_id);
         let mut terminal_after_recovery = None;
 
         if !emit(events, AgentEvent::RunStarted { run_id }).await {
-            return Ok(());
-        }
-        if !emit(events, AgentEvent::TurnStarted { run_id, turn_id }).await {
             return Ok(());
         }
 
@@ -154,7 +148,7 @@ impl<'a> AgentRun<'a> {
                         return Ok(());
                     }
                     let mut request = turn.build_request(
-                        &self.context.messages,
+                        self.state.context.messages(),
                         tool_definitions,
                         hosted_tools.clone(),
                         tool_choice.clone(),
@@ -407,12 +401,10 @@ impl<'a> AgentRun<'a> {
                                 return Ok(());
                             }
                             let committed = turn.commit_output(output)?;
-                            let message_index = self.context.messages.len();
-                            self.context
-                                .messages
-                                .push(normalize_for_history(Message::Assistant(
-                                    committed.content.clone(),
-                                )));
+                            let message_index = self.state.context.messages().len();
+                            self.state.context.push_message(normalize_for_history(
+                                Message::Assistant(committed.content.clone()),
+                            ));
                             model_stream = None;
                             let outcome = AgentOutcome::AssistantCommitted {
                                 message_index,
@@ -523,7 +515,7 @@ impl<'a> AgentRun<'a> {
                                     replacement,
                                 )) => {
                                     replace_tool_call_in_history(
-                                        &mut self.context.messages,
+                                        self.state.context.messages_mut(),
                                         &item.tool,
                                         replacement.clone(),
                                     );
@@ -753,7 +745,7 @@ impl<'a> AgentRun<'a> {
                         if !emit_step_started(events, &step).await {
                             return Ok(());
                         }
-                        let message_index = self.context.messages.len();
+                        let message_index = self.state.context.messages().len();
                         let step_id = step.id;
                         let pending_outcome = AgentOutcome::ToolResultCommitted {
                             message_index,
@@ -815,7 +807,9 @@ impl<'a> AgentRun<'a> {
                         {
                             return Ok(());
                         }
-                        self.context.messages.push(Message::Tool(result.clone()));
+                        self.state
+                            .context
+                            .push_message(Message::Tool(result.clone()));
                         if !emit(
                             events,
                             AgentEvent::ToolResultCommitted {
@@ -839,19 +833,16 @@ impl<'a> AgentRun<'a> {
         }
 
         if let Some(terminal) = terminal_after_recovery {
-            return finish_recovered_run(events, run_id, turn_id, terminal).await;
+            return finish_recovered_run(events, run_id, terminal).await;
         }
 
-        let step = clock.next_step(AgentAction::FinishTurn);
+        let step = clock.next_step(AgentAction::FinishRun);
         if !emit_step_started(events, &step).await {
             return Ok(());
         }
-        if !emit_step_completed_and_continue(events, run_id, step, AgentOutcome::TurnFinished)
+        if !emit_step_completed_and_continue(events, run_id, step, AgentOutcome::RunFinished)
             .await?
         {
-            return Ok(());
-        }
-        if !emit(events, AgentEvent::TurnFinished { run_id, turn_id }).await {
             return Ok(());
         }
         if !emit(events, AgentEvent::RunFinished { run_id }).await {
@@ -1111,7 +1102,7 @@ fn recovery_terminal_for_signal(
     step_id: AgentStepId,
 ) -> Option<RecoveryTerminal> {
     match signal {
-        AgentControlSignal::Control(AgentControl::AbortTurn) => Some(RecoveryTerminal::AbortTurn),
+        AgentControlSignal::Control(AgentControl::FinishRun) => Some(RecoveryTerminal::FinishRun),
         AgentControlSignal::Control(AgentControl::AbortRun) => Some(RecoveryTerminal::AbortRun),
         AgentControlSignal::Preempt => Some(RecoveryTerminal::Preempted { at: step_id }),
         _ => None,
@@ -1155,14 +1146,10 @@ async fn emit_recovering_after_last_step(
 async fn finish_recovered_run(
     events: &mpsc::Sender<AgentStreamItem>,
     run_id: AgentRunId,
-    turn_id: AgentTurnId,
     terminal: RecoveryTerminal,
 ) -> Result<()> {
     match terminal {
-        RecoveryTerminal::AbortTurn => {
-            if !emit(events, AgentEvent::TurnFinished { run_id, turn_id }).await {
-                return Ok(());
-            }
+        RecoveryTerminal::FinishRun => {
             let _ = emit(events, AgentEvent::RunFinished { run_id }).await;
         }
         RecoveryTerminal::AbortRun => {
@@ -1233,7 +1220,7 @@ async fn complete_step_after_control(
 ) -> Result<bool> {
     match signal {
         AgentControlSignal::Control(
-            control @ (AgentControl::Continue | AgentControl::AbortTurn | AgentControl::AbortRun),
+            control @ (AgentControl::Continue | AgentControl::FinishRun | AgentControl::AbortRun),
         ) => {
             let step_id = step.id;
             if !emit_step_completed(events, step, outcome).await {
@@ -1344,18 +1331,7 @@ async fn continue_after_control(
             .await;
             Ok(false)
         }
-        AgentControl::AbortTurn => {
-            if !emit(
-                events,
-                AgentEvent::TurnFinished {
-                    run_id,
-                    turn_id: step_id.turn_id,
-                },
-            )
-            .await
-            {
-                return Ok(false);
-            }
+        AgentControl::FinishRun => {
             let _ = emit(events, AgentEvent::RunFinished { run_id }).await;
             Ok(false)
         }

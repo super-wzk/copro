@@ -15,13 +15,14 @@
 - `control()` 已对非法 control kind 和 replacement invariant 做即时校验。
 - `ToolResultReplacement` 已用于 typed tool result replacement，由运行层自动填充 `call_id` / `name`。
 - `Pause` / `Resume` 已形成 boundary 和 in-flight pause request 的 `RunPaused` -> `RunResumed` 事件链。
-- `AbortTurn` / `AbortRun` 已在事件层区分，in-flight `preempt()` 已产生 `RunPreempted`。
+- `FinishRun` / `AbortRun` 已在事件层区分，in-flight `preempt()` 已产生 `RunPreempted`。
 - `Ready` 已通过 `StepReady` 成为真实可观察状态，`Recovering` 已通过 `RunRecovering` 成为真实 recovery 状态。
 - abort/preempt/stop 遇到已提交 tool call 或 tool execution boundary 时，会通过 recovery step 补齐 tool result。
 - `AgentRunHandle` 已加入单 driver lease，避免 `events()` / `step()` 并发抢同一 receiver。
 - `AgentTurn` 纯状态机化已评估：当前已无 async/IO/cancellation token；进一步 `next_action()` / `apply_outcome()` 拆分暂缓为后续机械重构。
 - `run.rs` 已拆为 `run/{types,control,checkpoint,handle,execution}.rs`，`run/mod.rs` 只保留声明和 re-export。
 - `runtime` public namespace 已移除；`StopSignal` public API 已移除，取消能力收拢为每个 run 内部的 cancellation source，由 `AgentRunHandle` 的 `Abort*` / `preempt()` 驱动。
+- `AgentContext` 已作为 public 可序列化值对象加入 API，用于保存/恢复长期 context 状态；字段私有且只提供 getter，不包含 model/tools 或 in-flight run/runtime 对象。
 - `run_stream()` 已基于 `AgentRunHandle` auto mode 实现。
 - `AgentControl` 已支持 request、model delta、assistant output、tool call、tool result 的改写/拒绝。
 - `AgentHook` / `AgentHooks` / `ToolCallDecision` 已从当前工作区代码中移除。
@@ -107,19 +108,19 @@
 原问题：
 
 - `RunPreempted` / `Recovering` 目前偏预留。
-- `AbortTurn` 和 `AbortRun` 行为仍接近。
+- `FinishRun` 和 `AbortRun` 行为仍接近。
 - assistant 已 commit tool call 后，如果 abort/preempt 发生在某些 boundary，可能留下无 tool result 的 history。
 
 目标：
 
-- `AbortTurn` 只终止当前 turn，并按需补齐 tool result recovery。
+- `FinishRun` 只结束当前 run，并按需补齐 tool result recovery。
 - `AbortRun` 终止 run，并按需补齐 tool result recovery。
 - `preempt()` 可中断 in-flight action，并发出明确 interrupted/recovery event。
 
 验收：
 
 - assistant tool call 已 commit 后，无论 abort/preempt 发生在哪里，history 中每个 tool call 都有对应 tool result。
-- `AbortTurn` / `AbortRun` 事件顺序有测试覆盖。
+- `FinishRun` / `AbortRun` 事件顺序有测试覆盖。
 - in-flight model stream 和 tool execution 的 preempt 行为有测试覆盖。
 
 ### 5. AgentRunHandle 缺少单 driver 保护（已完成）
@@ -268,7 +269,7 @@
 
 内容：
 
-- 区分 `AbortTurn` 和 `AbortRun`。
+- 区分 `FinishRun` 和 `AbortRun`。
 - 对 pending tool calls 生成 recovery tool results。
 - preempt 支持 in-flight cancellation 和明确 event。
 

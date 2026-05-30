@@ -7,7 +7,7 @@ use tokio::sync::oneshot;
 pub enum AgentControl {
     Continue,
     Pause,
-    AbortTurn,
+    FinishRun,
     AbortRun,
     ReplaceRequest(GenerateRequest),
     ReplaceModelDelta(OutputContentDelta),
@@ -54,7 +54,7 @@ impl AgentControl {
         match self {
             AgentControl::Continue => AgentControlKind::Continue,
             AgentControl::Pause => AgentControlKind::Pause,
-            AgentControl::AbortTurn => AgentControlKind::AbortTurn,
+            AgentControl::FinishRun => AgentControlKind::FinishRun,
             AgentControl::AbortRun => AgentControlKind::AbortRun,
             AgentControl::ReplaceRequest(_) => AgentControlKind::ReplaceRequest,
             AgentControl::ReplaceModelDelta(_) => AgentControlKind::ReplaceModelDelta,
@@ -73,7 +73,7 @@ impl AgentControl {
 pub enum AgentControlKind {
     Continue,
     Pause,
-    AbortTurn,
+    FinishRun,
     AbortRun,
     ReplaceRequest,
     ReplaceModelDelta,
