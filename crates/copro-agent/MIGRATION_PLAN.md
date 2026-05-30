@@ -16,6 +16,7 @@
 - `ToolResultReplacement` 已用于 typed tool result replacement，由运行层自动填充 `call_id` / `name`。
 - `Pause` / `Resume` 已形成 boundary 和 in-flight pause request 的 `RunPaused` -> `RunResumed` 事件链。
 - `AbortTurn` / `AbortRun` 已在事件层区分，in-flight `preempt()` 已产生 `RunPreempted`。
+- `AgentRunHandle` 已加入单 driver lease，避免 `events()` / `step()` 并发抢同一 receiver。
 - `run_stream()` 已基于 `AgentRunHandle` auto mode 实现。
 - `AgentControl` 已支持 request、model delta、assistant output、tool call、tool result 的改写/拒绝。
 - `AgentHook` / `AgentHooks` / `ToolCallDecision` 已从当前工作区代码中移除。
@@ -116,9 +117,9 @@
 - `AbortTurn` / `AbortRun` 事件顺序有测试覆盖。
 - in-flight model stream 和 tool execution 的 preempt 行为有测试覆盖。
 
-### 5. AgentRunHandle 缺少单 driver 保护
+### 5. AgentRunHandle 缺少单 driver 保护（已完成）
 
-问题：
+原问题：
 
 - `AgentRunHandle` 可 clone。
 - `events()` / `step()` 共享同一个 receiver，多个消费者可能抢事件。

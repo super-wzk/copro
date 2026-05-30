@@ -723,6 +723,46 @@ async fn run_handle_preempt_inflight_model_stream_emits_run_preempted() {
 }
 
 #[tokio::test]
+async fn run_handle_rejects_step_while_events_driver_is_active() {
+    let agent = test_agent(vec![OutputStreamEvent::Finished {
+        reason: FinishReason::Stop,
+        usage: None,
+    }]);
+    let run = agent.start_run().await.unwrap();
+    let mut stream = run.clone().events();
+
+    stream.next().await.unwrap().unwrap();
+    let error = run.step().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("agent run already has an active driver")
+    );
+
+    drop(stream);
+    run.step().await.unwrap();
+}
+
+#[tokio::test]
+async fn run_handle_rejects_second_events_driver() {
+    let agent = test_agent(vec![OutputStreamEvent::Finished {
+        reason: FinishReason::Stop,
+        usage: None,
+    }]);
+    let run = agent.start_run().await.unwrap();
+    let mut first = run.clone().events();
+    let mut second = run.clone().events();
+
+    first.next().await.unwrap().unwrap();
+    let error = second.next().await.unwrap().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("agent run already has an active driver")
+    );
+}
+
+#[tokio::test]
 async fn run_handle_rejects_stale_control() {
     let agent = test_agent(vec![OutputStreamEvent::Finished {
         reason: FinishReason::Stop,

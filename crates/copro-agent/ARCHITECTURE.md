@@ -566,6 +566,7 @@ event 规则：
 - 调度器不能直接修改 `AgentTurn`、`AgentRunState`、in-flight handle 或 `AgentContext` history。
 - 调度器不能提交 stale `AgentControl`；每次 control 必须携带当前 `AgentStepId`。
 - 常规路径应通过 typed control point 生成 `AgentControlDecision`；低层 `control()` 会立即拒绝非法 control kind 和非法 replacement invariant。
+- 同一个 `AgentRunHandle` 同一时间只能有一个 active driver；`events()` 持有 stream lease，`step()` 持有单次调用 lease。
 - 调度器 trait 如果需要，放在上层 crate，例如 `AgentRunDriver` / `AgentOrchestrator`，不进入底层核心。
 
 示例 API：

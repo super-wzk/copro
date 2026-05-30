@@ -21,6 +21,7 @@ use std::collections::HashSet;
 use std::mem;
 use std::result::Result as StdResult;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinError;
@@ -595,6 +596,17 @@ pub struct AgentRunHandle {
     events: Arc<Mutex<mpsc::Receiver<AgentStreamItem>>>,
     state: Arc<Mutex<AgentRunHandleState>>,
     stop_signal: StopSignal,
+    driver_active: Arc<AtomicBool>,
+}
+
+struct AgentRunDriverLease {
+    active: Arc<AtomicBool>,
+}
+
+impl Drop for AgentRunDriverLease {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
 }
 
 struct AgentRunHandleState {
@@ -621,11 +633,13 @@ impl AgentRunHandle {
                 active_tool_call_ids: HashSet::new(),
             })),
             stop_signal,
+            driver_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn into_stream(self) -> AgentStream {
         Box::pin(async_stream::try_stream! {
+            let _lease = self.try_acquire_driver()?;
             while let Some(event) = self.next_event().await? {
                 yield event;
             }
@@ -637,6 +651,7 @@ impl AgentRunHandle {
     }
 
     pub async fn step(&self) -> Result<AgentStepReport> {
+        let _lease = self.try_acquire_driver()?;
         self.state.lock().await.continue_pending_control();
 
         let mut events = Vec::new();
@@ -791,6 +806,15 @@ impl AgentRunHandle {
             .state
             .clone()
             .ok_or_else(|| Error::client("agent run has not started"))
+    }
+
+    fn try_acquire_driver(&self) -> Result<AgentRunDriverLease> {
+        self.driver_active
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map(|_| AgentRunDriverLease {
+                active: Arc::clone(&self.driver_active),
+            })
+            .map_err(|_| Error::client("agent run already has an active driver"))
     }
 
     async fn next_event(&self) -> Result<Option<AgentEvent>> {
