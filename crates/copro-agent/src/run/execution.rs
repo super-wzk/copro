@@ -41,6 +41,14 @@ enum RecoverableStepFlow {
     Recover(RecoveryTerminal),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentRunPhaseFlow {
+    Continue,
+    Stop,
+    Finish,
+    Recover(RecoveryTerminal),
+}
+
 struct AgentRunClock {
     run_id: AgentRunId,
     next_tick: u64,
@@ -94,15 +102,9 @@ impl<'a> AgentRun<'a> {
     }
 
     async fn run_turn_inner(&mut self, events: &mpsc::Sender<AgentStreamItem>) -> Result<()> {
-        let model = Arc::clone(&self.state.model);
-        let tools = Arc::clone(&self.state.tools);
-        let cancellation = self.cancellation.clone();
-        let tool_choice = self.state.context.tool_choice().cloned();
-        let hosted_tools = self.state.context.hosted_tools().to_vec();
-        let options = self.state.context.options().clone();
-        let mut model_stream: Option<ModelStream> = None;
         let run_id = self.state.allocate_run_id();
         let mut clock = AgentRunClock::new(run_id);
+        let mut model_stream: Option<ModelStream> = None;
         let mut terminal_after_recovery = None;
 
         if !emit(events, AgentEvent::RunStarted { run_id }).await {
@@ -111,675 +113,63 @@ impl<'a> AgentRun<'a> {
 
         let mut turn = AgentTurn::new();
 
-        'run: loop {
+        loop {
             if turn.is_finished() {
                 break;
             }
             if terminal_after_recovery.is_none()
-                && cancellation.is_cancelled()
+                && self.cancellation.is_cancelled()
                 && !turn.needs_tool_result_commit()
             {
                 turn.finish();
                 break;
             }
 
-            match turn.phase() {
+            let flow = match turn.phase() {
                 AgentTurnPhase::ModelRequest => {
-                    let step = clock.next_step(AgentAction::LoadTools);
-                    if !emit_step_started(events, &step).await {
-                        return Ok(());
-                    }
-                    let tool_definitions = tools.definitions().await?;
-                    if !emit_step_completed_and_continue(
+                    self.run_model_request_phase(
                         events,
                         run_id,
-                        step,
-                        AgentOutcome::ToolsLoaded(tool_definitions.clone()),
+                        &mut clock,
+                        &mut turn,
+                        &mut model_stream,
                     )
                     .await?
-                    {
-                        return Ok(());
-                    }
-
-                    let step = clock.next_step(AgentAction::BuildRequest {
-                        tools: tool_definitions.clone(),
-                    });
-                    if !emit_step_started(events, &step).await {
-                        return Ok(());
-                    }
-                    let mut request = turn.build_request(
-                        self.state.context.messages(),
-                        tool_definitions,
-                        hosted_tools.clone(),
-                        tool_choice.clone(),
-                        options.clone(),
-                    );
-                    let pending_outcome = AgentOutcome::RequestBuilt(request.clone());
-                    let Some(control) =
-                        emit_control_required(events, step.clone(), pending_outcome.clone()).await
-                    else {
-                        return Ok(());
-                    };
-                    let unhandled_control = match control {
-                        AgentControlSignal::Control(AgentControl::Continue) => None,
-                        AgentControlSignal::Control(AgentControl::ReplaceRequest(replacement)) => {
-                            request = replacement;
-                            None
-                        }
-                        other => Some(other),
-                    };
-                    if !complete_step_with_control_result(
-                        events,
-                        run_id,
-                        step,
-                        pending_outcome,
-                        AgentOutcome::RequestBuilt(request.clone()),
-                        unhandled_control,
-                    )
-                    .await?
-                    {
-                        return Ok(());
-                    }
-
-                    let step = clock.next_step(AgentAction::OpenModelStream {
-                        request: request.clone(),
-                    });
-                    if !emit_step_started(events, &step).await {
-                        return Ok(());
-                    }
-                    model_stream = Some(model.stream(request));
-                    turn.open_model_stream()?;
-                    if !emit_step_completed_and_continue(
-                        events,
-                        run_id,
-                        step,
-                        AgentOutcome::ModelStreamOpened,
-                    )
-                    .await?
-                    {
-                        return Ok(());
-                    }
                 }
                 AgentTurnPhase::ModelStreaming => {
-                    let step = clock.next_step(AgentAction::ReadModelStream);
-                    if !emit_step_started(events, &step).await {
-                        return Ok(());
-                    }
-                    let cancel = cancellation.token();
-                    let stream = model_stream
-                        .as_mut()
-                        .ok_or_else(|| Error::protocol("model stream is not open"))?;
-                    let event = tokio::select! {
-                        _ = cancel.cancelled() => Ok(None),
-                        event = stream.next() => match event {
-                            Some(Ok(event)) => Ok(Some(event)),
-                            Some(Err(error)) => Err(error),
-                            None => Err(Error::protocol("stream ended before finished event")),
-                        },
-                    }?;
-
-                    let Some(event) = event else {
-                        if !emit_step_completed_and_continue(
-                            events,
-                            run_id,
-                            step,
-                            AgentOutcome::ActionInterrupted {
-                                reason: AgentInterruptReason::Stopped,
-                            },
-                        )
-                        .await?
-                        {
-                            return Ok(());
-                        }
-                        turn.finish();
-                        break;
-                    };
-
-                    match event {
-                        OutputStreamEvent::Delta {
-                            content_index,
-                            delta,
-                        } => {
-                            let pending_outcome = AgentOutcome::ModelDelta {
-                                content_index,
-                                delta: delta.clone(),
-                            };
-                            let Some(control) = emit_control_required(
-                                events,
-                                step.clone(),
-                                pending_outcome.clone(),
-                            )
-                            .await
-                            else {
-                                return Ok(());
-                            };
-                            let (outcome, delta, unhandled_control) = match control {
-                                AgentControlSignal::Control(AgentControl::Continue) => (
-                                    AgentOutcome::ModelDelta {
-                                        content_index,
-                                        delta: delta.clone(),
-                                    },
-                                    Some(delta),
-                                    None,
-                                ),
-                                AgentControlSignal::Control(AgentControl::ReplaceModelDelta(
-                                    replacement,
-                                )) => (
-                                    AgentOutcome::ModelDelta {
-                                        content_index,
-                                        delta: replacement.clone(),
-                                    },
-                                    Some(replacement),
-                                    None,
-                                ),
-                                AgentControlSignal::Control(AgentControl::DropModelDelta) => (
-                                    AgentOutcome::ModelDeltaDropped {
-                                        content_index,
-                                        delta,
-                                    },
-                                    None,
-                                    None,
-                                ),
-                                other => (pending_outcome.clone(), Some(delta), Some(other)),
-                            };
-                            if !complete_step_with_control_result(
-                                events,
-                                run_id,
-                                step.clone(),
-                                pending_outcome,
-                                outcome,
-                                unhandled_control,
-                            )
-                            .await?
-                            {
-                                return Ok(());
-                            }
-                            let Some(delta) = delta else {
-                                continue;
-                            };
-                            turn.apply_output_delta(content_index, delta.clone())?;
-                            if !emit(
-                                events,
-                                AgentEvent::ModelDelta {
-                                    step_id: step.id,
-                                    content_index,
-                                    delta: delta.clone(),
-                                },
-                            )
-                            .await
-                            {
-                                return Ok(());
-                            }
-                        }
-                        OutputStreamEvent::Finished { reason, usage } => {
-                            let mut output = turn.finish_output(reason, usage)?;
-                            let pending_outcome = AgentOutcome::ModelOutputFinished {
-                                content: output.content.clone(),
-                                reason: output.reason,
-                                usage: output.usage.clone(),
-                            };
-                            let Some(control) = emit_control_required(
-                                events,
-                                step.clone(),
-                                pending_outcome.clone(),
-                            )
-                            .await
-                            else {
-                                return Ok(());
-                            };
-                            let unhandled_control = match control {
-                                AgentControlSignal::Control(AgentControl::Continue) => None,
-                                AgentControlSignal::Control(
-                                    AgentControl::ReplaceAssistantOutput(replacement),
-                                ) => {
-                                    output.content = replacement;
-                                    None
-                                }
-                                other => Some(other),
-                            };
-                            if !complete_step_with_control_result(
-                                events,
-                                run_id,
-                                step,
-                                pending_outcome,
-                                AgentOutcome::ModelOutputFinished {
-                                    content: output.content.clone(),
-                                    reason: output.reason,
-                                    usage: output.usage.clone(),
-                                },
-                                unhandled_control,
-                            )
-                            .await?
-                            {
-                                return Ok(());
-                            }
-
-                            let step = clock.next_step(AgentAction::CommitAssistant {
-                                content: output.content.clone(),
-                                reason: output.reason,
-                                usage: output.usage.clone(),
-                            });
-                            if !emit_step_started(events, &step).await {
-                                return Ok(());
-                            }
-                            let committed = turn.commit_output(output)?;
-                            let message_index = self.state.context.messages().len();
-                            self.state.context.push_message(normalize_for_history(
-                                Message::Assistant(committed.content.clone()),
-                            ));
-                            model_stream = None;
-                            let outcome = AgentOutcome::AssistantCommitted {
-                                message_index,
-                                content: committed.content.clone(),
-                                reason: committed.reason,
-                                usage: committed.usage.clone(),
-                            };
-                            if !emit(
-                                events,
-                                AgentEvent::AssistantCommitted {
-                                    step_id: step.id,
-                                    message_index,
-                                    content: committed.content.clone(),
-                                    reason: committed.reason,
-                                    usage: committed.usage,
-                                },
-                            )
-                            .await
-                            {
-                                return Ok(());
-                            }
-                            if committed
-                                .content
-                                .iter()
-                                .any(|item| matches!(item, OutputContent::ToolCall(_)))
-                            {
-                                match emit_step_completed_and_continue_recoverable(
-                                    events,
-                                    run_id,
-                                    step.clone(),
-                                    outcome.clone(),
-                                )
-                                .await?
-                                {
-                                    RecoverableStepFlow::Continue => {}
-                                    RecoverableStepFlow::Stop => return Ok(()),
-                                    RecoverableStepFlow::Recover(terminal) => {
-                                        terminal_after_recovery = Some(terminal);
-                                        turn.abort_pending_tools()?;
-                                        continue 'run;
-                                    }
-                                }
-                            } else if !emit_step_completed_and_continue(
-                                events, run_id, step, outcome,
-                            )
-                            .await?
-                            {
-                                return Ok(());
-                            }
-                        }
-                    }
+                    self.run_model_streaming_phase(
+                        events,
+                        run_id,
+                        &mut clock,
+                        &mut turn,
+                        &mut model_stream,
+                    )
+                    .await?
                 }
                 AgentTurnPhase::ToolPlanning => {
-                    if cancellation.is_cancelled() {
-                        if !emit_recovering_after_last_step(events, run_id, &clock).await {
-                            return Ok(());
-                        }
-                        turn.abort_pending_tools()?;
-                    } else {
-                        let mut plan = Vec::new();
-
-                        for tool in turn.tool_calls()? {
-                            let policy = tools.execution_policy(&tool).await?;
-                            let mut item = ToolPlanItem::pending(tool, policy);
-
-                            let step = clock.next_step(AgentAction::PlanTool {
-                                tool: item.tool.clone(),
-                            });
-                            if !emit_step_started(events, &step).await {
-                                return Ok(());
-                            }
-                            let outcome = match &item.completed_result {
-                                Some(result) => AgentOutcome::ToolRejected {
-                                    tool: item.tool.clone(),
-                                    result: result.clone(),
-                                },
-                                None => AgentOutcome::ToolPlanned {
-                                    tool: item.tool.clone(),
-                                    policy: item.policy,
-                                },
-                            };
-                            let pending_outcome = outcome;
-                            let Some(control) = emit_control_required(
-                                events,
-                                step.clone(),
-                                pending_outcome.clone(),
-                            )
-                            .await
-                            else {
-                                return Ok(());
-                            };
-                            let final_outcome;
-                            let mut step_completed = false;
-                            match control {
-                                AgentControlSignal::Control(AgentControl::Continue) => {
-                                    final_outcome = match &item.completed_result {
-                                        Some(result) => AgentOutcome::ToolRejected {
-                                            tool: item.tool.clone(),
-                                            result: result.clone(),
-                                        },
-                                        None => AgentOutcome::ToolPlanned {
-                                            tool: item.tool.clone(),
-                                            policy: item.policy,
-                                        },
-                                    };
-                                }
-                                AgentControlSignal::Control(AgentControl::ReplaceToolCall(
-                                    replacement,
-                                )) => {
-                                    replace_tool_call_in_history(
-                                        self.state.context.messages_mut(),
-                                        &item.tool,
-                                        replacement.clone(),
-                                    );
-                                    let policy = tools.execution_policy(&replacement).await?;
-                                    item = ToolPlanItem::pending(replacement, policy);
-                                    final_outcome = AgentOutcome::ToolPlanned {
-                                        tool: item.tool.clone(),
-                                        policy: item.policy,
-                                    };
-                                }
-                                AgentControlSignal::Control(AgentControl::RejectToolCall {
-                                    reason,
-                                }) => {
-                                    let result = rejected_tool_result(&item.tool, reason);
-                                    item = ToolPlanItem::completed(item.tool, result);
-                                    final_outcome = AgentOutcome::ToolRejected {
-                                        tool: item.tool.clone(),
-                                        result: item
-                                            .completed_result
-                                            .clone()
-                                            .expect("rejected tool call must have a result"),
-                                    };
-                                }
-                                other => {
-                                    final_outcome = pending_outcome.clone();
-                                    match complete_recoverable_step_after_control(
-                                        events,
-                                        run_id,
-                                        step.clone(),
-                                        pending_outcome,
-                                        other,
-                                    )
-                                    .await?
-                                    {
-                                        RecoverableStepFlow::Continue => {
-                                            step_completed = true;
-                                        }
-                                        RecoverableStepFlow::Stop => return Ok(()),
-                                        RecoverableStepFlow::Recover(terminal) => {
-                                            terminal_after_recovery = Some(terminal);
-                                            turn.abort_pending_tools()?;
-                                            continue 'run;
-                                        }
-                                    }
-                                }
-                            }
-                            if !step_completed
-                                && !complete_step_after_control(
-                                    events,
-                                    run_id,
-                                    step,
-                                    final_outcome,
-                                    AgentControlSignal::continue_run(),
-                                )
-                                .await?
-                            {
-                                return Ok(());
-                            }
-
-                            plan.push(item);
-                        }
-
-                        turn.set_tool_plan(plan)?;
-                    }
+                    self.run_tool_planning_phase(events, run_id, &mut clock, &mut turn)
+                        .await?
                 }
                 AgentTurnPhase::ToolExecution => {
-                    if cancellation.is_cancelled() {
-                        if !emit_recovering_after_last_step(events, run_id, &clock).await {
-                            return Ok(());
-                        }
-                        turn.abort_pending_tools()?;
-                    } else {
-                        let mut plan = VecDeque::from(turn.take_tool_plan()?);
-                        let mut completed_tools: Vec<(ToolCall, ToolResult)> = Vec::new();
-                        let mut parallel_batch: Vec<ToolCall> = Vec::new();
-
-                        while let Some(mut item) = plan.pop_front() {
-                            if let Some(result) = item.completed_result.take() {
-                                match flush_parallel_batch(
-                                    events,
-                                    &mut clock,
-                                    Arc::clone(&tools),
-                                    cancellation.token(),
-                                    &mut parallel_batch,
-                                    &mut completed_tools,
-                                )
-                                .await?
-                                {
-                                    RecoverableStepFlow::Continue => {}
-                                    RecoverableStepFlow::Stop => return Ok(()),
-                                    RecoverableStepFlow::Recover(terminal) => {
-                                        terminal_after_recovery = Some(terminal);
-                                        recover_pending_tool_execution(
-                                            &mut completed_tools,
-                                            &mut parallel_batch,
-                                            Some(ToolPlanItem::completed(
-                                                item.tool.clone(),
-                                                result.clone(),
-                                            )),
-                                            &mut plan,
-                                        );
-                                        turn.set_completed_tools(completed_tools, true)?;
-                                        continue 'run;
-                                    }
-                                }
-                                completed_tools.push((item.tool, result));
-                            } else if item.policy == ToolExecutionPolicy::Parallel {
-                                parallel_batch.push(item.tool);
-                            } else {
-                                match flush_parallel_batch(
-                                    events,
-                                    &mut clock,
-                                    Arc::clone(&tools),
-                                    cancellation.token(),
-                                    &mut parallel_batch,
-                                    &mut completed_tools,
-                                )
-                                .await?
-                                {
-                                    RecoverableStepFlow::Continue => {}
-                                    RecoverableStepFlow::Stop => return Ok(()),
-                                    RecoverableStepFlow::Recover(terminal) => {
-                                        terminal_after_recovery = Some(terminal);
-                                        recover_pending_tool_execution(
-                                            &mut completed_tools,
-                                            &mut parallel_batch,
-                                            Some(item),
-                                            &mut plan,
-                                        );
-                                        turn.set_completed_tools(completed_tools, true)?;
-                                        continue 'run;
-                                    }
-                                }
-
-                                let tool = item.tool;
-                                let policy = item.policy;
-                                match emit_tool_started(events, &mut clock, tool.clone(), policy)
-                                    .await?
-                                {
-                                    RecoverableStepFlow::Continue => {}
-                                    RecoverableStepFlow::Stop => return Ok(()),
-                                    RecoverableStepFlow::Recover(terminal) => {
-                                        terminal_after_recovery = Some(terminal);
-                                        recover_pending_tool_execution(
-                                            &mut completed_tools,
-                                            &mut parallel_batch,
-                                            Some(ToolPlanItem::pending(tool, policy)),
-                                            &mut plan,
-                                        );
-                                        turn.set_completed_tools(completed_tools, true)?;
-                                        continue 'run;
-                                    }
-                                }
-                                let completed = Self::execute_tool_call_with_router(
-                                    Arc::clone(&tools),
-                                    tool,
-                                    cancellation.token(),
-                                );
-                                let completed = completed.await?;
-                                match emit_tool_finished(
-                                    events,
-                                    &mut clock,
-                                    completed.0.clone(),
-                                    completed.1.clone(),
-                                )
-                                .await?
-                                {
-                                    RecoverableStepFlow::Continue => {
-                                        completed_tools.push(completed);
-                                    }
-                                    RecoverableStepFlow::Stop => return Ok(()),
-                                    RecoverableStepFlow::Recover(terminal) => {
-                                        completed_tools.push(completed);
-                                        terminal_after_recovery = Some(terminal);
-                                        recover_pending_tool_execution(
-                                            &mut completed_tools,
-                                            &mut parallel_batch,
-                                            None,
-                                            &mut plan,
-                                        );
-                                        turn.set_completed_tools(completed_tools, true)?;
-                                        continue 'run;
-                                    }
-                                }
-                            }
-                        }
-
-                        match flush_parallel_batch(
-                            events,
-                            &mut clock,
-                            Arc::clone(&tools),
-                            cancellation.token(),
-                            &mut parallel_batch,
-                            &mut completed_tools,
-                        )
+                    self.run_tool_execution_phase(events, run_id, &mut clock, &mut turn)
                         .await?
-                        {
-                            RecoverableStepFlow::Continue => {}
-                            RecoverableStepFlow::Stop => return Ok(()),
-                            RecoverableStepFlow::Recover(terminal) => {
-                                terminal_after_recovery = Some(terminal);
-                                recover_pending_tool_execution(
-                                    &mut completed_tools,
-                                    &mut parallel_batch,
-                                    None,
-                                    &mut plan,
-                                );
-                                turn.set_completed_tools(completed_tools, true)?;
-                                continue 'run;
-                            }
-                        }
-                        if cancellation.is_cancelled()
-                            && !emit_recovering_after_last_step(events, run_id, &clock).await
-                        {
-                            return Ok(());
-                        }
-                        turn.set_completed_tools(completed_tools, cancellation.is_cancelled())?;
-                    }
                 }
                 AgentTurnPhase::ToolResultCommit => {
-                    let pending = turn.take_tool_results_for_commit()?;
-                    for (tool, mut result) in pending.completed_tools {
-                        let step = clock.next_step(AgentAction::CommitToolResult {
-                            tool: tool.clone(),
-                            result: result.clone(),
-                        });
-                        if !emit_step_started(events, &step).await {
-                            return Ok(());
-                        }
-                        let message_index = self.state.context.messages().len();
-                        let step_id = step.id;
-                        let pending_outcome = AgentOutcome::ToolResultCommitted {
-                            message_index,
-                            tool: tool.clone(),
-                            result: result.clone(),
-                        };
-                        let Some(control) =
-                            emit_control_required(events, step.clone(), pending_outcome.clone())
-                                .await
-                        else {
-                            return Ok(());
-                        };
-                        let unhandled_control = match control {
-                            AgentControlSignal::Control(AgentControl::Continue) => None,
-                            AgentControlSignal::Control(AgentControl::ReplaceToolResult(
-                                replacement,
-                            )) => {
-                                result = replacement;
-                                None
-                            }
-                            AgentControlSignal::Control(
-                                AgentControl::ReplaceToolResultContent(replacement),
-                            ) => {
-                                result = ToolResult {
-                                    call_id: tool.id.clone(),
-                                    name: tool.name.clone(),
-                                    status: replacement.status,
-                                    content: replacement.content,
-                                };
-                                None
-                            }
-                            other => Some(other),
-                        };
-                        if !complete_step_with_control_result(
-                            events,
-                            run_id,
-                            step,
-                            pending_outcome,
-                            AgentOutcome::ToolResultCommitted {
-                                message_index,
-                                tool: tool.clone(),
-                                result: result.clone(),
-                            },
-                            unhandled_control,
-                        )
+                    self.run_tool_result_commit_phase(events, run_id, &mut clock, &mut turn)
                         .await?
-                        {
-                            return Ok(());
-                        }
-                        self.state
-                            .context
-                            .push_message(Message::Tool(result.clone()));
-                        if !emit(
-                            events,
-                            AgentEvent::ToolResultCommitted {
-                                step_id,
-                                message_index,
-                                tool,
-                                result,
-                            },
-                        )
-                        .await
-                        {
-                            return Ok(());
-                        }
-                    }
-
-                    let finish_turn = pending.finish_after_commit || cancellation.is_cancelled();
-                    turn.finish_tool_result_commit(finish_turn);
                 }
                 AgentTurnPhase::Finished => break,
             };
+
+            match flow {
+                AgentRunPhaseFlow::Continue => {}
+                AgentRunPhaseFlow::Stop => return Ok(()),
+                AgentRunPhaseFlow::Finish => break,
+                AgentRunPhaseFlow::Recover(terminal) => {
+                    terminal_after_recovery = Some(terminal);
+                    continue;
+                }
+            }
         }
 
         if let Some(terminal) = terminal_after_recovery {
@@ -800,6 +190,670 @@ impl<'a> AgentRun<'a> {
         }
 
         Ok(())
+    }
+
+    async fn run_model_request_phase(
+        &mut self,
+        events: &mpsc::Sender<AgentStreamItem>,
+        run_id: AgentRunId,
+        clock: &mut AgentRunClock,
+        turn: &mut AgentTurn,
+        model_stream: &mut Option<ModelStream>,
+    ) -> Result<AgentRunPhaseFlow> {
+        let model = Arc::clone(&self.state.model);
+        let tools = Arc::clone(&self.state.tools);
+        let tool_choice = self.state.context.tool_choice().cloned();
+        let hosted_tools = self.state.context.hosted_tools().to_vec();
+        let options = self.state.context.options().clone();
+
+        let step = clock.next_step(AgentAction::LoadTools);
+        if !emit_step_started(events, &step).await {
+            return Ok(AgentRunPhaseFlow::Stop);
+        }
+        let tool_definitions = tools.definitions().await?;
+        if !emit_step_completed_and_continue(
+            events,
+            run_id,
+            step,
+            AgentOutcome::ToolsLoaded(tool_definitions.clone()),
+        )
+        .await?
+        {
+            return Ok(AgentRunPhaseFlow::Stop);
+        }
+
+        let step = clock.next_step(AgentAction::BuildRequest {
+            tools: tool_definitions.clone(),
+        });
+        if !emit_step_started(events, &step).await {
+            return Ok(AgentRunPhaseFlow::Stop);
+        }
+        let mut request = turn.build_request(
+            self.state.context.messages(),
+            tool_definitions,
+            hosted_tools,
+            tool_choice,
+            options,
+        );
+        let pending_outcome = AgentOutcome::RequestBuilt(request.clone());
+        let Some(control) =
+            emit_control_required(events, step.clone(), pending_outcome.clone()).await
+        else {
+            return Ok(AgentRunPhaseFlow::Stop);
+        };
+        let unhandled_control = match control {
+            AgentControlSignal::Control(AgentControl::Continue) => None,
+            AgentControlSignal::Control(AgentControl::ReplaceRequest(replacement)) => {
+                request = replacement;
+                None
+            }
+            other => Some(other),
+        };
+        if !complete_step_with_control_result(
+            events,
+            run_id,
+            step,
+            pending_outcome,
+            AgentOutcome::RequestBuilt(request.clone()),
+            unhandled_control,
+        )
+        .await?
+        {
+            return Ok(AgentRunPhaseFlow::Stop);
+        }
+
+        let step = clock.next_step(AgentAction::OpenModelStream {
+            request: request.clone(),
+        });
+        if !emit_step_started(events, &step).await {
+            return Ok(AgentRunPhaseFlow::Stop);
+        }
+        *model_stream = Some(model.stream(request));
+        turn.open_model_stream()?;
+        if !emit_step_completed_and_continue(events, run_id, step, AgentOutcome::ModelStreamOpened)
+            .await?
+        {
+            return Ok(AgentRunPhaseFlow::Stop);
+        }
+
+        Ok(AgentRunPhaseFlow::Continue)
+    }
+
+    async fn run_model_streaming_phase(
+        &mut self,
+        events: &mpsc::Sender<AgentStreamItem>,
+        run_id: AgentRunId,
+        clock: &mut AgentRunClock,
+        turn: &mut AgentTurn,
+        model_stream: &mut Option<ModelStream>,
+    ) -> Result<AgentRunPhaseFlow> {
+        let step = clock.next_step(AgentAction::ReadModelStream);
+        if !emit_step_started(events, &step).await {
+            return Ok(AgentRunPhaseFlow::Stop);
+        }
+        let cancel = self.cancellation.token();
+        let stream = model_stream
+            .as_mut()
+            .ok_or_else(|| Error::protocol("model stream is not open"))?;
+        let event = tokio::select! {
+            _ = cancel.cancelled() => Ok(None),
+            event = stream.next() => match event {
+                Some(Ok(event)) => Ok(Some(event)),
+                Some(Err(error)) => Err(error),
+                None => Err(Error::protocol("stream ended before finished event")),
+            },
+        }?;
+
+        let Some(event) = event else {
+            if !emit_step_completed_and_continue(
+                events,
+                run_id,
+                step,
+                AgentOutcome::ActionInterrupted {
+                    reason: AgentInterruptReason::Stopped,
+                },
+            )
+            .await?
+            {
+                return Ok(AgentRunPhaseFlow::Stop);
+            }
+            turn.finish();
+            return Ok(AgentRunPhaseFlow::Finish);
+        };
+
+        match event {
+            OutputStreamEvent::Delta {
+                content_index,
+                delta,
+            } => {
+                let pending_outcome = AgentOutcome::ModelDelta {
+                    content_index,
+                    delta: delta.clone(),
+                };
+                let Some(control) =
+                    emit_control_required(events, step.clone(), pending_outcome.clone()).await
+                else {
+                    return Ok(AgentRunPhaseFlow::Stop);
+                };
+                let (outcome, delta, unhandled_control) = match control {
+                    AgentControlSignal::Control(AgentControl::Continue) => (
+                        AgentOutcome::ModelDelta {
+                            content_index,
+                            delta: delta.clone(),
+                        },
+                        Some(delta),
+                        None,
+                    ),
+                    AgentControlSignal::Control(AgentControl::ReplaceModelDelta(replacement)) => (
+                        AgentOutcome::ModelDelta {
+                            content_index,
+                            delta: replacement.clone(),
+                        },
+                        Some(replacement),
+                        None,
+                    ),
+                    AgentControlSignal::Control(AgentControl::DropModelDelta) => (
+                        AgentOutcome::ModelDeltaDropped {
+                            content_index,
+                            delta,
+                        },
+                        None,
+                        None,
+                    ),
+                    other => (pending_outcome.clone(), Some(delta), Some(other)),
+                };
+                if !complete_step_with_control_result(
+                    events,
+                    run_id,
+                    step.clone(),
+                    pending_outcome,
+                    outcome,
+                    unhandled_control,
+                )
+                .await?
+                {
+                    return Ok(AgentRunPhaseFlow::Stop);
+                }
+                let Some(delta) = delta else {
+                    return Ok(AgentRunPhaseFlow::Continue);
+                };
+                turn.apply_output_delta(content_index, delta.clone())?;
+                if !emit(
+                    events,
+                    AgentEvent::ModelDelta {
+                        step_id: step.id,
+                        content_index,
+                        delta: delta.clone(),
+                    },
+                )
+                .await
+                {
+                    return Ok(AgentRunPhaseFlow::Stop);
+                }
+            }
+            OutputStreamEvent::Finished { reason, usage } => {
+                let mut output = turn.finish_output(reason, usage)?;
+                let pending_outcome = AgentOutcome::ModelOutputFinished {
+                    content: output.content.clone(),
+                    reason: output.reason,
+                    usage: output.usage.clone(),
+                };
+                let Some(control) =
+                    emit_control_required(events, step.clone(), pending_outcome.clone()).await
+                else {
+                    return Ok(AgentRunPhaseFlow::Stop);
+                };
+                let unhandled_control = match control {
+                    AgentControlSignal::Control(AgentControl::Continue) => None,
+                    AgentControlSignal::Control(AgentControl::ReplaceAssistantOutput(
+                        replacement,
+                    )) => {
+                        output.content = replacement;
+                        None
+                    }
+                    other => Some(other),
+                };
+                if !complete_step_with_control_result(
+                    events,
+                    run_id,
+                    step,
+                    pending_outcome,
+                    AgentOutcome::ModelOutputFinished {
+                        content: output.content.clone(),
+                        reason: output.reason,
+                        usage: output.usage.clone(),
+                    },
+                    unhandled_control,
+                )
+                .await?
+                {
+                    return Ok(AgentRunPhaseFlow::Stop);
+                }
+
+                let step = clock.next_step(AgentAction::CommitAssistant {
+                    content: output.content.clone(),
+                    reason: output.reason,
+                    usage: output.usage.clone(),
+                });
+                if !emit_step_started(events, &step).await {
+                    return Ok(AgentRunPhaseFlow::Stop);
+                }
+                let committed = turn.commit_output(output)?;
+                let message_index = self.state.context.messages().len();
+                self.state
+                    .context
+                    .push_message(normalize_for_history(Message::Assistant(
+                        committed.content.clone(),
+                    )));
+                *model_stream = None;
+                let outcome = AgentOutcome::AssistantCommitted {
+                    message_index,
+                    content: committed.content.clone(),
+                    reason: committed.reason,
+                    usage: committed.usage.clone(),
+                };
+                if !emit(
+                    events,
+                    AgentEvent::AssistantCommitted {
+                        step_id: step.id,
+                        message_index,
+                        content: committed.content.clone(),
+                        reason: committed.reason,
+                        usage: committed.usage,
+                    },
+                )
+                .await
+                {
+                    return Ok(AgentRunPhaseFlow::Stop);
+                }
+                if committed
+                    .content
+                    .iter()
+                    .any(|item| matches!(item, OutputContent::ToolCall(_)))
+                {
+                    match emit_step_completed_and_continue_recoverable(
+                        events,
+                        run_id,
+                        step.clone(),
+                        outcome.clone(),
+                    )
+                    .await?
+                    {
+                        RecoverableStepFlow::Continue => {}
+                        RecoverableStepFlow::Stop => return Ok(AgentRunPhaseFlow::Stop),
+                        RecoverableStepFlow::Recover(terminal) => {
+                            turn.abort_pending_tools()?;
+                            return Ok(AgentRunPhaseFlow::Recover(terminal));
+                        }
+                    }
+                } else if !emit_step_completed_and_continue(events, run_id, step, outcome).await? {
+                    return Ok(AgentRunPhaseFlow::Stop);
+                }
+            }
+        }
+
+        Ok(AgentRunPhaseFlow::Continue)
+    }
+
+    async fn run_tool_planning_phase(
+        &mut self,
+        events: &mpsc::Sender<AgentStreamItem>,
+        run_id: AgentRunId,
+        clock: &mut AgentRunClock,
+        turn: &mut AgentTurn,
+    ) -> Result<AgentRunPhaseFlow> {
+        if self.cancellation.is_cancelled() {
+            if !emit_recovering_after_last_step(events, run_id, clock).await {
+                return Ok(AgentRunPhaseFlow::Stop);
+            }
+            turn.abort_pending_tools()?;
+            return Ok(AgentRunPhaseFlow::Continue);
+        }
+
+        let tools = Arc::clone(&self.state.tools);
+        let mut plan = Vec::new();
+
+        for tool in turn.tool_calls()? {
+            let policy = tools.execution_policy(&tool).await?;
+            let mut item = ToolPlanItem::pending(tool, policy);
+
+            let step = clock.next_step(AgentAction::PlanTool {
+                tool: item.tool.clone(),
+            });
+            if !emit_step_started(events, &step).await {
+                return Ok(AgentRunPhaseFlow::Stop);
+            }
+            let outcome = match &item.completed_result {
+                Some(result) => AgentOutcome::ToolRejected {
+                    tool: item.tool.clone(),
+                    result: result.clone(),
+                },
+                None => AgentOutcome::ToolPlanned {
+                    tool: item.tool.clone(),
+                    policy: item.policy,
+                },
+            };
+            let pending_outcome = outcome;
+            let Some(control) =
+                emit_control_required(events, step.clone(), pending_outcome.clone()).await
+            else {
+                return Ok(AgentRunPhaseFlow::Stop);
+            };
+            let final_outcome;
+            let mut step_completed = false;
+            match control {
+                AgentControlSignal::Control(AgentControl::Continue) => {
+                    final_outcome = match &item.completed_result {
+                        Some(result) => AgentOutcome::ToolRejected {
+                            tool: item.tool.clone(),
+                            result: result.clone(),
+                        },
+                        None => AgentOutcome::ToolPlanned {
+                            tool: item.tool.clone(),
+                            policy: item.policy,
+                        },
+                    };
+                }
+                AgentControlSignal::Control(AgentControl::ReplaceToolCall(replacement)) => {
+                    replace_tool_call_in_history(
+                        self.state.context.messages_mut(),
+                        &item.tool,
+                        replacement.clone(),
+                    );
+                    let policy = tools.execution_policy(&replacement).await?;
+                    item = ToolPlanItem::pending(replacement, policy);
+                    final_outcome = AgentOutcome::ToolPlanned {
+                        tool: item.tool.clone(),
+                        policy: item.policy,
+                    };
+                }
+                AgentControlSignal::Control(AgentControl::RejectToolCall { reason }) => {
+                    let result = rejected_tool_result(&item.tool, reason);
+                    item = ToolPlanItem::completed(item.tool, result);
+                    final_outcome = AgentOutcome::ToolRejected {
+                        tool: item.tool.clone(),
+                        result: item
+                            .completed_result
+                            .clone()
+                            .expect("rejected tool call must have a result"),
+                    };
+                }
+                other => {
+                    final_outcome = pending_outcome.clone();
+                    match complete_recoverable_step_after_control(
+                        events,
+                        run_id,
+                        step.clone(),
+                        pending_outcome,
+                        other,
+                    )
+                    .await?
+                    {
+                        RecoverableStepFlow::Continue => {
+                            step_completed = true;
+                        }
+                        RecoverableStepFlow::Stop => return Ok(AgentRunPhaseFlow::Stop),
+                        RecoverableStepFlow::Recover(terminal) => {
+                            turn.abort_pending_tools()?;
+                            return Ok(AgentRunPhaseFlow::Recover(terminal));
+                        }
+                    }
+                }
+            }
+            if !step_completed
+                && !complete_step_after_control(
+                    events,
+                    run_id,
+                    step,
+                    final_outcome,
+                    AgentControlSignal::continue_run(),
+                )
+                .await?
+            {
+                return Ok(AgentRunPhaseFlow::Stop);
+            }
+
+            plan.push(item);
+        }
+
+        turn.set_tool_plan(plan)?;
+        Ok(AgentRunPhaseFlow::Continue)
+    }
+
+    async fn run_tool_execution_phase(
+        &mut self,
+        events: &mpsc::Sender<AgentStreamItem>,
+        run_id: AgentRunId,
+        clock: &mut AgentRunClock,
+        turn: &mut AgentTurn,
+    ) -> Result<AgentRunPhaseFlow> {
+        if self.cancellation.is_cancelled() {
+            if !emit_recovering_after_last_step(events, run_id, clock).await {
+                return Ok(AgentRunPhaseFlow::Stop);
+            }
+            turn.abort_pending_tools()?;
+            return Ok(AgentRunPhaseFlow::Continue);
+        }
+
+        let tools = Arc::clone(&self.state.tools);
+        let mut plan = VecDeque::from(turn.take_tool_plan()?);
+        let mut completed_tools: Vec<(ToolCall, ToolResult)> = Vec::new();
+        let mut parallel_batch: Vec<ToolCall> = Vec::new();
+
+        while let Some(mut item) = plan.pop_front() {
+            if let Some(result) = item.completed_result.take() {
+                match flush_parallel_batch(
+                    events,
+                    clock,
+                    Arc::clone(&tools),
+                    self.cancellation.token(),
+                    &mut parallel_batch,
+                    &mut completed_tools,
+                )
+                .await?
+                {
+                    RecoverableStepFlow::Continue => {}
+                    RecoverableStepFlow::Stop => return Ok(AgentRunPhaseFlow::Stop),
+                    RecoverableStepFlow::Recover(terminal) => {
+                        recover_pending_tool_execution(
+                            &mut completed_tools,
+                            &mut parallel_batch,
+                            Some(ToolPlanItem::completed(item.tool.clone(), result.clone())),
+                            &mut plan,
+                        );
+                        turn.set_completed_tools(completed_tools, true)?;
+                        return Ok(AgentRunPhaseFlow::Recover(terminal));
+                    }
+                }
+                completed_tools.push((item.tool, result));
+            } else if item.policy == ToolExecutionPolicy::Parallel {
+                parallel_batch.push(item.tool);
+            } else {
+                match flush_parallel_batch(
+                    events,
+                    clock,
+                    Arc::clone(&tools),
+                    self.cancellation.token(),
+                    &mut parallel_batch,
+                    &mut completed_tools,
+                )
+                .await?
+                {
+                    RecoverableStepFlow::Continue => {}
+                    RecoverableStepFlow::Stop => return Ok(AgentRunPhaseFlow::Stop),
+                    RecoverableStepFlow::Recover(terminal) => {
+                        recover_pending_tool_execution(
+                            &mut completed_tools,
+                            &mut parallel_batch,
+                            Some(item),
+                            &mut plan,
+                        );
+                        turn.set_completed_tools(completed_tools, true)?;
+                        return Ok(AgentRunPhaseFlow::Recover(terminal));
+                    }
+                }
+
+                let tool = item.tool;
+                let policy = item.policy;
+                match emit_tool_started(events, clock, tool.clone(), policy).await? {
+                    RecoverableStepFlow::Continue => {}
+                    RecoverableStepFlow::Stop => return Ok(AgentRunPhaseFlow::Stop),
+                    RecoverableStepFlow::Recover(terminal) => {
+                        recover_pending_tool_execution(
+                            &mut completed_tools,
+                            &mut parallel_batch,
+                            Some(ToolPlanItem::pending(tool, policy)),
+                            &mut plan,
+                        );
+                        turn.set_completed_tools(completed_tools, true)?;
+                        return Ok(AgentRunPhaseFlow::Recover(terminal));
+                    }
+                }
+                let completed = Self::execute_tool_call_with_router(
+                    Arc::clone(&tools),
+                    tool,
+                    self.cancellation.token(),
+                )
+                .await?;
+                match emit_tool_finished(events, clock, completed.0.clone(), completed.1.clone())
+                    .await?
+                {
+                    RecoverableStepFlow::Continue => {
+                        completed_tools.push(completed);
+                    }
+                    RecoverableStepFlow::Stop => return Ok(AgentRunPhaseFlow::Stop),
+                    RecoverableStepFlow::Recover(terminal) => {
+                        completed_tools.push(completed);
+                        recover_pending_tool_execution(
+                            &mut completed_tools,
+                            &mut parallel_batch,
+                            None,
+                            &mut plan,
+                        );
+                        turn.set_completed_tools(completed_tools, true)?;
+                        return Ok(AgentRunPhaseFlow::Recover(terminal));
+                    }
+                }
+            }
+        }
+
+        match flush_parallel_batch(
+            events,
+            clock,
+            Arc::clone(&tools),
+            self.cancellation.token(),
+            &mut parallel_batch,
+            &mut completed_tools,
+        )
+        .await?
+        {
+            RecoverableStepFlow::Continue => {}
+            RecoverableStepFlow::Stop => return Ok(AgentRunPhaseFlow::Stop),
+            RecoverableStepFlow::Recover(terminal) => {
+                recover_pending_tool_execution(
+                    &mut completed_tools,
+                    &mut parallel_batch,
+                    None,
+                    &mut plan,
+                );
+                turn.set_completed_tools(completed_tools, true)?;
+                return Ok(AgentRunPhaseFlow::Recover(terminal));
+            }
+        }
+        if self.cancellation.is_cancelled()
+            && !emit_recovering_after_last_step(events, run_id, clock).await
+        {
+            return Ok(AgentRunPhaseFlow::Stop);
+        }
+        turn.set_completed_tools(completed_tools, self.cancellation.is_cancelled())?;
+
+        Ok(AgentRunPhaseFlow::Continue)
+    }
+
+    async fn run_tool_result_commit_phase(
+        &mut self,
+        events: &mpsc::Sender<AgentStreamItem>,
+        run_id: AgentRunId,
+        clock: &mut AgentRunClock,
+        turn: &mut AgentTurn,
+    ) -> Result<AgentRunPhaseFlow> {
+        let pending = turn.take_tool_results_for_commit()?;
+        for (tool, mut result) in pending.completed_tools {
+            let step = clock.next_step(AgentAction::CommitToolResult {
+                tool: tool.clone(),
+                result: result.clone(),
+            });
+            if !emit_step_started(events, &step).await {
+                return Ok(AgentRunPhaseFlow::Stop);
+            }
+            let message_index = self.state.context.messages().len();
+            let step_id = step.id;
+            let pending_outcome = AgentOutcome::ToolResultCommitted {
+                message_index,
+                tool: tool.clone(),
+                result: result.clone(),
+            };
+            let Some(control) =
+                emit_control_required(events, step.clone(), pending_outcome.clone()).await
+            else {
+                return Ok(AgentRunPhaseFlow::Stop);
+            };
+            let unhandled_control = match control {
+                AgentControlSignal::Control(AgentControl::Continue) => None,
+                AgentControlSignal::Control(AgentControl::ReplaceToolResult(replacement)) => {
+                    result = replacement;
+                    None
+                }
+                AgentControlSignal::Control(AgentControl::ReplaceToolResultContent(
+                    replacement,
+                )) => {
+                    result = ToolResult {
+                        call_id: tool.id.clone(),
+                        name: tool.name.clone(),
+                        status: replacement.status,
+                        content: replacement.content,
+                    };
+                    None
+                }
+                other => Some(other),
+            };
+            if !complete_step_with_control_result(
+                events,
+                run_id,
+                step,
+                pending_outcome,
+                AgentOutcome::ToolResultCommitted {
+                    message_index,
+                    tool: tool.clone(),
+                    result: result.clone(),
+                },
+                unhandled_control,
+            )
+            .await?
+            {
+                return Ok(AgentRunPhaseFlow::Stop);
+            }
+            self.state
+                .context
+                .push_message(Message::Tool(result.clone()));
+            if !emit(
+                events,
+                AgentEvent::ToolResultCommitted {
+                    step_id,
+                    message_index,
+                    tool,
+                    result,
+                },
+            )
+            .await
+            {
+                return Ok(AgentRunPhaseFlow::Stop);
+            }
+        }
+
+        let finish_turn = pending.finish_after_commit || self.cancellation.is_cancelled();
+        turn.finish_tool_result_commit(finish_turn);
+        Ok(AgentRunPhaseFlow::Continue)
     }
 
     async fn execute_parallel_batch(
