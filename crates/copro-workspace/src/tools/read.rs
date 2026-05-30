@@ -106,7 +106,7 @@ pub enum ReadOutput {
 }
 
 impl ToolOutput for ReadOutput {
-    fn into_tool_result_content(self) -> Result<Vec<InputContent>, String> {
+    fn into_content(self) -> Result<Vec<InputContent>, String> {
         match self {
             Self::Text(text) => Ok(vec![InputContent::Text(text)]),
             Self::Image(image) => Ok(vec![InputContent::Image(image)]),

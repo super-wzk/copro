@@ -82,6 +82,30 @@ async fn fn_tool_wraps_async_closures() {
 }
 
 #[tokio::test]
+async fn fn_tool_can_return_no_output() {
+    let router = LocalToolRouter::new(vec![tool!(
+        "noop",
+        "Return no output.",
+        |_input: EmptyInput, _cancel: CancellationToken| async move { Ok::<_, String>(()) },
+    )]);
+
+    let result = router
+        .execute(
+            ToolCall {
+                id: "call-noop".into(),
+                name: "noop".to_string(),
+                arguments: serde_json::Map::new(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert!(result.content.is_empty());
+}
+
+#[tokio::test]
 async fn local_tool_router_reports_tool_execution_policy() {
     let router = LocalToolRouter::new(vec![tool!(
         "echo",
@@ -104,6 +128,9 @@ async fn local_tool_router_reports_tool_execution_policy() {
 struct EchoInput {
     message: String,
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct EmptyInput {}
 
 async fn echo(input: EchoInput, _cancel: CancellationToken) -> StdResult<String, String> {
     Ok(format!("echo: {}", input.message))

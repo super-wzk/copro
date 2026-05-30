@@ -63,6 +63,6 @@ impl<T: Tool> ErasedTool for T {
     ) -> Result<Vec<InputContent>, String> {
         let input = serde_json::from_value::<T::Input>(args).map_err(|e| e.to_string())?;
         let output = self.call(input, cancel).await?;
-        output.into_tool_result_content()
+        output.into_content()
     }
 }
