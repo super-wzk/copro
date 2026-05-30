@@ -4,6 +4,7 @@ use copro_agent::{
 };
 use copro_api::message::{InputContent, OutputContent, ToolResultStatus};
 use copro_api::stream::{Model, OutputContentDelta};
+use copro_harness::request::RequestPipeline;
 use copro_harness::skills::{SkillRequestInjector, SkillRuntime, SkillToolRouter};
 use copro_harness::tool;
 use copro_harness::tools::{CompositeToolRouter, LocalToolRouter};
@@ -73,7 +74,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         workspace_tools.clone(),
         skill_tools,
     ]));
-    let skill_request = SkillRequestInjector::new(skill_runtime);
+    let request_pipeline =
+        RequestPipeline::new(vec![Arc::new(SkillRequestInjector::new(skill_runtime))]);
 
     let mut history = AgentHistory::default();
     let config = AgentTurnConfig::default();
@@ -111,7 +113,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             config.clone(),
             Arc::clone(&model),
             Arc::clone(&tool_router),
-            &skill_request,
+            &request_pipeline,
         )
         .await
         {
@@ -132,7 +134,7 @@ async fn drive_turn(
     config: AgentTurnConfig,
     model: Arc<dyn Model>,
     tools: Arc<dyn ToolRouter>,
-    skill_request: &SkillRequestInjector,
+    request_pipeline: &RequestPipeline,
 ) -> Result<AgentHistory, Box<dyn StdError>> {
     let run = start_turn(history, config, model, tools);
     let mut started_assistant = false;
@@ -150,7 +152,7 @@ async fn drive_turn(
                 let AgentOutcome::RequestBuilt(mut request) = report.outcome.clone() else {
                     unreachable!("request checkpoint must carry a request outcome")
                 };
-                skill_request.prepare_request(&mut request).await?;
+                request_pipeline.prepare_request(&mut request).await?;
                 point.control(AgentControl::ReplaceRequest(request)).await?;
             }
             _ => {

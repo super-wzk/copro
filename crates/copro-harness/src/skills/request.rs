@@ -1,5 +1,7 @@
 use super::SkillRuntime;
 use super::tool::LOAD_SKILL_TOOL_NAME;
+use crate::request::RequestInjector;
+use copro_api::async_trait;
 use copro_api::error::Result;
 use copro_api::message::{InputContent, InputMessage, Message, OutputContent, OutputMessage};
 use copro_api::request::GenerateRequest;
@@ -37,6 +39,13 @@ impl SkillRequestInjector {
             );
         }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl RequestInjector for SkillRequestInjector {
+    async fn prepare_request(&self, request: &mut GenerateRequest) -> Result<()> {
+        SkillRequestInjector::prepare_request(self, request).await
     }
 }
 

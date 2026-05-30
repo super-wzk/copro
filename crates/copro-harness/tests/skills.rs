@@ -6,6 +6,7 @@ use copro_api::message::{
     ToolResultStatus,
 };
 use copro_api::request::{GenerateRequest, GenerateRequestOptions};
+use copro_harness::request::RequestPipeline;
 use copro_harness::skills::{
     SkillDocument, SkillRequestInjector, SkillRuntime, SkillStore, SkillSummary, SkillToolRouter,
 };
@@ -40,6 +41,30 @@ async fn request_injector_adds_available_skills_after_initial_instructions() {
     ));
     assert!(matches!(
         request.messages.get(2),
+        Some(Message::Input(InputMessage::User(_)))
+    ));
+}
+
+#[tokio::test]
+async fn skill_request_injector_runs_in_request_pipeline() {
+    let runtime = runtime_with(vec![skill("test-skill", "Use for testing.")]);
+    let pipeline = RequestPipeline::new(vec![Arc::new(SkillRequestInjector::new(runtime))]);
+    let mut request = GenerateRequest {
+        messages: vec![Message::user(vec![InputContent::Text("hi".to_string())])],
+        tools: Vec::new(),
+        tool_choice: None,
+        hosted_tools: Vec::new(),
+        options: GenerateRequestOptions::default(),
+    };
+
+    pipeline.prepare_request(&mut request).await.unwrap();
+
+    assert!(matches!(
+        request.messages.first(),
+        Some(Message::Input(InputMessage::Developer(_)))
+    ));
+    assert!(matches!(
+        request.messages.get(1),
         Some(Message::Input(InputMessage::User(_)))
     ));
 }
