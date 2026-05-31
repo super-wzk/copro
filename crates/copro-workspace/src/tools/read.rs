@@ -1,9 +1,9 @@
 pub use crate::tools::utils::{CacheEntry, FileCache, FileSnapshot};
 use crate::tools::utils::{read_file_bytes, resolve_path, validate_utf8};
-use copro_agent::{CancellationToken, ToolExecutionPolicy};
+use copro_agent::ToolExecutionPolicy;
 use copro_api::async_trait;
 use copro_api::message::{ImageContent, InputContent};
-use copro_harness::tools::{Tool, ToolOutput};
+use copro_harness::tools::{Tool, ToolContext, ToolOutput};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
@@ -134,7 +134,7 @@ impl Tool for ReadTool {
     async fn call(
         &self,
         input: Self::Input,
-        _cancel: CancellationToken,
+        _context: ToolContext,
     ) -> Result<Self::Output, String> {
         let path = resolve_path(&self.root, &input.path)?;
         let metadata = path.metadata().await.map_err(|error| error.to_string())?;

@@ -1,4 +1,4 @@
-use copro_agent::CancellationToken;
+use copro_harness::tools::ToolContext;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,7 +11,7 @@ pub struct CalculatorInput {
     pub expression: String,
 }
 
-pub async fn calculator(input: CalculatorInput, _cancel: CancellationToken) -> Result<f64, String> {
+pub async fn calculator(input: CalculatorInput, _context: ToolContext) -> Result<f64, String> {
     evaluate_expression(&input.expression).map_err(|e| e.to_string())
 }
 
@@ -155,7 +155,7 @@ pub struct DateTimeInput {
     pub timezone_offset: i32,
 }
 
-pub async fn datetime(input: DateTimeInput, _cancel: CancellationToken) -> Result<String, String> {
+pub async fn datetime(input: DateTimeInput, _context: ToolContext) -> Result<String, String> {
     let now = SystemTime::now();
     let total_secs = now
         .duration_since(UNIX_EPOCH)

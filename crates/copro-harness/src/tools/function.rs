@@ -1,6 +1,7 @@
 use super::output::ToolOutput;
 use super::tool::{ErasedTool, Tool};
-use copro_agent::{CancellationToken, ToolExecutionPolicy};
+use crate::tools::ToolContext;
+use copro_agent::ToolExecutionPolicy;
 use copro_api::async_trait;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -11,7 +12,7 @@ use std::sync::Arc;
 
 type BoxToolFuture<Output> = Pin<Box<dyn Future<Output = Result<Output, String>> + Send>>;
 type FnToolHandler<Input, Output> =
-    dyn Fn(Input, CancellationToken) -> BoxToolFuture<Output> + Send + Sync;
+    dyn Fn(Input, ToolContext) -> BoxToolFuture<Output> + Send + Sync;
 
 /// Builder for constructing an erased [`FnTool`] with optional configuration.
 ///
@@ -28,7 +29,7 @@ impl<Input, Output, F, Fut> ToolBuilder<Input, Output, F, Fut>
 where
     Input: DeserializeOwned + JsonSchema + Send + 'static,
     Output: ToolOutput + Send + 'static,
-    F: Fn(Input, CancellationToken) -> Fut + Send + Sync + 'static,
+    F: Fn(Input, ToolContext) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<Output, String>> + Send + 'static,
 {
     pub fn new(name: impl Into<String>, description: impl Into<String>, handler: F) -> Self {
@@ -50,8 +51,8 @@ where
     /// Build the tool, returning an erased reference.
     pub fn build(self) -> Arc<dyn ErasedTool> {
         let handler = Arc::new(
-            move |input: Input, cancel: CancellationToken| -> BoxToolFuture<Output> {
-                Box::pin((self.handler)(input, cancel))
+            move |input: Input, context: ToolContext| -> BoxToolFuture<Output> {
+                Box::pin((self.handler)(input, context))
             },
         );
         Arc::new(FnTool {
@@ -80,12 +81,12 @@ impl<Input, Output> FnTool<Input, Output> {
     where
         Input: 'static,
         Output: 'static,
-        F: Fn(Input, CancellationToken) -> Fut + Send + Sync + 'static,
+        F: Fn(Input, ToolContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Output, String>> + Send + 'static,
     {
         let handler = Arc::new(
-            move |input: Input, cancel: CancellationToken| -> BoxToolFuture<Output> {
-                Box::pin(handler(input, cancel))
+            move |input: Input, context: ToolContext| -> BoxToolFuture<Output> {
+                Box::pin(handler(input, context))
             },
         );
 
@@ -137,12 +138,8 @@ where
         self.execution_policy
     }
 
-    async fn call(
-        &self,
-        input: Self::Input,
-        cancel: CancellationToken,
-    ) -> Result<Self::Output, String> {
-        (self.handler)(input, cancel).await
+    async fn call(&self, input: Self::Input, context: ToolContext) -> Result<Self::Output, String> {
+        (self.handler)(input, context).await
     }
 }
 

@@ -5,7 +5,7 @@ use crate::tools::vfs_walk::{
 };
 use copro_agent::{CancellationToken, ToolExecutionPolicy};
 use copro_api::async_trait;
-use copro_harness::tools::Tool;
+use copro_harness::tools::{Tool, ToolContext};
 use ignore::gitignore::Gitignore;
 use ignore::overrides::{Override, OverrideBuilder};
 use schemars::JsonSchema;
@@ -74,11 +74,8 @@ impl Tool for GlobTool {
         ToolExecutionPolicy::Parallel
     }
 
-    async fn call(
-        &self,
-        input: Self::Input,
-        cancel: CancellationToken,
-    ) -> Result<Self::Output, String> {
+    async fn call(&self, input: Self::Input, context: ToolContext) -> Result<Self::Output, String> {
+        let cancel = context.cancellation().clone();
         if cancel.is_cancelled() {
             return Err("glob cancelled".to_string());
         }

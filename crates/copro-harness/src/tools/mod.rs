@@ -1,8 +1,13 @@
+mod context;
 mod function;
 mod output;
 mod router;
 mod tool;
 
+pub use context::{
+    IntoToolUpdate, ToolContext, ToolSlots, ToolUpdate, ToolUpdateParts, ToolUpdatePayload,
+    ToolUpdateSlot,
+};
 pub use copro_agent::ToolExecutionPolicy;
 pub use function::{FnTool, ToolBuilder};
 pub use output::ToolOutput;

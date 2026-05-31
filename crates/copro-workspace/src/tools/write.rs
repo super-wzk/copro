@@ -1,9 +1,9 @@
 use crate::tools::read::READ_TOOL_NAME;
 use crate::tools::utils::{CacheEntry, FileCache, FileSnapshot, read_file_bytes, resolve_path};
 use async_std::io::WriteExt;
-use copro_agent::{CancellationToken, ToolExecutionPolicy};
+use copro_agent::ToolExecutionPolicy;
 use copro_api::async_trait;
-use copro_harness::tools::Tool;
+use copro_harness::tools::{Tool, ToolContext};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use vfs::VfsFileType;
@@ -90,7 +90,7 @@ impl Tool for WriteTool {
     async fn call(
         &self,
         input: Self::Input,
-        _cancel: CancellationToken,
+        _context: ToolContext,
     ) -> Result<Self::Output, String> {
         let path = resolve_path(&self.root, &input.path)?;
 

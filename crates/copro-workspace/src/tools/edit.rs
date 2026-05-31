@@ -2,9 +2,9 @@ use crate::tools::read::READ_TOOL_NAME;
 use crate::tools::read::digit_count;
 use crate::tools::utils::{FileCache, read_file_bytes, resolve_path, validate_utf8};
 use async_std::io::WriteExt;
-use copro_agent::{CancellationToken, ToolExecutionPolicy};
+use copro_agent::ToolExecutionPolicy;
 use copro_api::async_trait;
-use copro_harness::tools::Tool;
+use copro_harness::tools::{Tool, ToolContext};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use vfs::async_vfs::AsyncVfsPath;
@@ -72,7 +72,7 @@ impl Tool for EditTool {
     async fn call(
         &self,
         input: Self::Input,
-        _cancel: CancellationToken,
+        _context: ToolContext,
     ) -> Result<Self::Output, String> {
         // Gate: file must have been read first
         {

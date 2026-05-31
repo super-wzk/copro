@@ -5,7 +5,7 @@ use crate::tools::vfs_walk::{
 };
 use copro_agent::{CancellationToken, ToolExecutionPolicy};
 use copro_api::async_trait;
-use copro_harness::tools::Tool;
+use copro_harness::tools::{Tool, ToolContext};
 use ignore::gitignore::Gitignore;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -64,11 +64,8 @@ impl Tool for LsTool {
         ToolExecutionPolicy::Parallel
     }
 
-    async fn call(
-        &self,
-        input: Self::Input,
-        cancel: CancellationToken,
-    ) -> Result<Self::Output, String> {
+    async fn call(&self, input: Self::Input, context: ToolContext) -> Result<Self::Output, String> {
+        let cancel = context.cancellation().clone();
         if cancel.is_cancelled() {
             return Err("ls cancelled".to_string());
         }

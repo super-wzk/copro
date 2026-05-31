@@ -5,10 +5,11 @@ use copro_api::message::{InputContent, ToolCall, ToolResult, ToolResultStatus};
 use copro_api::tool::ToolDefinition;
 use copro_harness::tool;
 use copro_harness::tools::{
-    CompositeToolRouter, ErasedTool, FnTool, LocalToolRouter, ToolExecutionPolicy,
+    CompositeToolRouter, ErasedTool, FnTool, LocalToolRouter, Tool, ToolContext,
+    ToolExecutionPolicy, ToolSlots, ToolUpdateParts, ToolUpdatePayload, ToolUpdateSlot,
 };
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::result::Result as StdResult;
 use std::sync::Arc;
@@ -48,7 +49,10 @@ async fn fn_tool_can_be_used_directly() {
     assert_eq!(definition.description, "Echo a message.");
 
     let content = tool
-        .call_content(json!({ "message": "direct" }), CancellationToken::new())
+        .call_content(
+            json!({ "message": "direct" }),
+            ToolContext::without_slots("call-direct", "echo", CancellationToken::new()),
+        )
         .await
         .unwrap();
 
@@ -60,9 +64,7 @@ async fn fn_tool_wraps_async_closures() {
     let router = LocalToolRouter::new(vec![tool!(
         "length",
         "Return the message length.",
-        |input: EchoInput, _cancel: CancellationToken| async move {
-            Ok::<_, String>(input.message.len())
-        },
+        |input: EchoInput, _context: ToolContext| async move { Ok::<_, String>(input.message.len()) },
     )]);
 
     let result = router
@@ -86,7 +88,7 @@ async fn fn_tool_can_return_no_output() {
     let router = LocalToolRouter::new(vec![tool!(
         "noop",
         "Return no output.",
-        |_input: EmptyInput, _cancel: CancellationToken| async move { Ok::<_, String>(()) },
+        |_input: EmptyInput, _context: ToolContext| async move { Ok::<_, String>(()) },
     )]);
 
     let result = router
@@ -103,6 +105,73 @@ async fn fn_tool_can_return_no_output() {
 
     assert_eq!(result.status, ToolResultStatus::Success);
     assert!(result.content.is_empty());
+}
+
+#[tokio::test]
+async fn tool_context_emits_typed_updates_through_slots() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let slots = ToolSlots::new().with(ToolUpdateSlot::new(move |update| {
+        let tx = tx.clone();
+        async move {
+            tx.send(update).await.unwrap();
+        }
+    }));
+    let router = LocalToolRouter::new(vec![Arc::new(UpdateTool)]).with_slots(slots);
+
+    let result = router
+        .execute(call("updater"), CancellationToken::new())
+        .await
+        .unwrap();
+    let update = rx.recv().await.unwrap();
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(tool_text(&result), "done");
+    assert_eq!(update.call_id.as_str(), "call-updater");
+    assert_eq!(update.tool_name, "updater");
+    assert_eq!(update.sequence, 0);
+    assert_eq!(update.kind, StatusUpdate::KIND);
+    assert_eq!(content_text(&update.content), "running");
+    assert_eq!(update.payload, json!({ "message": "running" }));
+}
+
+#[tokio::test]
+async fn tool_context_updates_are_noop_without_slot() {
+    let router = LocalToolRouter::new(vec![Arc::new(UpdateTool)]);
+
+    let result = router
+        .execute(call("updater"), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(tool_text(&result), "done");
+}
+
+#[tokio::test]
+async fn tool_context_emits_raw_update_parts_through_slots() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let slots = ToolSlots::new().with(ToolUpdateSlot::new(move |update| {
+        let tx = tx.clone();
+        async move {
+            tx.send(update).await.unwrap();
+        }
+    }));
+    let router = LocalToolRouter::new(vec![Arc::new(RawUpdateTool)]).with_slots(slots);
+
+    let result = router
+        .execute(call("raw_updater"), CancellationToken::new())
+        .await
+        .unwrap();
+    let update = rx.recv().await.unwrap();
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(tool_text(&result), "done");
+    assert_eq!(update.call_id.as_str(), "call-raw_updater");
+    assert_eq!(update.tool_name, "raw_updater");
+    assert_eq!(update.sequence, 0);
+    assert_eq!(update.kind, "raw.status");
+    assert_eq!(content_text(&update.content), "raw running");
+    assert_eq!(update.payload, json!({ "message": "raw running" }));
 }
 
 #[tokio::test]
@@ -132,7 +201,80 @@ struct EchoInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct EmptyInput {}
 
-async fn echo(input: EchoInput, _cancel: CancellationToken) -> StdResult<String, String> {
+struct UpdateTool;
+
+struct RawUpdateTool;
+
+#[derive(Debug, Serialize)]
+struct StatusUpdate {
+    message: String,
+}
+
+impl ToolUpdatePayload for StatusUpdate {
+    const KIND: &'static str = "status";
+
+    fn content(&self) -> Vec<InputContent> {
+        vec![InputContent::Text(self.message.clone())]
+    }
+}
+
+#[async_trait]
+impl Tool for UpdateTool {
+    type Input = EmptyInput;
+    type Output = String;
+
+    fn name(&self) -> &str {
+        "updater"
+    }
+
+    fn description(&self) -> &str {
+        "Emit a typed update."
+    }
+
+    async fn call(
+        &self,
+        _input: Self::Input,
+        context: ToolContext,
+    ) -> StdResult<Self::Output, String> {
+        context
+            .emit(StatusUpdate {
+                message: "running".to_string(),
+            })
+            .await?;
+        Ok("done".to_string())
+    }
+}
+
+#[async_trait]
+impl Tool for RawUpdateTool {
+    type Input = EmptyInput;
+    type Output = String;
+
+    fn name(&self) -> &str {
+        "raw_updater"
+    }
+
+    fn description(&self) -> &str {
+        "Emit a raw update."
+    }
+
+    async fn call(
+        &self,
+        _input: Self::Input,
+        context: ToolContext,
+    ) -> StdResult<Self::Output, String> {
+        context
+            .emit(ToolUpdateParts::new(
+                "raw.status",
+                vec![InputContent::Text("raw running".to_string())],
+                json!({ "message": "raw running" }),
+            ))
+            .await?;
+        Ok("done".to_string())
+    }
+}
+
+async fn echo(input: EchoInput, _context: ToolContext) -> StdResult<String, String> {
     Ok(format!("echo: {}", input.message))
 }
 

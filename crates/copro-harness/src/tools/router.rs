@@ -1,3 +1,4 @@
+use super::context::{ToolContext, ToolSlots};
 use super::tool::ErasedTool;
 use copro_agent::{CancellationToken, ToolExecutionPolicy, ToolRouter};
 use copro_api::async_trait;
@@ -11,11 +12,20 @@ use std::sync::Arc;
 #[derive(Default, Clone)]
 pub struct LocalToolRouter {
     tools: Vec<Arc<dyn ErasedTool>>,
+    slots: ToolSlots,
 }
 
 impl LocalToolRouter {
     pub fn new(tools: Vec<Arc<dyn ErasedTool>>) -> Self {
-        Self { tools }
+        Self {
+            tools,
+            slots: ToolSlots::default(),
+        }
+    }
+
+    pub fn with_slots(mut self, slots: ToolSlots) -> Self {
+        self.slots = slots;
+        self
     }
 
     fn tool_by_name(&self, name: &str) -> Option<&Arc<dyn ErasedTool>> {
@@ -47,7 +57,8 @@ impl ToolRouter for LocalToolRouter {
             });
         };
 
-        let result = match tool.call_content(Value::Object(arguments), cancel).await {
+        let context = ToolContext::new(id.clone(), name.clone(), cancel, self.slots.clone());
+        let result = match tool.call_content(Value::Object(arguments), context).await {
             Ok(content) => ToolResult {
                 call_id: id,
                 name,
