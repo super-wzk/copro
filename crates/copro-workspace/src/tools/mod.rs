@@ -9,7 +9,7 @@ mod write;
 
 pub use edit::{EditTool, EditToolInput};
 pub use glob::{GlobInput, GlobTool};
-pub use grep::{GrepInput, GrepOutputMode, GrepTool, GrepToolConfig};
+pub use grep::{GrepInput, GrepMatchFound, GrepOutputMode, GrepProgress, GrepTool, GrepToolConfig};
 pub use ls::{LsInput, LsTool};
 pub use read::{ReadInput, ReadOutput, ReadTool, ReadToolConfig};
 pub use utils::{CacheEntry, FileCache, FileSnapshot};

@@ -5,14 +5,14 @@ use crate::tools::vfs_walk::{
 };
 use copro_agent::{CancellationToken, ToolExecutionPolicy};
 use copro_api::async_trait;
-use copro_harness::tools::{Tool, ToolContext};
+use copro_harness::tools::{Tool, ToolContext, ToolUpdatePayload};
 use grep::regex::{RegexMatcher, RegexMatcherBuilder};
 use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use ignore::gitignore::Gitignore;
 use ignore::overrides::{Override, OverrideBuilder};
 use ignore::types::{Types, TypesBuilder};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::Path;
 use std::time::SystemTime;
@@ -46,6 +46,29 @@ impl Default for GrepToolConfig {
 pub struct GrepTool {
     root: AsyncVfsPath,
     config: GrepToolConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GrepMatchFound {
+    pub path: String,
+    pub line_number: Option<u64>,
+    pub byte_offset: u64,
+    pub line_count: usize,
+}
+
+impl ToolUpdatePayload for GrepMatchFound {
+    const KIND: &'static str = "grep.match_found";
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GrepProgress {
+    pub searched_files: usize,
+    pub matched_files: usize,
+    pub current_path: Option<String>,
+}
+
+impl ToolUpdatePayload for GrepProgress {
+    const KIND: &'static str = "grep.progress";
 }
 
 impl GrepTool {
@@ -159,6 +182,7 @@ impl Tool for GrepTool {
         );
 
         let plan = SearchPlan {
+            context: &context,
             matcher: &matcher,
             filter: &filter,
             options: &search_options,
@@ -371,6 +395,7 @@ fn sort_note_for_matched_files(files: &[MatchedFileSort]) -> Option<&'static str
 }
 
 struct SearchPlan<'a> {
+    context: &'a ToolContext,
     matcher: &'a RegexMatcher,
     filter: &'a GrepFilter,
     options: &'a SearchOptions,
@@ -420,6 +445,8 @@ async fn search_vfs(
     }
 
     sort_candidate_files_by_modified_desc(&mut candidates);
+    let mut searched_files = 0;
+    let mut matched_files = 0;
     for candidate in candidates {
         if plan.cancel.is_cancelled() {
             return Err("grep cancelled".to_string());
@@ -427,10 +454,21 @@ async fn search_vfs(
         if output.should_stop() {
             break;
         }
+        searched_files += 1;
+        emit_grep_progress(
+            plan.context,
+            searched_files,
+            matched_files,
+            Some(&candidate),
+        )
+        .await?;
         if search_one_file(&candidate, plan, output).await? {
+            matched_files += 1;
             output.record_matched_file(candidate.modified);
         }
     }
+
+    emit_grep_progress(plan.context, searched_files, matched_files, None).await?;
 
     Ok(())
 }
@@ -543,35 +581,39 @@ async fn search_one_file(
 
     let has_match = match plan.mode {
         GrepOutputMode::FilesWithMatches => {
-            let mut sink = MatchOnlySink::default();
+            let mut sink = MatchOnlySink::new(display.clone());
             searcher
                 .search_slice(plan.matcher, &bytes, &mut sink)
                 .map_err(|error| error.to_string())?;
             if sink.has_match {
                 output.push(display);
             }
+            emit_grep_matches(plan.context, sink.matches).await?;
             sink.has_match
         }
         GrepOutputMode::Count => {
-            let mut sink = CountSink::default();
+            let mut sink = CountSink::new(display.clone());
             searcher
                 .search_slice(plan.matcher, &bytes, &mut sink)
                 .map_err(|error| error.to_string())?;
             if sink.match_count > 0 {
                 output.push(format!("{display}:{}", sink.match_count));
             }
+            emit_grep_matches(plan.context, sink.matches).await?;
             sink.match_count > 0
         }
         GrepOutputMode::Content => {
             let mut sink = ContentSink {
-                path: display,
+                path: display.clone(),
                 show_line_numbers: plan.options.line_numbers,
                 output,
                 has_match: false,
+                matches: MatchUpdates::new(display.clone()),
             };
             searcher
                 .search_slice(plan.matcher, &bytes, &mut sink)
                 .map_err(|error| error.to_string())?;
+            emit_grep_matches(plan.context, sink.matches).await?;
             sink.has_match
         }
     };
@@ -579,29 +621,49 @@ async fn search_one_file(
     Ok(has_match)
 }
 
-#[derive(Debug, Default)]
 struct MatchOnlySink {
     has_match: bool,
+    matches: MatchUpdates,
+}
+
+impl MatchOnlySink {
+    fn new(path: String) -> Self {
+        Self {
+            has_match: false,
+            matches: MatchUpdates::new(path),
+        }
+    }
 }
 
 impl Sink for MatchOnlySink {
     type Error = io::Error;
 
-    fn matched(&mut self, _searcher: &Searcher, _mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        self.matches.push(mat);
         self.has_match = true;
         Ok(false)
     }
 }
 
-#[derive(Debug, Default)]
 struct CountSink {
     match_count: usize,
+    matches: MatchUpdates,
+}
+
+impl CountSink {
+    fn new(path: String) -> Self {
+        Self {
+            match_count: 0,
+            matches: MatchUpdates::new(path),
+        }
+    }
 }
 
 impl Sink for CountSink {
     type Error = io::Error;
 
     fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        self.matches.push(mat);
         self.match_count += mat.lines().count().max(1);
         Ok(true)
     }
@@ -612,6 +674,7 @@ struct ContentSink<'a> {
     show_line_numbers: bool,
     output: &'a mut OutputCollector,
     has_match: bool,
+    matches: MatchUpdates,
 }
 
 impl Sink for ContentSink<'_> {
@@ -619,6 +682,7 @@ impl Sink for ContentSink<'_> {
 
     fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
         self.has_match = true;
+        self.matches.push(mat);
         for (index, line) in mat.lines().enumerate() {
             let line_number = mat.line_number().map(|number| number + index as u64);
             let output_line = render_grep_line(
@@ -653,6 +717,51 @@ impl Sink for ContentSink<'_> {
     fn context_break(&mut self, _searcher: &Searcher) -> Result<bool, Self::Error> {
         Ok(self.output.push("--".to_string()))
     }
+}
+
+struct MatchUpdates {
+    path: String,
+    matches: Vec<GrepMatchFound>,
+}
+
+impl MatchUpdates {
+    fn new(path: String) -> Self {
+        Self {
+            path,
+            matches: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, mat: &SinkMatch<'_>) {
+        self.matches.push(GrepMatchFound {
+            path: self.path.clone(),
+            line_number: mat.line_number(),
+            byte_offset: mat.absolute_byte_offset(),
+            line_count: mat.lines().count().max(1),
+        });
+    }
+}
+
+async fn emit_grep_matches(context: &ToolContext, matches: MatchUpdates) -> Result<(), String> {
+    for match_found in matches.matches {
+        context.emit(match_found).await?;
+    }
+    Ok(())
+}
+
+async fn emit_grep_progress(
+    context: &ToolContext,
+    searched_files: usize,
+    matched_files: usize,
+    current: Option<&CandidateFile>,
+) -> Result<(), String> {
+    context
+        .emit(GrepProgress {
+            searched_files,
+            matched_files,
+            current_path: current.map(|candidate| candidate.display_path.clone()),
+        })
+        .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

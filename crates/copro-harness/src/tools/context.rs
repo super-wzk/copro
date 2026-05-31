@@ -1,5 +1,5 @@
 use copro_agent::CancellationToken;
-use copro_api::message::{InputContent, ToolCallId};
+use copro_api::message::ToolCallId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::any::{Any, TypeId};
@@ -124,7 +124,6 @@ pub struct ToolUpdate {
     pub tool_name: String,
     pub sequence: u64,
     pub kind: String,
-    pub content: Vec<InputContent>,
     pub payload: Value,
 }
 
@@ -132,15 +131,13 @@ pub struct ToolUpdate {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolUpdateParts {
     pub kind: String,
-    pub content: Vec<InputContent>,
     pub payload: Value,
 }
 
 impl ToolUpdateParts {
-    pub fn new(kind: impl Into<String>, content: Vec<InputContent>, payload: Value) -> Self {
+    pub fn new(kind: impl Into<String>, payload: Value) -> Self {
         Self {
             kind: kind.into(),
-            content,
             payload,
         }
     }
@@ -149,10 +146,6 @@ impl ToolUpdateParts {
 /// Typed helper for tool update payloads.
 pub trait ToolUpdatePayload: Serialize + Send + 'static {
     const KIND: &'static str;
-
-    fn content(&self) -> Vec<InputContent> {
-        Vec::new()
-    }
 }
 
 /// Converts typed or erased update payloads into a runtime [`ToolUpdate`].
@@ -167,7 +160,6 @@ impl IntoToolUpdate for ToolUpdateParts {
             tool_name: context.tool_name.clone(),
             sequence,
             kind: self.kind,
-            content: self.content,
             payload: self.payload,
         })
     }
@@ -178,14 +170,12 @@ where
     T: ToolUpdatePayload,
 {
     fn into_update(self, context: &ToolContext, sequence: u64) -> Result<ToolUpdate, String> {
-        let content = self.content();
         let payload = serde_json::to_value(&self).map_err(|error| error.to_string())?;
         Ok(ToolUpdate {
             call_id: context.call_id.clone(),
             tool_name: context.tool_name.clone(),
             sequence,
             kind: T::KIND.to_string(),
-            content,
             payload,
         })
     }

@@ -1,7 +1,7 @@
 use async_std::io::WriteExt;
 use copro_agent::{CancellationToken, ToolRouter};
 use copro_api::message::{InputContent, ToolCall, ToolResult, ToolResultStatus};
-use copro_harness::tools::{ErasedTool, LocalToolRouter};
+use copro_harness::tools::{ErasedTool, LocalToolRouter, ToolSlots, ToolUpdate, ToolUpdateSlot};
 use copro_workspace::tools::GrepTool;
 use serde_json::json;
 use std::path::PathBuf;
@@ -224,6 +224,53 @@ async fn multiline_search_crosses_line_boundaries() {
     );
 }
 
+#[tokio::test]
+async fn emits_structured_progress_and_match_updates() {
+    let root = memory_root().await;
+    write_file(&root, "notes.txt", b"first\nneedle here\nlast\n").await;
+
+    let (result, updates) = execute_grep_with_updates(
+        root,
+        json!({
+            "pattern": "needle",
+            "output_mode": "content"
+        }),
+    )
+    .await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(tool_text(&result), "notes.txt:2:needle here");
+    assert_eq!(updates.len(), 3);
+    assert_eq!(updates[0].kind, "grep.progress");
+    assert_eq!(
+        updates[0].payload,
+        json!({
+            "searched_files": 1,
+            "matched_files": 0,
+            "current_path": "notes.txt",
+        })
+    );
+    assert_eq!(updates[1].kind, "grep.match_found");
+    assert_eq!(
+        updates[1].payload,
+        json!({
+            "path": "notes.txt",
+            "line_number": 2,
+            "byte_offset": 6,
+            "line_count": 1,
+        })
+    );
+    assert_eq!(updates[2].kind, "grep.progress");
+    assert_eq!(
+        updates[2].payload,
+        json!({
+            "searched_files": 1,
+            "matched_files": 1,
+            "current_path": null,
+        })
+    );
+}
+
 async fn memory_root() -> AsyncVfsPath {
     AsyncMemoryFS::new().into()
 }
@@ -270,6 +317,30 @@ async fn execute_grep(root: AsyncVfsPath, args: serde_json::Value) -> ToolResult
         .execute(call(args), CancellationToken::new())
         .await
         .unwrap()
+}
+
+async fn execute_grep_with_updates(
+    root: AsyncVfsPath,
+    args: serde_json::Value,
+) -> (ToolResult, Vec<ToolUpdate>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let slots = ToolSlots::new().with(ToolUpdateSlot::new(move |update| {
+        let tx = tx.clone();
+        async move {
+            tx.send(update).await.unwrap();
+        }
+    }));
+    let tool: Arc<dyn ErasedTool> = Arc::new(GrepTool::new(root));
+    let router = LocalToolRouter::new(vec![tool]).with_slots(slots);
+    let result = router
+        .execute(call(args), CancellationToken::new())
+        .await
+        .unwrap();
+    let mut updates = Vec::new();
+    while let Ok(update) = rx.try_recv() {
+        updates.push(update);
+    }
+    (result, updates)
 }
 
 fn call(args: serde_json::Value) -> ToolCall {

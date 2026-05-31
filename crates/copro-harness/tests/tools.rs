@@ -130,7 +130,6 @@ async fn tool_context_emits_typed_updates_through_slots() {
     assert_eq!(update.tool_name, "updater");
     assert_eq!(update.sequence, 0);
     assert_eq!(update.kind, StatusUpdate::KIND);
-    assert_eq!(content_text(&update.content), "running");
     assert_eq!(update.payload, json!({ "message": "running" }));
 }
 
@@ -170,7 +169,6 @@ async fn tool_context_emits_raw_update_parts_through_slots() {
     assert_eq!(update.tool_name, "raw_updater");
     assert_eq!(update.sequence, 0);
     assert_eq!(update.kind, "raw.status");
-    assert_eq!(content_text(&update.content), "raw running");
     assert_eq!(update.payload, json!({ "message": "raw running" }));
 }
 
@@ -212,10 +210,6 @@ struct StatusUpdate {
 
 impl ToolUpdatePayload for StatusUpdate {
     const KIND: &'static str = "status";
-
-    fn content(&self) -> Vec<InputContent> {
-        vec![InputContent::Text(self.message.clone())]
-    }
 }
 
 #[async_trait]
@@ -266,7 +260,6 @@ impl Tool for RawUpdateTool {
         context
             .emit(ToolUpdateParts::new(
                 "raw.status",
-                vec![InputContent::Text("raw running".to_string())],
                 json!({ "message": "raw running" }),
             ))
             .await?;
