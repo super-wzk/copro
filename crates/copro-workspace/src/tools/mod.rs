@@ -7,8 +7,8 @@ mod utils;
 mod vfs_walk;
 mod write;
 
-pub use edit::{EditTool, EditToolInput};
-pub use glob::{GlobInput, GlobTool};
+pub use edit::{EditMatchFound, EditTool, EditToolInput};
+pub use glob::{GlobInput, GlobProgress, GlobTool};
 pub use grep::{GrepInput, GrepMatchFound, GrepOutputMode, GrepProgress, GrepTool, GrepToolConfig};
 pub use ls::{LsInput, LsTool};
 pub use read::{ReadInput, ReadOutput, ReadTool, ReadToolConfig};

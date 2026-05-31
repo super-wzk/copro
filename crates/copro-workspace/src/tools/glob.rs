@@ -5,11 +5,11 @@ use crate::tools::vfs_walk::{
 };
 use copro_agent::{CancellationToken, ToolExecutionPolicy};
 use copro_api::async_trait;
-use copro_harness::tools::{Tool, ToolContext};
+use copro_harness::tools::{Tool, ToolContext, ToolUpdatePayload};
 use ignore::gitignore::Gitignore;
 use ignore::overrides::{Override, OverrideBuilder};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::time::SystemTime;
@@ -37,6 +37,18 @@ impl GlobTool {
     pub fn root(&self) -> &AsyncVfsPath {
         &self.root
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlobProgress {
+    pub searched_directories: usize,
+    pub searched_files: usize,
+    pub matched_files: usize,
+    pub current_path: Option<String>,
+}
+
+impl ToolUpdatePayload for GlobProgress {
+    const KIND: &'static str = "glob.progress";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -88,6 +100,7 @@ impl Tool for GlobTool {
         search_vfs(
             &self.root,
             search_path,
+            &context,
             &filter,
             input.include_ignored,
             &mut output,
@@ -202,6 +215,7 @@ struct GlobMatch {
 async fn search_vfs(
     root: &AsyncVfsPath,
     input_path: &str,
+    context: &ToolContext,
     filter: &GlobFilter,
     include_ignored: bool,
     output: &mut OutputCollector,
@@ -231,20 +245,30 @@ async fn search_vfs(
 
     match metadata.file_type {
         VfsFileType::File => {
+            let mut progress = GlobProgressState::default();
+            progress.searched_files += 1;
             if filter.matches(&start) {
-                output.push(display_path(&start), metadata.modified);
+                let path = display_path(&start);
+                output.push(path, metadata.modified);
+                progress.matched_files += 1;
             }
+            emit_glob_progress(context, &progress, Some(&start)).await?;
+            emit_glob_progress(context, &progress, None).await?;
         }
         VfsFileType::Directory => {
+            let mut progress = GlobProgressState::default();
             search_directory(
                 start,
                 inherited_gitignores,
+                context,
                 filter,
                 include_ignored,
                 output,
                 cancel,
+                &mut progress,
             )
             .await?;
+            emit_glob_progress(context, &progress, None).await?;
         }
     }
 
@@ -259,10 +283,12 @@ struct PendingDir {
 async fn search_directory(
     start: AsyncVfsPath,
     inherited_gitignores: Vec<Gitignore>,
+    context: &ToolContext,
     filter: &GlobFilter,
     include_ignored: bool,
     output: &mut OutputCollector,
     cancel: CancellationToken,
+    progress: &mut GlobProgressState,
 ) -> Result<(), String> {
     let mut pending = VecDeque::from([PendingDir {
         path: start,
@@ -280,6 +306,7 @@ async fn search_directory(
         if !include_ignored && let Some(matcher) = load_gitignore_in_dir(&path).await? {
             gitignores.push(matcher);
         }
+        progress.searched_directories += 1;
 
         let mut entries = directory_entries(&path).await?;
         entries.sort_by_key(|(path, _)| display_path(path));
@@ -290,9 +317,13 @@ async fn search_directory(
                     if !is_under_vcs_dir(&entry_path)
                         && (include_ignored
                             || !gitignore_is_ignored(&gitignores, &entry_path, false))
-                        && filter.matches(&entry_path)
                     {
-                        output.push(display_path(&entry_path), metadata.modified);
+                        progress.searched_files += 1;
+                        if filter.matches(&entry_path) {
+                            let path = display_path(&entry_path);
+                            output.push(path, metadata.modified);
+                            progress.matched_files += 1;
+                        }
                     }
                 }
                 VfsFileType::Directory => {
@@ -308,9 +339,32 @@ async fn search_directory(
                 }
             }
         }
+        emit_glob_progress(context, progress, Some(&path)).await?;
     }
 
     Ok(())
+}
+
+#[derive(Default)]
+struct GlobProgressState {
+    searched_directories: usize,
+    searched_files: usize,
+    matched_files: usize,
+}
+
+async fn emit_glob_progress(
+    context: &ToolContext,
+    progress: &GlobProgressState,
+    current: Option<&AsyncVfsPath>,
+) -> Result<(), String> {
+    context
+        .emit(GlobProgress {
+            searched_directories: progress.searched_directories,
+            searched_files: progress.searched_files,
+            matched_files: progress.matched_files,
+            current_path: current.map(display_path),
+        })
+        .await
 }
 
 fn sort_note_for_glob_matches(matches: &[GlobMatch]) -> Option<&'static str> {

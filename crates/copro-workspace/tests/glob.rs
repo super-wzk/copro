@@ -1,7 +1,7 @@
 use async_std::io::WriteExt;
 use copro_agent::{CancellationToken, ToolRouter};
 use copro_api::message::{InputContent, ToolCall, ToolResult, ToolResultStatus};
-use copro_harness::tools::{ErasedTool, LocalToolRouter};
+use copro_harness::tools::{ErasedTool, LocalToolRouter, ToolSlots, ToolUpdate, ToolUpdateSlot};
 use copro_workspace::tools::GlobTool;
 use serde_json::json;
 use std::path::PathBuf;
@@ -92,6 +92,46 @@ async fn include_ignored_finds_gitignored_files_but_still_skips_vcs_dirs() {
 }
 
 #[tokio::test]
+async fn emits_structured_progress_updates() {
+    let root = memory_root().await;
+    write_file(&root, "src/main.rs", b"fn main() {}\n").await;
+    write_file(&root, "src/notes.txt", b"notes\n").await;
+
+    let (result, updates) = execute_glob_with_updates(
+        root,
+        json!({
+            "pattern": "*.rs",
+            "path": "src"
+        }),
+    )
+    .await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(tool_text(&result), "src/main.rs\n1 files");
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[0].kind, "glob.progress");
+    assert_eq!(
+        updates[0].payload,
+        json!({
+            "searched_directories": 1,
+            "searched_files": 2,
+            "matched_files": 1,
+            "current_path": "src"
+        })
+    );
+    assert_eq!(updates[1].kind, "glob.progress");
+    assert_eq!(
+        updates[1].payload,
+        json!({
+            "searched_directories": 1,
+            "searched_files": 2,
+            "matched_files": 1,
+            "current_path": null
+        })
+    );
+}
+
+#[tokio::test]
 async fn sorts_matches_by_modified_time_descending() {
     let (root, temp_dir) = physical_root("glob-sort");
     write_file_at(&root, "older.txt", b"old\n", 1).await;
@@ -150,6 +190,30 @@ async fn execute_glob(root: AsyncVfsPath, args: serde_json::Value) -> ToolResult
         .execute(call(args), CancellationToken::new())
         .await
         .unwrap()
+}
+
+async fn execute_glob_with_updates(
+    root: AsyncVfsPath,
+    args: serde_json::Value,
+) -> (ToolResult, Vec<ToolUpdate>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let slots = ToolSlots::new().with(ToolUpdateSlot::new(move |update| {
+        let tx = tx.clone();
+        async move {
+            tx.send(update).await.unwrap();
+        }
+    }));
+    let tool: Arc<dyn ErasedTool> = Arc::new(GlobTool::new(root));
+    let router = LocalToolRouter::new(vec![tool]).with_slots(slots);
+    let result = router
+        .execute(call(args), CancellationToken::new())
+        .await
+        .unwrap();
+    let mut updates = Vec::new();
+    while let Ok(update) = rx.try_recv() {
+        updates.push(update);
+    }
+    (result, updates)
 }
 
 fn call(args: serde_json::Value) -> ToolCall {

@@ -4,9 +4,9 @@ use crate::tools::utils::{FileCache, read_file_bytes, resolve_path, validate_utf
 use async_std::io::WriteExt;
 use copro_agent::ToolExecutionPolicy;
 use copro_api::async_trait;
-use copro_harness::tools::{Tool, ToolContext};
+use copro_harness::tools::{Tool, ToolContext, ToolUpdatePayload};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use vfs::async_vfs::AsyncVfsPath;
 
 use similar::{ChangeTag, TextDiff};
@@ -39,6 +39,16 @@ impl EditTool {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditMatchFound {
+    pub path: String,
+    pub line_number: u64,
+}
+
+impl ToolUpdatePayload for EditMatchFound {
+    const KIND: &'static str = "edit.match_found";
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct EditToolInput {
     /// Path of the file to edit, relative to workspace root.
@@ -69,11 +79,7 @@ impl Tool for EditTool {
         ToolExecutionPolicy::Serial
     }
 
-    async fn call(
-        &self,
-        input: Self::Input,
-        _context: ToolContext,
-    ) -> Result<Self::Output, String> {
+    async fn call(&self, input: Self::Input, context: ToolContext) -> Result<Self::Output, String> {
         // Gate: file must have been read first
         {
             let cache_guard = self.cache.lock().unwrap();
@@ -92,13 +98,22 @@ impl Tool for EditTool {
 
         let content = validate_utf8(bytes, &input.path)?;
 
-        let occurrence_count = count_matches(&content, &input.old_string);
+        let matches = find_matches(&content, &input.old_string);
+        let occurrence_count = matches.len();
         if occurrence_count == 0 {
             return Err(format!(
                 "{}: `{}` not found in file",
                 input.path,
                 truncate_for_error(&input.old_string)
             ));
+        }
+        for line_number in matches.iter().map(|mat| mat.line_number) {
+            context
+                .emit(EditMatchFound {
+                    path: input.path.clone(),
+                    line_number,
+                })
+                .await?;
         }
         if !input.replace_all && occurrence_count > 1 {
             return Err(format!(
@@ -136,6 +151,11 @@ impl Tool for EditTool {
             input.path, replacements.count
         ))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EditMatch {
+    line_number: u64,
 }
 
 struct Replacement {
@@ -217,17 +237,24 @@ fn format_diff_with_line_numbers(old: &str, new: &str) -> String {
     output
 }
 
-fn count_matches(content: &str, old: &str) -> usize {
+fn find_matches(content: &str, old: &str) -> Vec<EditMatch> {
     if old.is_empty() {
-        return 0;
+        return Vec::new();
     }
-    let mut count = 0;
-    let mut cursor = 0;
+
+    let mut matches = Vec::new();
+    let mut cursor = 0usize;
+    let mut line_number = 1u64;
     while let Some(pos) = content[cursor..].find(old) {
-        count += 1;
-        cursor += pos + old.len();
+        let match_pos = cursor + pos;
+        line_number += content[cursor..match_pos]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count() as u64;
+        matches.push(EditMatch { line_number });
+        cursor = match_pos + old.len();
     }
-    count
+    matches
 }
 
 fn replace_text(content: &str, old: &str, new: &str, replace_all: bool) -> Replacement {
