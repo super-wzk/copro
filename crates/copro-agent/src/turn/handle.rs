@@ -11,9 +11,9 @@ use copro_api::response::FinishReason;
 use std::collections::HashSet;
 use std::fmt;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
 #[must_use = "agent control points should be explicitly continued or controlled; Drop only best-effort continues"]
 pub struct AgentControlPoint {
