@@ -48,7 +48,7 @@ pub struct GrepTool {
     config: GrepToolConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrepMatchFound {
     pub path: String,
     pub line_number: Option<u64>,
@@ -60,7 +60,7 @@ impl ToolUpdatePayload for GrepMatchFound {
     const KIND: &'static str = "grep.match_found";
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrepProgress {
     pub searched_files: usize,
     pub matched_files: usize,

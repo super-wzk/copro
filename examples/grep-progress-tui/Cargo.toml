@@ -1,0 +1,17 @@
+[package]
+name = "grep-progress-tui"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+copro-agent.workspace = true
+copro-api.workspace = true
+copro-harness.workspace = true
+copro-workspace.workspace = true
+crossterm = "0.29"
+futures-util.workspace = true
+ratatui = "0.30"
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+vfs.workspace = true
