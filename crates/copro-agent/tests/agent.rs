@@ -909,6 +909,78 @@ async fn turn_handle_preempt_inflight_model_stream_emits_turn_preempted() {
 }
 
 #[tokio::test]
+async fn turn_handle_preempt_request_overrides_deferred_pause_request() {
+    let agent = TestSession::new(
+        Arc::new(PendingAfterFirstDeltaModel),
+        Arc::new(EmptyToolRouter),
+    );
+    let run = agent.start_turn().await.unwrap();
+
+    let first = loop {
+        let report = run.step_until_control().await.unwrap();
+        if matches!(
+            report.pending_outcome(),
+            AgentOutcome::ModelDelta {
+                delta: OutputContentDelta::Text(text),
+                ..
+            } if text == "first"
+        ) {
+            break report;
+        }
+        report.continue_turn().await.unwrap();
+    };
+    first.continue_turn().await.unwrap();
+
+    let step_task = tokio::spawn({
+        let run = run.clone();
+        async move { run.step_until_control().await }
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    run.pause().await.unwrap();
+    run.preempt().await.unwrap();
+
+    let interrupted = tokio::time::timeout(Duration::from_secs(1), step_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let interrupted_step_id = interrupted.step().id;
+    assert!(matches!(
+        interrupted.pending_outcome(),
+        AgentOutcome::ActionInterrupted {
+            reason: AgentInterruptReason::Stopped
+        }
+    ));
+    assert_eq!(
+        interrupted.state,
+        AgentTurnState::Preempting {
+            step_id: interrupted_step_id,
+        }
+    );
+    drop(interrupted);
+
+    let events = tokio::time::timeout(
+        Duration::from_secs(1),
+        run.clone().events().collect::<Vec<_>>(),
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .collect::<Result<Vec<_>>>()
+    .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnPreempted { .. }))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnPaused { .. }))
+    );
+}
+
+#[tokio::test]
 async fn turn_handle_preempt_inflight_tool_execution_recovers_tool_result() {
     let agent = TestSession::new(
         Arc::new(ToolThenDoneModel {

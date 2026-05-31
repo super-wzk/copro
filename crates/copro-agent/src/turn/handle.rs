@@ -11,11 +11,11 @@ use copro_api::response::FinishReason;
 use std::collections::HashSet;
 use std::fmt;
 use std::ops::Deref;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 
-#[must_use = "agent control points must be continued, controlled, paused, finished, or aborted"]
+#[must_use = "agent control points should be explicitly continued or controlled; Drop only best-effort continues"]
 pub struct AgentControlPoint {
     turn: AgentTurnHandle,
     checkpoint: AgentCheckpoint,
@@ -47,6 +47,18 @@ struct AgentTurnDriverLease {
     active: Arc<AtomicBool>,
 }
 
+struct PendingControl {
+    step_id: AgentStepId,
+    report: AgentStepReport,
+    reply: oneshot::Sender<AgentControlSignal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredControlRequest {
+    Pause,
+    Preempt,
+}
+
 impl Drop for AgentTurnDriverLease {
     fn drop(&mut self) {
         self.active.store(false, Ordering::Release);
@@ -54,11 +66,9 @@ impl Drop for AgentTurnDriverLease {
 }
 
 struct AgentTurnHandleState {
-    pending_control: Option<(AgentStepId, oneshot::Sender<AgentControlSignal>)>,
+    pending_control: Option<PendingControl>,
     pending_resume: Option<(AgentStepId, oneshot::Sender<()>)>,
-    pause_requested: bool,
-    preempt_requested: bool,
-    last_report: Option<AgentStepReport>,
+    deferred_control: Option<DeferredControlRequest>,
     state: Option<AgentTurnState>,
     active_tool_call_ids: HashSet<ToolCallId>,
 }
@@ -74,9 +84,7 @@ impl AgentTurnHandle {
             state: Arc::new(Mutex::new(AgentTurnHandleState {
                 pending_control: None,
                 pending_resume: None,
-                pause_requested: false,
-                preempt_requested: false,
-                last_report: None,
+                deferred_control: None,
                 state: None,
                 active_tool_call_ids: HashSet::new(),
             })),
@@ -130,15 +138,11 @@ impl AgentTurnHandle {
                         step: step.clone(),
                         outcome: outcome.clone(),
                     });
-                    let mut state_inner = self.state.lock().await;
-                    let state = state_inner.enter_manual_control_boundary(&step, &outcome, reply);
-                    let report = AgentStepReport {
-                        step,
-                        outcome,
-                        state,
-                        events,
-                    };
-                    state_inner.last_report = Some(report.clone());
+                    let report = self
+                        .state
+                        .lock()
+                        .await
+                        .enter_manual_control_boundary(step, outcome, events, reply);
                     return Ok(AgentControlPoint::new(self.clone(), report, lease));
                 }
                 AgentStreamItem::Error(error) => {
@@ -155,16 +159,16 @@ impl AgentTurnHandle {
         control: AgentControl,
     ) -> Result<AgentStepReport> {
         let mut inner = self.state.lock().await;
-        let report = inner
-            .last_report
-            .clone()
-            .ok_or_else(|| Error::client("agent turn is not waiting for control"))?;
-        let Some((pending_step_id, _)) = &inner.pending_control else {
-            return Err(Error::client("agent turn is not waiting for control"));
+        let report = {
+            let pending = inner
+                .pending_control
+                .as_ref()
+                .ok_or_else(|| Error::client("agent turn is not waiting for control"))?;
+            if pending.step_id != step_id {
+                return Err(Error::client("stale agent control step id"));
+            }
+            pending.report.clone()
         };
-        if *pending_step_id != step_id {
-            return Err(Error::client("stale agent control step id"));
-        }
         inner.validate_control(&report.outcome, &control)?;
         inner.observe_control(&report.outcome, &control);
 
@@ -207,11 +211,14 @@ impl AgentTurnHandle {
 
     pub async fn pause(&self) -> Result<()> {
         let mut inner = self.state.lock().await;
-        let Some((step_id, _)) = &inner.pending_control else {
-            inner.pause_requested = true;
+        let Some(step_id) = inner
+            .pending_control
+            .as_ref()
+            .map(|pending| pending.step_id)
+        else {
+            inner.defer_pause();
             return Ok(());
         };
-        let step_id = *step_id;
         inner.send_pause_control(step_id);
         inner.state = Some(AgentTurnState::Paused { at: step_id });
         Ok(())
@@ -230,11 +237,15 @@ impl AgentTurnHandle {
     pub async fn preempt(&self) -> Result<()> {
         self.cancellation.cancel();
         let mut inner = self.state.lock().await;
-        if let Some((step_id, _)) = &inner.pending_control {
-            inner.state = Some(AgentTurnState::Preempting { step_id: *step_id });
+        if let Some(step_id) = inner
+            .pending_control
+            .as_ref()
+            .map(|pending| pending.step_id)
+        {
+            inner.state = Some(AgentTurnState::Preempting { step_id });
             inner.send_pending_signal(AgentControlSignal::preempt());
         } else {
-            inner.preempt_requested = true;
+            inner.defer_preempt();
         }
         Ok(())
     }
@@ -422,19 +433,36 @@ impl AgentTurnHandleState {
 
     fn enter_manual_control_boundary(
         &mut self,
-        step: &AgentStep,
-        outcome: &AgentOutcome,
+        step: AgentStep,
+        outcome: AgentOutcome,
+        events: Vec<AgentEvent>,
         reply: oneshot::Sender<AgentControlSignal>,
-    ) -> AgentTurnState {
-        let mut state = self.enter_waiting_control(step, outcome);
-        if let Some((requested_state, signal)) = self.take_requested_control_signal(step.id) {
-            state = requested_state;
-            let _ = reply.send(signal);
-        } else {
-            self.pending_control = Some((step.id, reply));
+    ) -> AgentStepReport {
+        let step_id = step.id;
+        let mut state = self.enter_waiting_control(&step, &outcome);
+        let requested_signal = self.take_requested_control_signal(step_id);
+        if let Some((requested_state, _)) = &requested_signal {
+            state = requested_state.clone();
         }
 
-        state
+        let report = AgentStepReport {
+            step,
+            outcome,
+            state,
+            events,
+        };
+
+        if let Some((_, signal)) = requested_signal {
+            let _ = reply.send(signal);
+        } else {
+            self.pending_control = Some(PendingControl {
+                step_id,
+                report: report.clone(),
+                reply,
+            });
+        }
+
+        report
     }
 
     fn enter_waiting_control(
@@ -454,20 +482,29 @@ impl AgentTurnHandleState {
         &mut self,
         step_id: AgentStepId,
     ) -> Option<(AgentTurnState, AgentControlSignal)> {
-        if self.preempt_requested {
-            self.preempt_requested = false;
-            let state = AgentTurnState::Preempting { step_id };
-            self.state = Some(state.clone());
-            Some((state, AgentControlSignal::preempt()))
-        } else if self.pause_requested {
-            self.pause_requested = false;
-            let state = AgentTurnState::Paused { at: step_id };
-            self.state = Some(state.clone());
-            let signal = self.make_pause_signal(step_id);
-            Some((state, signal))
-        } else {
-            None
+        match self.deferred_control.take()? {
+            DeferredControlRequest::Preempt => {
+                let state = AgentTurnState::Preempting { step_id };
+                self.state = Some(state.clone());
+                Some((state, AgentControlSignal::preempt()))
+            }
+            DeferredControlRequest::Pause => {
+                let state = AgentTurnState::Paused { at: step_id };
+                self.state = Some(state.clone());
+                let signal = self.make_pause_signal(step_id);
+                Some((state, signal))
+            }
         }
+    }
+
+    fn defer_pause(&mut self) {
+        if self.deferred_control != Some(DeferredControlRequest::Preempt) {
+            self.deferred_control = Some(DeferredControlRequest::Pause);
+        }
+    }
+
+    fn defer_preempt(&mut self) {
+        self.deferred_control = Some(DeferredControlRequest::Preempt);
     }
 
     fn validate_control(&self, outcome: &AgentOutcome, control: &AgentControl) -> Result<()> {
@@ -517,17 +554,17 @@ impl AgentTurnHandleState {
     }
 
     fn send_pending_signal(&mut self, signal: AgentControlSignal) {
-        if let Some((_, reply)) = self.pending_control.take() {
-            let _ = reply.send(signal);
+        if let Some(pending) = self.pending_control.take() {
+            let _ = pending.reply.send(signal);
         }
     }
 
     fn send_pause_control(&mut self, step_id: AgentStepId) {
-        let Some((_, reply)) = self.pending_control.take() else {
+        let Some(pending) = self.pending_control.take() else {
             return;
         };
         let signal = self.make_pause_signal(step_id);
-        if reply.send(signal).is_err() {
+        if pending.reply.send(signal).is_err() {
             self.pending_resume = None;
         }
     }
