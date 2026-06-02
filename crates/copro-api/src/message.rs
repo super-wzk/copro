@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use derive_more::{Deref, Display, From, Into};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -45,7 +47,7 @@ pub struct ToolResult {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ImageContent {
     Url { url: String },
-    Data { mime_type: String, data: Vec<u8> },
+    Data { mime_type: String, data: Arc<[u8]> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

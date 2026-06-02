@@ -1,6 +1,6 @@
+use coox_harness::skills::{SkillDocument, SkillStore, SkillSummary};
 use copro_api::async_trait;
 use copro_api::error::{Error, Result};
-use copro_harness::skills::{SkillDocument, SkillStore, SkillSummary};
 use std::path::PathBuf;
 
 pub struct ExampleSkillStore {

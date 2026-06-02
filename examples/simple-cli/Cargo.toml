@@ -7,9 +7,9 @@ publish = false
 [dependencies]
 copro-agent.workspace = true
 copro-api.workspace = true
-copro-provider-openai.workspace = true
-copro-harness.workspace = true
-copro-workspace.workspace = true
+coox-provider-openai.workspace = true
+coox-harness.workspace = true
+coox-workspace.workspace = true
 vfs.workspace = true
 futures-util.workspace = true
 serde.workspace = true

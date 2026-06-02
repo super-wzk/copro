@@ -1,0 +1,16 @@
+[package]
+name = "coox-tui"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[features]
+test-support = []
+
+[dependencies]
+arboard = "3"
+image = { version = "0.25", default-features = false, features = ["default-formats"] }
+pulldown-cmark.workspace = true
+ratatui = { version = "0.30", features = ["unstable-widget-ref"] }
+ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
+unicode-width = "0.2"

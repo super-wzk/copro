@@ -1,4 +1,4 @@
-use copro_harness::tools::ToolContext;
+use coox_harness::tools::ToolContext;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::time::{SystemTime, UNIX_EPOCH};

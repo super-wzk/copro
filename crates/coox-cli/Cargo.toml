@@ -1,0 +1,24 @@
+[package]
+name = "coox-cli"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+copro-agent.workspace = true
+copro-api.workspace = true
+coox-provider-openai.workspace = true
+coox-workspace.workspace = true
+coox-tui.workspace = true
+crossterm = "0.29"
+futures-util.workspace = true
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info", "unstable-widget-ref"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tui-overlay = "0.1.2"
+unicode-width = "0.2"
+vfs.workspace = true
+
+[dev-dependencies]
+coox-tui = { workspace = true, features = ["test-support"] }
+image = { version = "0.25", default-features = false, features = ["default-formats"] }
+ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }

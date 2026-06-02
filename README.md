@@ -6,9 +6,9 @@ Copro is a Rust workspace for building controllable agent runtimes. It provides 
 
 - `copro-agent`: schedulable agent runtime, turn handles, checkpoints, and control APIs.
 - `copro-api`: shared message, request, response, stream, and tool types.
-- `copro-provider-openai`: OpenAI Responses API provider implementation.
-- `copro-harness`: local tools and skills helpers for examples and applications.
-- `copro-workspace`: workspace-oriented tool router.
+- `coox-provider-openai`: OpenAI Responses API provider implementation.
+- `coox-harness`: local tools and skills helpers for examples and applications.
+- `coox-workspace`: workspace-oriented tool router.
 
 ## Quick Start
 
@@ -24,8 +24,8 @@ Or start with a minimal no-tools agent:
 ```rust
 use copro_agent::{AgentEvent, AgentHistory, AgentTurnConfig, InputMessage, start_turn};
 use copro_api::message::InputContent;
-use copro_harness::tools::LocalToolRouter;
-use copro_provider_openai::{
+use coox_harness::tools::LocalToolRouter;
+use coox_provider_openai::{
     OpenAiResponsesModelConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
 };
 use futures_util::StreamExt;

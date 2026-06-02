@@ -1,13 +1,15 @@
 [workspace]
 members = [
-  "crates/copro-agent",
-  "crates/copro-config",
-  "crates/copro-api",
-  "crates/copro-derive",
-  "crates/copro-provider-openai",
-  "crates/copro-harness",
-  "crates/copro-workspace",
-  "examples/*",
+    "crates/copro-agent",
+    "crates/coox-config",
+    "crates/copro-api",
+    "crates/copro-derive",
+    "crates/coox-provider-openai",
+    "crates/coox-harness",
+    "crates/coox-workspace",
+    "crates/coox-tui",
+    "crates/coox-cli",
+    "examples/*",
 ]
 resolver = "3"
 
@@ -17,17 +19,18 @@ edition = "2024"
 
 [workspace.dependencies]
 copro-agent = { path = "crates/copro-agent" }
-copro-config = { path = "crates/copro-config" }
+coox-config = { path = "crates/coox-config" }
 copro-api = { path = "crates/copro-api" }
 copro-derive = { path = "crates/copro-derive" }
-copro-provider-openai = { path = "crates/copro-provider-openai" }
-copro-harness = { path = "crates/copro-harness" }
-copro-workspace = { path = "crates/copro-workspace" }
+coox-provider-openai = { path = "crates/coox-provider-openai" }
+coox-harness = { path = "crates/coox-harness" }
+coox-workspace = { path = "crates/coox-workspace" }
+coox-tui = { path = "crates/coox-tui" }
 
 async-openai = { version = "0.40.2", default-features = false, features = [
-  "byot",
-  "responses",
-  "rustls",
+    "byot",
+    "responses",
+    "rustls",
 ] }
 async-std = "1"
 async-stream = "0.3"
@@ -35,12 +38,14 @@ async-trait = "0.1"
 base64 = "0.22"
 config = "0.15"
 derive_more = { version = "2", features = ["deref", "display", "from", "into"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1.0"
 futures-util = "0.3"
 grep = "0.4.1"
 ignore = "0.4"
+libc = "0.2"
 proc-macro2 = "1"
+pulldown-cmark = "0.13"
 quote = "1"
 schemars = "1.2.1"
 similar = "3"
@@ -49,3 +54,4 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 vfs = { version = "0.13", features = ["async-vfs"] }
+windows-sys = "0.61.2"

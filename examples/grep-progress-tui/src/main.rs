@@ -1,9 +1,9 @@
-use copro_agent::{CancellationToken, ToolRouter};
-use copro_api::message::{InputContent, ToolCall, ToolResult, ToolResultStatus};
-use copro_harness::tools::{
+use coox_harness::tools::{
     ErasedTool, LocalToolRouter, ToolSlots, ToolUpdate, ToolUpdatePayload, ToolUpdateSlot,
 };
-use copro_workspace::tools::{GrepMatchFound, GrepProgress, GrepTool};
+use coox_workspace::tools::{GrepMatchFound, GrepProgress, GrepTool};
+use copro_agent::{CancellationToken, ToolRouter};
+use copro_api::message::{InputContent, ToolCall, ToolResult, ToolResultStatus};
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
 use crossterm::terminal::{

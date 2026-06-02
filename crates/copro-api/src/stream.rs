@@ -311,7 +311,7 @@ mod tests {
                 content_index: 1,
                 delta: OutputContentDelta::Image(ImageContent::Data {
                     mime_type: "image/png".to_string(),
-                    data: vec![1, 2, 3],
+                    data: vec![1, 2, 3].into(),
                 }),
             })
             .unwrap();
@@ -332,7 +332,7 @@ mod tests {
                 }),
                 OutputContent::Image(ImageContent::Data {
                     mime_type: "image/png".to_string(),
-                    data: vec![1, 2, 3],
+                    data: vec![1, 2, 3].into(),
                 }),
             ])
         );

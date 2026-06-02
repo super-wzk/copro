@@ -29,7 +29,7 @@
 - public `Agent` facade 已移除；应用层拥有 `AgentHistory`，每个 turn 消费 history，并在完成后通过 `AgentTurnHandle::into_history()` 取回更新后的 history。
 - `AgentControl` 已支持 request、model delta、assistant output、tool call、tool result 的改写/拒绝。
 - `AgentHook` / `AgentHooks` / `ToolCallDecision` 已从当前工作区代码中移除。
-- `copro-harness` 的 skills 注入已迁移为显式 `SkillRequestInjector`。
+- `coox-harness` 的 skills 注入已迁移为显式 `SkillRequestInjector`。
 - `simple-cli` 已通过 `RequestBuilt` boundary 使用 `ReplaceRequest` 注入 skills request。
 - `cargo clippy`、`cargo test -p copro-agent`、`cargo test`、RustRover build 已在当前迁移过程中通过。
 
