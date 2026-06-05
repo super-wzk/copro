@@ -278,7 +278,10 @@ fn drain_runtime_events(app: &mut App) -> DirtyState {
 
 fn render_app(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
-    let input_box = input_box();
+    let input_selection = app
+        .selection_manager
+        .selection_for(&AppSelectionSurface::Input);
+    let input_box = input_box().preserve_viewport(input_selection.is_some());
     let input_layout = input_box.layout(&app.input, area.width);
     let input_height = input_layout.render_height();
     let chunks = Layout::default()
@@ -292,9 +295,6 @@ fn render_app(frame: &mut Frame<'_>, app: &mut App) {
         .split(area);
 
     render_conversation_area(frame, app, chunks[0]);
-    let input_selection = app
-        .selection_manager
-        .selection_for(&AppSelectionSurface::Input);
     frame.render_stateful_widget_ref(
         input_box.selection(input_selection),
         chunks[2],
@@ -667,11 +667,8 @@ fn scroll_input_selection(app: &mut App, delta: i32) -> bool {
     let Some(area) = selection_map(app, AppSelectionSurface::Input).map(SelectionMap::area) else {
         return false;
     };
-    let rows = delta
-        .saturating_neg()
-        .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
     app.input
-        .scroll_viewport_by(rows, usize::from(area.width), area.height)
+        .scroll_viewport_by(delta, usize::from(area.width), area.height)
 }
 
 fn refresh_selection_map(app: &mut App, surface: AppSelectionSurface) {
@@ -698,7 +695,8 @@ fn refresh_input_selection_map(app: &mut App) {
             .saturating_add(INPUT_BOX_PADDING.top)
             .saturating_add(INPUT_BOX_PADDING.bottom),
     );
-    let input_box = input_box();
+    let input_box = input_box()
+        .preserve_viewport(app.selection_manager.active_key() == Some(&AppSelectionSurface::Input));
     let layout = input_box.layout(&app.input, full_area.width);
     app.selection_manager.register(
         AppSelectionSurface::Input,
@@ -1639,6 +1637,7 @@ mod tests {
             .expect("visible input line")
             .clone();
         let row = line.screen_y.expect("visible row");
+        let cursor = app.input.cursor();
 
         assert!(before > 0);
 
@@ -1663,6 +1662,7 @@ mod tests {
 
         assert_eq!(dirty, DirtyState::frame());
         assert!(after < before);
+        assert_eq!(app.input.cursor(), cursor);
         assert!(
             app.selection_manager
                 .selection_for(&AppSelectionSurface::Input)

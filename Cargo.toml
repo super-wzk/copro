@@ -47,7 +47,6 @@ libc = "0.2"
 proc-macro2 = "1"
 pulldown-cmark = "0.13"
 quote = "1"
-ratatui-textarea = { version = "0.9.1", default-features = false }
 schemars = "1.2.1"
 similar = "3"
 syn = { version = "2", features = ["derive", "parsing", "printing"] }
