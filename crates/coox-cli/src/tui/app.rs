@@ -589,15 +589,17 @@ fn finish_active_selection(app: &mut App) -> DirtyState {
     let text = copy_finished_selection(app, surface, selection);
 
     if text.is_empty() {
-        if surface != AppSelectionSurface::Input {
-            push_notification(app, NotificationKind::Info, "no selection");
-        }
+        return finish_selection_dirty(app, surface);
     } else if app.clipboard.write_text(&text).is_ok() {
         push_notification(app, NotificationKind::Success, "copied");
     } else {
         push_notification(app, NotificationKind::Error, "copy failed");
     }
 
+    finish_selection_dirty(app, surface)
+}
+
+fn finish_selection_dirty(app: &mut App, surface: AppSelectionSurface) -> DirtyState {
     match surface {
         AppSelectionSurface::Conversation => {
             app.frozen_selection_viewport_start = None;
@@ -1483,6 +1485,44 @@ mod tests {
 
         assert_eq!(app.clipboard.last_written_text(), Some("alpha"));
         assert_eq!(app.notifications.current_message(), Some("copied"));
+        assert!(
+            app.selection_manager
+                .selection_for(&AppSelectionSurface::Conversation)
+                .is_none()
+        );
+        assert!(!app.selection_manager.is_dragging());
+    }
+
+    #[test]
+    fn conversation_mouse_click_clears_selection_without_notification() {
+        let mut app = app_with(FinishedModel);
+        app.state
+            .apply_delta(OutputContentDelta::Text("alpha beta".to_string()));
+        render_text(&mut app, 40, 8);
+        let line = app
+            .selection_manager
+            .map_for(&AppSelectionSurface::Conversation)
+            .expect("conversation selection map")
+            .lines()
+            .iter()
+            .find(|line| line.text.contains("alpha"))
+            .expect("alpha line is visible")
+            .clone();
+        let row = line.screen_y.expect("line has screen row");
+
+        let down_dirty = handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), line.x, row),
+        );
+        let up_dirty = handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), line.x, row),
+        );
+
+        assert_eq!(down_dirty, DirtyState::frame());
+        assert_eq!(up_dirty, DirtyState::frame());
+        assert_eq!(app.clipboard.last_written_text(), None);
+        assert_eq!(app.notifications.current_message(), None);
         assert!(
             app.selection_manager
                 .selection_for(&AppSelectionSurface::Conversation)
