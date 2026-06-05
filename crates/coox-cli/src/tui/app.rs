@@ -22,7 +22,7 @@ use coox_tui::{
     clipboard::ClipboardHandler,
     components::{
         image::ImageRenderer,
-        input::{InputBox, InputEditor},
+        input::{INPUT_BOX_PADDING, InputBox, InputEditor},
         scroll_view::ScrollViewState,
     },
     selection::{Selection, SelectionManager, SelectionMap},
@@ -70,7 +70,7 @@ pub struct App {
     conversation_layout: Option<ConversationLayout>,
     conversation_cache: Option<ConversationCache>,
     selection_manager: SelectionManager<AppSelectionSurface>,
-    conversation_selection_autoscroll: Option<SelectionAutoscroll>,
+    selection_autoscroll: Option<SelectionAutoscroll>,
     frozen_selection_viewport_start: Option<u32>,
     quit: bool,
 }
@@ -89,6 +89,7 @@ struct ConversationCache {
 
 #[derive(Clone, Copy, Debug)]
 struct SelectionAutoscroll {
+    surface: AppSelectionSurface,
     scroll_delta: i32,
     column: u16,
     next_tick: Instant,
@@ -172,7 +173,7 @@ impl App {
             conversation_layout: None,
             conversation_cache: None,
             selection_manager: SelectionManager::default(),
-            conversation_selection_autoscroll: None,
+            selection_autoscroll: None,
             frozen_selection_viewport_start: None,
             quit: false,
         }
@@ -196,7 +197,7 @@ pub async fn run(tui: &mut Tui, app: &mut App) -> io::Result<()> {
         } else {
             IDLE_INPUT_POLL_TIMEOUT
         };
-        if let Some(autoscroll) = app.conversation_selection_autoscroll {
+        if let Some(autoscroll) = app.selection_autoscroll {
             poll_timeout = poll_timeout.min(autoscroll.next_tick.saturating_duration_since(now));
         }
         if let Some(deadline) = app.notifications.next_deadline(now) {
@@ -476,7 +477,9 @@ fn has_conversation_selection(app: &App) -> bool {
         .is_some()
         || (app.selection_manager.is_dragging()
             && app.selection_manager.active_key() == Some(&AppSelectionSurface::Conversation))
-        || app.conversation_selection_autoscroll.is_some()
+        || app
+            .selection_autoscroll
+            .is_some_and(|autoscroll| autoscroll.surface == AppSelectionSurface::Conversation)
 }
 
 fn mouse_in_conversation_area(app: &App, mouse: MouseEvent) -> bool {
@@ -518,7 +521,7 @@ fn set_conversation_scroll_from_bottom(app: &mut App, scroll_from_bottom: u32) -
     changed
 }
 
-fn update_conversation_selection_drag(app: &mut App, mouse: MouseEvent) {
+fn update_surface_selection_drag(app: &mut App, surface: AppSelectionSurface, mouse: MouseEvent) {
     let Some(area) = app.selection_manager.active_area() else {
         return;
     };
@@ -527,7 +530,7 @@ fn update_conversation_selection_drag(app: &mut App, mouse: MouseEvent) {
     }
 
     if mouse.row >= area.y && mouse.row < area.y.saturating_add(area.height) {
-        app.conversation_selection_autoscroll = None;
+        app.selection_autoscroll = None;
         app.selection_manager
             .update_focus_nearest(mouse.column, mouse.row);
         return;
@@ -535,7 +538,8 @@ fn update_conversation_selection_drag(app: &mut App, mouse: MouseEvent) {
 
     let scroll_delta = if mouse.row < area.y { 1 } else { -1 };
     let max_x = area.x.saturating_add(area.width.saturating_sub(1));
-    app.conversation_selection_autoscroll = Some(SelectionAutoscroll {
+    app.selection_autoscroll = Some(SelectionAutoscroll {
+        surface,
         scroll_delta,
         column: mouse.column.clamp(area.x, max_x),
         next_tick: Instant::now(),
@@ -543,7 +547,7 @@ fn update_conversation_selection_drag(app: &mut App, mouse: MouseEvent) {
 }
 
 fn start_selection_at(app: &mut App, mouse: MouseEvent) -> Option<DirtyState> {
-    app.conversation_selection_autoscroll = None;
+    app.selection_autoscroll = None;
     let surface = app.selection_manager.start_at(mouse.column, mouse.row)?;
 
     match surface {
@@ -563,21 +567,16 @@ fn start_selection_at(app: &mut App, mouse: MouseEvent) -> Option<DirtyState> {
 
 fn update_active_selection_drag(app: &mut App, mouse: MouseEvent) -> DirtyState {
     match app.selection_manager.active_key().copied() {
-        Some(AppSelectionSurface::Conversation) => {
-            update_conversation_selection_drag(app, mouse);
-            DirtyState::frame()
-        }
-        Some(AppSelectionSurface::Input) => {
-            app.selection_manager
-                .update_focus_nearest(mouse.column, mouse.row);
-            DirtyState::frame()
+        Some(surface) => {
+            update_surface_selection_drag(app, surface, mouse);
+            surface_frame_dirty(surface)
         }
         None => DirtyState::none(),
     }
 }
 
 fn finish_active_selection(app: &mut App) -> DirtyState {
-    app.conversation_selection_autoscroll = None;
+    app.selection_autoscroll = None;
 
     let Some((surface, selection)) = app.selection_manager.finish_selection() else {
         push_notification(app, NotificationKind::Info, "no selection");
@@ -609,7 +608,9 @@ fn copy_finished_selection(
 ) -> String {
     match surface {
         AppSelectionSurface::Conversation => {
-            let Some(area) = conversation_selection_map(app).map(SelectionMap::area) else {
+            let Some(area) =
+                selection_map(app, AppSelectionSurface::Conversation).map(SelectionMap::area)
+            else {
                 return String::new();
             };
             app.conversation_layout
@@ -617,31 +618,104 @@ fn copy_finished_selection(
                 .map(|layout| layout.copy_selection(area, selection))
                 .unwrap_or_default()
         }
-        AppSelectionSurface::Input => app
-            .selection_manager
-            .map_for(&AppSelectionSurface::Input)
-            .map(|map| map.copy_selection(selection))
-            .unwrap_or_default(),
+        AppSelectionSurface::Input => {
+            let Some(area) = selection_map(app, AppSelectionSurface::Input).map(SelectionMap::area)
+            else {
+                return String::new();
+            };
+            app.input
+                .copy_selection(usize::from(area.width), area.x, selection)
+        }
     }
 }
 
 fn clear_conversation_selection(app: &mut App) {
     app.selection_manager.clear();
-    app.conversation_selection_autoscroll = None;
+    app.selection_autoscroll = None;
     app.frozen_selection_viewport_start = None;
 }
 
 fn conversation_selection_map(app: &App) -> Option<&SelectionMap> {
-    app.selection_manager
-        .map_for(&AppSelectionSurface::Conversation)
+    selection_map(app, AppSelectionSurface::Conversation)
+}
+
+fn selection_map(app: &App, surface: AppSelectionSurface) -> Option<&SelectionMap> {
+    app.selection_manager.map_for(&surface)
+}
+
+fn surface_frame_dirty(surface: AppSelectionSurface) -> DirtyState {
+    match surface {
+        AppSelectionSurface::Conversation | AppSelectionSurface::Input => DirtyState::frame(),
+    }
+}
+
+fn surface_scroll_dirty(surface: AppSelectionSurface) -> DirtyState {
+    match surface {
+        AppSelectionSurface::Conversation => DirtyState::conversation(),
+        AppSelectionSurface::Input => DirtyState::frame(),
+    }
+}
+
+fn scroll_selection_surface(app: &mut App, surface: AppSelectionSurface, delta: i32) -> bool {
+    match surface {
+        AppSelectionSurface::Conversation => scroll_conversation(app, delta),
+        AppSelectionSurface::Input => scroll_input_selection(app, delta),
+    }
+}
+
+fn scroll_input_selection(app: &mut App, delta: i32) -> bool {
+    let Some(area) = selection_map(app, AppSelectionSurface::Input).map(SelectionMap::area) else {
+        return false;
+    };
+    let rows = delta
+        .saturating_neg()
+        .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+    app.input
+        .scroll_viewport_by(rows, usize::from(area.width), area.height)
+}
+
+fn refresh_selection_map(app: &mut App, surface: AppSelectionSurface) {
+    match surface {
+        AppSelectionSurface::Conversation => refresh_conversation_selection_map(app),
+        AppSelectionSurface::Input => refresh_input_selection_map(app),
+    }
+}
+
+fn refresh_input_selection_map(app: &mut App) {
+    let Some(content_area) = selection_map(app, AppSelectionSurface::Input).map(SelectionMap::area)
+    else {
+        return;
+    };
+    let full_area = Rect::new(
+        content_area.x.saturating_sub(INPUT_BOX_PADDING.left),
+        content_area.y.saturating_sub(INPUT_BOX_PADDING.top),
+        content_area
+            .width
+            .saturating_add(INPUT_BOX_PADDING.left)
+            .saturating_add(INPUT_BOX_PADDING.right),
+        content_area
+            .height
+            .saturating_add(INPUT_BOX_PADDING.top)
+            .saturating_add(INPUT_BOX_PADDING.bottom),
+    );
+    let input_box = input_box();
+    let layout = input_box.layout(&app.input, full_area.width);
+    app.selection_manager.register(
+        AppSelectionSurface::Input,
+        layout.selection_map(&app.input, full_area),
+    );
 }
 
 fn tick_selection_autoscroll(app: &mut App) -> DirtyState {
-    let Some(autoscroll) = app.conversation_selection_autoscroll else {
+    let Some(autoscroll) = app.selection_autoscroll else {
         return DirtyState::none();
     };
     if !app.selection_manager.is_dragging() {
-        app.conversation_selection_autoscroll = None;
+        app.selection_autoscroll = None;
+        return DirtyState::none();
+    }
+    if app.selection_manager.active_key() != Some(&autoscroll.surface) {
+        app.selection_autoscroll = None;
         return DirtyState::none();
     }
 
@@ -650,11 +724,11 @@ fn tick_selection_autoscroll(app: &mut App) -> DirtyState {
         return DirtyState::none();
     }
 
-    scroll_conversation(app, autoscroll.scroll_delta);
-    refresh_conversation_selection_map(app);
+    scroll_selection_surface(app, autoscroll.surface, autoscroll.scroll_delta);
+    refresh_selection_map(app, autoscroll.surface);
 
-    let Some(area) = conversation_selection_map(app).map(SelectionMap::area) else {
-        return DirtyState::conversation();
+    let Some(area) = selection_map(app, autoscroll.surface).map(SelectionMap::area) else {
+        return surface_scroll_dirty(autoscroll.surface);
     };
     let edge_row = if autoscroll.scroll_delta > 0 {
         area.y
@@ -664,11 +738,11 @@ fn tick_selection_autoscroll(app: &mut App) -> DirtyState {
     app.selection_manager
         .update_focus_nearest(autoscroll.column, edge_row);
 
-    app.conversation_selection_autoscroll = Some(SelectionAutoscroll {
+    app.selection_autoscroll = Some(SelectionAutoscroll {
         next_tick: now + SELECTION_AUTOSCROLL_INTERVAL,
         ..autoscroll
     });
-    DirtyState::conversation()
+    surface_scroll_dirty(autoscroll.surface)
 }
 
 fn preserve_frozen_selection_viewport(app: &mut App) {
@@ -1539,6 +1613,61 @@ mod tests {
                 .is_none()
         );
         assert!(!app.selection_manager.is_dragging());
+    }
+
+    #[test]
+    fn drag_above_input_autoscrolls_selection_toward_top() {
+        let mut app = app_with(FinishedModel);
+        insert_text(
+            &mut app.input,
+            &(0..30)
+                .map(|index| format!("{index:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        render_text(&mut app, 40, 20);
+        let map = app
+            .selection_manager
+            .map_for(&AppSelectionSurface::Input)
+            .expect("input selection map");
+        let area = map.area();
+        let before = map.viewport_start();
+        let line = map
+            .lines()
+            .iter()
+            .find(|line| line.screen_y.is_some())
+            .expect("visible input line")
+            .clone();
+        let row = line.screen_y.expect("visible row");
+
+        assert!(before > 0);
+
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), line.x, row),
+        );
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                line.x,
+                area.y.saturating_sub(1),
+            ),
+        );
+        let dirty = tick_selection_autoscroll(&mut app);
+        let after = app
+            .selection_manager
+            .map_for(&AppSelectionSurface::Input)
+            .expect("input selection map")
+            .viewport_start();
+
+        assert_eq!(dirty, DirtyState::frame());
+        assert!(after < before);
+        assert!(
+            app.selection_manager
+                .selection_for(&AppSelectionSurface::Input)
+                .is_some()
+        );
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use ratatui::{
     buffer::Buffer,
     layout::{Position, Rect},
@@ -138,9 +140,60 @@ impl InputEditor {
     }
 
     pub fn visual_rows(&self, width: usize) -> usize {
+        self.visual_row_count(width).clamp(1, MAX_INPUT_ROWS)
+    }
+
+    pub fn visual_row_count(&self, width: usize) -> usize {
         let (_, row_count) = self.visual_positions(width);
 
-        row_count.clamp(1, MAX_INPUT_ROWS)
+        row_count
+    }
+
+    pub fn scroll_viewport_by(&mut self, rows: i16, width: usize, height: u16) -> bool {
+        let height = usize::from(height).max(1);
+        let max_top = self.visual_row_count(width).saturating_sub(height);
+        let previous = self.viewport_top_row.min(max_top);
+        let next = apply_scroll_delta(previous, rows).min(max_top);
+        self.viewport_top_row = previous;
+        if next == previous {
+            return false;
+        }
+
+        self.sync_textarea();
+        self.textarea.scroll((rows, 0));
+        self.sync_cursor_byte();
+        self.cursor_visual_hint = Some(CursorVisualHint::new(
+            width,
+            self.textarea.screen_cursor().row,
+        ));
+        self.viewport_top_row = next;
+        true
+    }
+
+    pub fn copy_selection(&self, width: usize, origin_x: u16, selection: Selection) -> String {
+        let (start, end) = selection.normalized();
+        let row_start = start.y as usize;
+        let row_end = end.y.saturating_add(1) as usize;
+        let map_width = width.clamp(1, usize::from(u16::MAX)) as u16;
+        let rows = self.selection_rows_in_range(width, row_start..row_end);
+        let mut map = SelectionMap::new(Rect::new(origin_x, 0, map_width, 0), u32::MAX, 0);
+
+        for (index, row) in rows {
+            map.push_line(SelectionRow::new(
+                origin_x,
+                index as u32,
+                None,
+                map_width,
+                SelectionRowContent::new(
+                    row.text_width.min(map_width),
+                    row.text,
+                    row.copy_separator,
+                    row.cells,
+                ),
+            ));
+        }
+
+        map.copy_selection(selection)
     }
 
     pub fn visual_lines(&self, width: usize) -> Vec<String> {
@@ -324,6 +377,14 @@ fn next_viewport_top(previous_top: usize, cursor_row: usize, height: u16) -> usi
         cursor_row + 1 - height
     } else {
         previous_top
+    }
+}
+
+fn apply_scroll_delta(position: usize, delta: i16) -> usize {
+    if delta >= 0 {
+        position.saturating_add(delta as usize)
+    } else {
+        position.saturating_sub((-delta) as usize)
     }
 }
 
@@ -544,22 +605,25 @@ impl InputBoxLayout {
         );
 
         let content_area = self.content_area(area);
-        let rows = input.selection_rows(self.content_width);
+        let total_rows = input.visual_row_count(self.content_width);
         let mut map = SelectionMap::new(
             content_area,
             self.viewport_top_row as u32,
-            rows.len() as u32,
+            total_rows as u32,
         );
         if content_area.is_empty() {
             return map;
         }
 
-        for (index, row) in rows.into_iter().enumerate() {
+        let visible_start = self.viewport_top_row;
+        let visible_end = visible_start.saturating_add(usize::from(content_area.height));
+        let rows = input.selection_rows_in_range(self.content_width, visible_start..visible_end);
+
+        for (index, row) in rows {
             let y = index as u32;
-            let screen_y = index
-                .checked_sub(self.viewport_top_row)
-                .filter(|visible_index| *visible_index < usize::from(content_area.height))
-                .map(|visible_index| content_area.y.saturating_add(visible_index as u16));
+            let screen_y = content_area
+                .y
+                .checked_add(index.saturating_sub(self.viewport_top_row) as u16);
             map.push_line(SelectionRow::new(
                 content_area.x,
                 y,
@@ -625,51 +689,91 @@ struct InputSelectionCell {
 }
 
 impl InputEditor {
-    fn selection_rows(&self, width: usize) -> Vec<InputSelectionRow> {
+    fn selection_rows_in_range(
+        &self,
+        width: usize,
+        range: Range<usize>,
+    ) -> Vec<(usize, InputSelectionRow)> {
         let width = width.max(1);
         let mut rows = Vec::new();
+        let mut row_index = 0;
         let mut row_start = 0;
         let mut col = 0;
         let mut cells = Vec::new();
+        let mut collecting = range.contains(&row_index);
 
         for (index, ch) in self.text.char_indices() {
             let end = index + ch.len_utf8();
 
             if ch == '\n' {
-                rows.push(InputSelectionRow::new(
+                push_selection_row(
+                    &mut rows,
+                    row_index,
+                    collecting,
                     &self.text[row_start..index],
                     CopySeparator::HardLine,
                     cells,
-                ));
+                );
+                row_index += 1;
+                if row_index >= range.end {
+                    return rows;
+                }
                 row_start = end;
                 col = 0;
                 cells = Vec::new();
+                collecting = range.contains(&row_index);
                 continue;
             }
 
             let next_col = next_display_col(&self.text, row_start, index, end, col);
             if col > 0 && next_col > width {
-                rows.push(InputSelectionRow::new(
+                push_selection_row(
+                    &mut rows,
+                    row_index,
+                    collecting,
                     &self.text[row_start..index],
                     CopySeparator::None,
                     cells,
-                ));
+                );
+                row_index += 1;
+                if row_index >= range.end {
+                    return rows;
+                }
                 row_start = index;
                 col = 0;
                 cells = Vec::new();
+                collecting = range.contains(&row_index);
             }
 
             let next_col = next_display_col(&self.text, row_start, index, end, col);
-            push_selection_cell(&mut cells, ch, col, next_col);
+            if collecting {
+                push_selection_cell(&mut cells, ch, col, next_col);
+            }
             col = next_col;
         }
 
-        rows.push(InputSelectionRow::new(
+        push_selection_row(
+            &mut rows,
+            row_index,
+            collecting,
             &self.text[row_start..],
             CopySeparator::None,
             cells,
-        ));
+        );
         rows
+    }
+}
+
+fn push_selection_row(
+    rows: &mut Vec<(usize, InputSelectionRow)>,
+    index: usize,
+    collecting: bool,
+    text: &str,
+    copy_separator: CopySeparator,
+    cells: Vec<InputSelectionCell>,
+) {
+    if collecting {
+        rows.push((index, InputSelectionRow::new(text, copy_separator, cells)));
     }
 }
 
@@ -911,6 +1015,73 @@ mod tests {
             [
                 "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19"
             ]
+        );
+    }
+
+    #[test]
+    fn selection_map_contains_only_visible_input_rows_for_large_content() {
+        let mut input = InputEditor::default();
+        let text = (0..1_000)
+            .map(|index| format!("{index:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        input.insert_str(&text);
+        let backend = TestBackend::new(8, 16);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_stateful_widget_ref(InputBox::new(), area, &mut input);
+            })
+            .expect("render input");
+
+        let input_box = InputBox::new();
+        let area = Rect::new(0, 0, 8, 16);
+        let layout = input_box.layout(&input, area.width);
+        let map = layout.selection_map(&input, area);
+
+        assert!(map.lines().len() <= usize::from(layout.content_height()));
+        assert!(map.lines().iter().all(|line| line.screen_y.is_some()));
+        assert!(map.lines().iter().all(|line| line.text != "000"));
+    }
+
+    #[test]
+    fn copy_selection_can_include_input_rows_outside_current_viewport() {
+        let mut input = InputEditor::default();
+        let text = (0..20)
+            .map(|index| format!("{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        input.insert_str(&text);
+        let backend = TestBackend::new(8, 16);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_stateful_widget_ref(InputBox::new(), area, &mut input);
+            })
+            .expect("render input");
+
+        let input_box = InputBox::new();
+        let area = Rect::new(0, 0, 8, 16);
+        let layout = input_box.layout(&input, area.width);
+        let map = layout.selection_map(&input, area);
+        let last = map
+            .lines()
+            .iter()
+            .find(|line| line.text == "19")
+            .expect("last line visible");
+        let selection = Selection::new(
+            TextPosition::new(last.x, 0),
+            TextPosition::new(last.end_x(), last.y),
+        );
+
+        assert!(map.lines().iter().all(|line| line.text != "00"));
+        assert_eq!(
+            input.copy_selection(layout.content_width(), last.x, selection),
+            text
         );
     }
 
