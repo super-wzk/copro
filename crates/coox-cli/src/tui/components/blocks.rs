@@ -17,14 +17,46 @@ pub const BLOCK_PADDING: Padding = Padding::new(1, 1, 1, 1);
 
 #[derive(Clone, Debug)]
 pub enum BlockSegment {
-    Line(Line<'static>),
+    Line(BlockLine),
     Image(ImageContent),
 }
 
+#[derive(Clone, Debug)]
+pub struct BlockLine {
+    line: Line<'static>,
+    trim: bool,
+}
+
+impl BlockLine {
+    pub fn new(line: Line<'static>) -> Self {
+        Self { line, trim: true }
+    }
+
+    pub fn preserve_whitespace(line: Line<'static>) -> Self {
+        Self { line, trim: false }
+    }
+
+    pub fn line(&self) -> &Line<'static> {
+        &self.line
+    }
+
+    pub fn trim(&self) -> bool {
+        self.trim
+    }
+}
+
 impl BlockSegment {
+    fn line(line: Line<'static>) -> Self {
+        Self::Line(BlockLine::new(line))
+    }
+
+    fn preformatted_line(line: Line<'static>) -> Self {
+        Self::Line(BlockLine::preserve_whitespace(line))
+    }
+
     pub fn into_line(self) -> Line<'static> {
         match self {
-            Self::Line(line) => line,
+            Self::Line(line) => line.line,
             Self::Image(image) => image_placeholder_line(&image),
         }
     }
@@ -73,7 +105,7 @@ fn render_assistant_items(items: &[AssistantItem]) -> Vec<BlockSegment> {
                         .styles(markdown_styles())
                         .lines()
                         .into_iter()
-                        .map(BlockSegment::Line),
+                        .map(BlockSegment::line),
                 );
             }
             AssistantItem::Image(image) => segments.push(BlockSegment::Image(image.clone())),
@@ -91,7 +123,7 @@ fn render_tool_segments(tool: &ToolBlockState) -> Vec<BlockSegment> {
         tool.name.as_str()
     };
 
-    segments.push(BlockSegment::Line(Line::from(Span::styled(
+    segments.push(BlockSegment::line(Line::from(Span::styled(
         name.to_string(),
         tool_header_text_style(),
     ))));
@@ -102,12 +134,15 @@ fn render_tool_segments(tool: &ToolBlockState) -> Vec<BlockSegment> {
 
     if let Some(result) = &tool.result {
         if segments.len() > 1 {
-            segments.push(BlockSegment::Line(Line::from(Span::styled(
+            segments.push(BlockSegment::line(Line::from(Span::styled(
                 "─".to_string(),
                 tool_divider_text_style(),
             ))));
         }
-        segments.extend(render_input_content(&result.content, Style::default()));
+        segments.extend(render_preformatted_input_content(
+            &result.content,
+            Style::default(),
+        ));
     }
 
     non_empty(segments)
@@ -128,7 +163,7 @@ fn render_input_content(content: &[InputContent], style: Style) -> Vec<BlockSegm
 
 fn render_text_segments(text: &str, style: Style) -> Vec<BlockSegment> {
     if text.is_empty() {
-        return vec![BlockSegment::Line(Line::from(Span::styled(
+        return vec![BlockSegment::line(Line::from(Span::styled(
             String::new(),
             style,
         )))];
@@ -136,7 +171,36 @@ fn render_text_segments(text: &str, style: Style) -> Vec<BlockSegment> {
 
     text.lines()
         .map(|line| Line::from(Span::styled(line.to_string(), style)))
-        .map(BlockSegment::Line)
+        .map(BlockSegment::line)
+        .collect()
+}
+
+fn render_preformatted_input_content(content: &[InputContent], style: Style) -> Vec<BlockSegment> {
+    let mut segments = Vec::new();
+
+    for item in content {
+        match item {
+            InputContent::Text(text) => {
+                segments.extend(render_preformatted_text_segments(text, style));
+            }
+            InputContent::Image(image) => segments.push(BlockSegment::Image(image.clone())),
+        }
+    }
+
+    non_empty(segments)
+}
+
+fn render_preformatted_text_segments(text: &str, style: Style) -> Vec<BlockSegment> {
+    if text.is_empty() {
+        return vec![BlockSegment::preformatted_line(Line::from(Span::styled(
+            String::new(),
+            style,
+        )))];
+    }
+
+    text.lines()
+        .map(|line| Line::from(Span::styled(line.to_string(), style)))
+        .map(BlockSegment::preformatted_line)
         .collect()
 }
 
@@ -162,6 +226,10 @@ fn apply_block_fold(block: &BlockState, segments: Vec<BlockSegment>) -> Vec<Bloc
         return segments;
     }
 
+    let preserve_whitespace = segments.iter().any(|segment| match segment {
+        BlockSegment::Line(line) => !line.trim(),
+        BlockSegment::Image(_) => false,
+    });
     let lines = segments
         .into_iter()
         .map(BlockSegment::into_line)
@@ -173,12 +241,21 @@ fn apply_block_fold(block: &BlockState, segments: Vec<BlockSegment>) -> Vec<Bloc
         ))
         .lines();
 
-    visible.into_iter().map(BlockSegment::Line).collect()
+    visible
+        .into_iter()
+        .map(|line| {
+            if preserve_whitespace {
+                BlockSegment::preformatted_line(line)
+            } else {
+                BlockSegment::line(line)
+            }
+        })
+        .collect()
 }
 
 fn non_empty(segments: Vec<BlockSegment>) -> Vec<BlockSegment> {
     if segments.is_empty() {
-        vec![BlockSegment::Line(Line::from(String::new()))]
+        vec![BlockSegment::line(Line::from(String::new()))]
     } else {
         segments
     }
@@ -379,6 +456,39 @@ mod tests {
         let text = render_text(&state.blocks()[0]);
 
         assert_eq!(text, vec!["bash", "{\"cmd\":\"pwd\"}", "─", "/tmp/project"]);
+    }
+
+    #[test]
+    fn read_tool_result_keeps_line_number_separator_visible() {
+        let mut state = AppState::default();
+        state.apply_delta(OutputContentDelta::ToolCall {
+            id: Some("call_1".to_string()),
+            name: Some("read".to_string()),
+            arguments: "{\"path\":\"Cargo.toml\"}".to_string(),
+        });
+        state.apply_tool_result(ToolResult {
+            call_id: ToolCallId::new("call_1"),
+            name: "read".to_string(),
+            status: ToolResultStatus::Success,
+            content: vec![InputContent::Text(
+                "Cargo.toml\n1: [workspace]\n2: members = [".to_string(),
+            )],
+        });
+
+        let text = render_text(&state.blocks()[0]);
+
+        assert_eq!(
+            text,
+            vec![
+                "read",
+                "{\"path\":\"Cargo.toml\"}",
+                "─",
+                "Cargo.toml",
+                "1: [workspace]",
+                "2: members = [",
+            ]
+        );
+        assert!(!text.iter().any(|line| line.contains('\t')));
     }
 
     fn render_text(block: &BlockState) -> Vec<String> {

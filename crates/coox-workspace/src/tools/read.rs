@@ -240,7 +240,7 @@ fn render_text(text: &str, input: &ReadInput, config: &ReadToolConfig) -> Result
 
 fn render_line(line_number: usize, width: usize, line: &str, line_numbers: bool) -> String {
     if line_numbers {
-        format!("{line_number:>width$}\t{line}")
+        format!("{line_number:>width$}: {line}")
     } else {
         line.to_string()
     }

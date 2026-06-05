@@ -15,7 +15,7 @@ async fn reads_text_file_with_line_numbers() {
     let result = execute_read(root, json!({ "path": "hello.txt" })).await;
 
     assert_eq!(result.status, ToolResultStatus::Success);
-    assert_eq!(tool_text(&result), "hello.txt\n1\thello\n2\tworld");
+    assert_eq!(tool_text(&result), "hello.txt\n1: hello\n2: world");
 }
 
 #[tokio::test]
@@ -32,7 +32,25 @@ async fn reads_text_file_with_offset_and_limit() {
     assert_eq!(result.status, ToolResultStatus::Success);
     assert_eq!(
         tool_text(&result),
-        "hello.txt\n2\ttwo\n3\tthree\n[truncated: reached line limit; continue with offset=4]"
+        "hello.txt\n2: two\n3: three\n[truncated: reached line limit; continue with offset=4]"
+    );
+}
+
+#[tokio::test]
+async fn aligns_line_number_gutter_to_widest_line_number() {
+    let root = memory_root().await;
+    let mut text = String::new();
+    for index in 1..=12 {
+        text.push_str(&format!("line {index}\n"));
+    }
+    write_file(&root, "numbered.txt", text.as_bytes()).await;
+
+    let result = execute_read(root, json!({ "path": "numbered.txt" })).await;
+
+    assert_eq!(result.status, ToolResultStatus::Success);
+    assert_eq!(
+        tool_text(&result),
+        "numbered.txt\n 1: line 1\n 2: line 2\n 3: line 3\n 4: line 4\n 5: line 5\n 6: line 6\n 7: line 7\n 8: line 8\n 9: line 9\n10: line 10\n11: line 11\n12: line 12"
     );
 }
 
@@ -50,8 +68,8 @@ async fn truncates_after_default_line_limit() {
     assert_eq!(result.status, ToolResultStatus::Success);
     let text = tool_text(&result);
     assert!(text.starts_with("large.txt\n"));
-    assert!(text.contains("   1\tline 1"));
-    assert!(text.contains("2000\tline 2000"));
+    assert!(text.contains("   1: line 1"));
+    assert!(text.contains("2000: line 2000"));
     assert!(text.ends_with("[truncated: reached line limit; continue with offset=2001]"));
 }
 
@@ -80,7 +98,7 @@ async fn respects_configured_line_limits() {
     assert_eq!(result.status, ToolResultStatus::Success);
     assert_eq!(
         tool_text(&result),
-        "hello.txt\n1\ta\n[truncated: reached line limit; continue with offset=2]"
+        "hello.txt\n1: a\n[truncated: reached line limit; continue with offset=2]"
     );
 }
 

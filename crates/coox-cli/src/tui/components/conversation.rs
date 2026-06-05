@@ -24,8 +24,8 @@ use coox_tui::{
 use copro_api::message::ImageContent;
 
 use crate::tui::components::blocks::{
-    BLOCK_PADDING, BlockSegment, block_container_style, image_placeholder_text, image_source,
-    render_block_segments,
+    BLOCK_PADDING, BlockLine, BlockSegment, block_container_style, image_placeholder_text,
+    image_source, render_block_segments,
 };
 use crate::tui::state::{AppState, BlockState};
 
@@ -175,6 +175,53 @@ struct PreparedBlock {
     height: u32,
 }
 
+#[derive(Clone, Debug)]
+struct TextLineGroup {
+    lines: Vec<Line<'static>>,
+    trim: bool,
+}
+
+impl Default for TextLineGroup {
+    fn default() -> Self {
+        Self {
+            lines: Vec::new(),
+            trim: true,
+        }
+    }
+}
+
+impl TextLineGroup {
+    fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    fn push(&mut self, line: &BlockLine) -> Option<Self> {
+        if self.lines.is_empty() {
+            self.trim = line.trim();
+            self.lines.push(line.line().clone());
+            return None;
+        }
+
+        if self.trim == line.trim() {
+            self.lines.push(line.line().clone());
+            return None;
+        }
+
+        let previous = std::mem::replace(
+            self,
+            Self {
+                lines: vec![line.line().clone()],
+                trim: line.trim(),
+            },
+        );
+        Some(previous)
+    }
+
+    fn take(&mut self) -> Self {
+        std::mem::take(self)
+    }
+}
+
 fn prepare_blocks<'a>(
     blocks: impl Iterator<Item = &'a BlockState>,
     width: u16,
@@ -183,7 +230,7 @@ fn prepare_blocks<'a>(
         .map(|block| {
             let segments = render_block_segments(block);
             let style = block_container_style(block);
-            let height = block_height(width, &segments, style);
+            let height = block_height(width, &segments);
             PreparedBlock {
                 segments,
                 style,
@@ -298,14 +345,25 @@ fn collect_block_selection_rows(
         source_end,
     };
     let mut virtual_y = u32::from(BLOCK_PADDING.top);
-    let mut line_group = Vec::new();
+    let mut line_group = TextLineGroup::default();
 
     for segment in &block.segments {
         match segment {
-            BlockSegment::Line(line) => line_group.push(line.clone()),
+            BlockSegment::Line(line) => {
+                if let Some(group) = line_group.push(line) {
+                    virtual_y = collect_line_group_selection_rows(
+                        group,
+                        block.style,
+                        block_top,
+                        virtual_y,
+                        clip,
+                        map,
+                    );
+                }
+            }
             BlockSegment::Image(image) => {
                 virtual_y = collect_line_group_selection_rows(
-                    std::mem::take(&mut line_group),
+                    line_group.take(),
                     block.style,
                     block_top,
                     virtual_y,
@@ -328,20 +386,20 @@ fn collect_block_selection_rows(
 }
 
 fn collect_line_group_selection_rows(
-    lines: Vec<Line<'static>>,
+    group: TextLineGroup,
     style: Style,
     block_top: u32,
     virtual_y: u32,
     clip: RenderClip,
     map: &mut SelectionMap,
 ) -> u32 {
-    if lines.is_empty() || clip.width == 0 {
+    if group.is_empty() || clip.width == 0 {
         return virtual_y;
     }
 
     let mut row = virtual_y;
-    for line in lines {
-        let line_height = line_height(clip.width, &line, style);
+    for line in group.lines {
+        let line_height = line_height(clip.width, &line, style, group.trim);
         let line_bottom = row.saturating_add(line_height);
         let global_top = block_top.saturating_add(row);
         let global_bottom = block_top.saturating_add(line_bottom);
@@ -358,7 +416,7 @@ fn collect_line_group_selection_rows(
             continue;
         }
 
-        let rendered_rows = rendered_line_selection_rows(&line, clip.width, style);
+        let rendered_rows = rendered_line_selection_rows(&line, clip.width, style, group.trim);
 
         for source_row in row..line_bottom {
             let row_index = source_row.saturating_sub(row) as usize;
@@ -447,11 +505,12 @@ fn rendered_line_selection_rows(
     line: &Line<'static>,
     width: u16,
     style: Style,
+    trim: bool,
 ) -> Vec<RenderedSelectionRow> {
-    let height = line_height(width, line, style);
+    let height = line_height(width, line, style, trim);
     let virtual_area = Rect::new(0, 0, width, u16_saturated(height));
     let mut virtual_buf = Buffer::empty(virtual_area);
-    text_paragraph(vec![line.clone()], style).render(virtual_area, &mut virtual_buf);
+    text_paragraph(vec![line.clone()], style, trim).render(virtual_area, &mut virtual_buf);
 
     let mut rows = (0..virtual_area.height)
         .map(|y| {
@@ -587,19 +646,17 @@ fn render_block_view(
         source_end,
     };
     let mut virtual_y = u32::from(BLOCK_PADDING.top);
-    let mut line_group = Vec::new();
+    let mut line_group = TextLineGroup::default();
 
     for segment in segments {
         match segment {
-            BlockSegment::Line(line) => line_group.push(line.clone()),
+            BlockSegment::Line(line) => {
+                if let Some(group) = line_group.push(line) {
+                    virtual_y = render_line_group_view(group, style, virtual_y, clip, buf);
+                }
+            }
             BlockSegment::Image(image) => {
-                virtual_y = render_line_group_view(
-                    std::mem::take(&mut line_group),
-                    style,
-                    virtual_y,
-                    clip,
-                    buf,
-                );
+                virtual_y = render_line_group_view(line_group.take(), style, virtual_y, clip, buf);
                 virtual_y = render_image_segment_view(
                     image,
                     image_renderer,
@@ -625,17 +682,17 @@ struct RenderClip {
 }
 
 fn render_line_group_view(
-    lines: Vec<Line<'static>>,
+    group: TextLineGroup,
     style: Style,
     virtual_y: u32,
     clip: RenderClip,
     buf: &mut Buffer,
 ) -> u32 {
-    if lines.is_empty() || clip.width == 0 {
+    if group.is_empty() || clip.width == 0 {
         return virtual_y;
     }
 
-    let height = text_height(clip.width, &lines, style);
+    let height = text_height(clip.width, &group);
     let virtual_bottom = virtual_y.saturating_add(height);
     if let Some((visible_top, visible_bottom)) = visible_range(
         virtual_y,
@@ -644,17 +701,18 @@ fn render_line_group_view(
         clip.source_end,
     ) {
         let (slice_top, visible_lines) = visible_text_lines(
-            &lines,
+            &group,
             clip.width,
             style,
             visible_top,
             visible_bottom,
             virtual_y,
         );
-        let slice_height = text_height(clip.width, &visible_lines, style);
+        let slice_height = text_height(clip.width, &visible_lines);
         let virtual_area = Rect::new(0, 0, clip.width, u16_saturated(slice_height));
         let mut virtual_buf = Buffer::empty(virtual_area);
-        text_paragraph(visible_lines, style).render(virtual_area, &mut virtual_buf);
+        text_paragraph(visible_lines.lines, style, visible_lines.trim)
+            .render(virtual_area, &mut virtual_buf);
 
         for source_row in visible_top..visible_bottom {
             let local_y = source_row.saturating_sub(slice_top);
@@ -672,23 +730,26 @@ fn render_line_group_view(
 }
 
 fn visible_text_lines(
-    lines: &[Line<'static>],
+    group: &TextLineGroup,
     width: u16,
     style: Style,
     visible_top: u32,
     visible_bottom: u32,
     group_top: u32,
-) -> (u32, Vec<Line<'static>>) {
+) -> (u32, TextLineGroup) {
     let mut row = group_top;
     let mut slice_top = None;
-    let mut visible = Vec::new();
+    let mut visible = TextLineGroup {
+        lines: Vec::new(),
+        trim: group.trim,
+    };
 
-    for line in lines {
-        let line_height = line_height(width, line, style);
+    for line in &group.lines {
+        let line_height = line_height(width, line, style, group.trim);
         let line_bottom = row.saturating_add(line_height);
         if line_bottom > visible_top && row < visible_bottom {
             slice_top.get_or_insert(row);
-            visible.push(line.clone());
+            visible.lines.push(line.clone());
         }
         if row >= visible_bottom {
             break;
@@ -739,47 +800,52 @@ fn visible_range(top: u32, bottom: u32, source_start: u32, source_end: u32) -> O
     (visible_top < visible_bottom).then_some((visible_top, visible_bottom))
 }
 
-fn block_height(width: u16, segments: &[BlockSegment], style: Style) -> u32 {
+fn block_height(width: u16, segments: &[BlockSegment]) -> u32 {
     let inner_width = width
         .saturating_sub(BLOCK_PADDING.left + BLOCK_PADDING.right)
         .max(1);
-    let content_height = content_height(inner_width, segments, style);
+    let content_height = content_height(inner_width, segments);
     content_height
         .saturating_add(u32::from(BLOCK_PADDING.top + BLOCK_PADDING.bottom))
         .max(u32::from(BLOCK_PADDING.top + BLOCK_PADDING.bottom))
 }
 
-fn content_height(width: u16, segments: &[BlockSegment], style: Style) -> u32 {
+fn content_height(width: u16, segments: &[BlockSegment]) -> u32 {
     let mut height = 0_u32;
-    let mut line_group = Vec::new();
+    let mut line_group = TextLineGroup::default();
 
     for segment in segments {
         match segment {
-            BlockSegment::Line(line) => line_group.push(line.clone()),
+            BlockSegment::Line(line) => {
+                if let Some(group) = line_group.push(line) {
+                    height = height.saturating_add(text_height(width, &group));
+                }
+            }
             BlockSegment::Image(_) => {
-                height = height.saturating_add(text_height(width, &line_group, style));
-                line_group.clear();
+                height = height.saturating_add(text_height(width, &line_group));
+                line_group = TextLineGroup::default();
                 height = height.saturating_add(u32::from(IMAGE_PREVIEW_HEIGHT));
             }
         }
     }
 
-    height.saturating_add(text_height(width, &line_group, style))
+    height.saturating_add(text_height(width, &line_group))
 }
 
-fn text_height(width: u16, lines: &[Line<'static>], style: Style) -> u32 {
-    if lines.is_empty() {
+fn text_height(width: u16, group: &TextLineGroup) -> u32 {
+    if group.is_empty() {
         return 0;
     }
 
-    lines
+    group
+        .lines
         .iter()
-        .map(|line| line_height(width, line, style))
+        .map(|line| line_height(width, line, Style::default(), group.trim))
         .sum()
 }
 
-fn line_height(width: u16, line: &Line<'static>, style: Style) -> u32 {
-    text_paragraph(vec![line.clone()], style)
+fn line_height(width: u16, line: &Line<'static>, style: Style, trim: bool) -> u32 {
+    text_paragraph(vec![line.clone()], style, trim)
         .line_count(width)
         .try_into()
         .unwrap_or(u32::MAX)
@@ -789,9 +855,9 @@ fn u16_saturated(value: u32) -> u16 {
     value.min(u32::from(u16::MAX)) as u16
 }
 
-fn text_paragraph(lines: Vec<Line<'static>>, style: Style) -> Paragraph<'static> {
+fn text_paragraph(lines: Vec<Line<'static>>, style: Style, trim: bool) -> Paragraph<'static> {
     let text = Text::from(lines).style(style);
-    Paragraph::new(text).style(style).wrap(Wrap { trim: true })
+    Paragraph::new(text).style(style).wrap(Wrap { trim })
 }
 
 fn symbol_width(symbol: &str) -> u16 {
@@ -864,6 +930,39 @@ mod tests {
         assert_eq!(lines[7], " rg");
         assert_eq!(lines[8], " {}");
         assert_eq!(lines[9], "");
+    }
+
+    #[test]
+    fn read_tool_result_preserves_leading_line_number_gutter() {
+        let mut state = AppState::default();
+        state.apply_delta(OutputContentDelta::ToolCall {
+            id: Some("call_1".to_string()),
+            name: Some("read".to_string()),
+            arguments: "{\"path\":\"Cargo.toml\"}".to_string(),
+        });
+        state.apply_tool_result(ToolResult {
+            call_id: ToolCallId::new("call_1"),
+            name: "read".to_string(),
+            status: ToolResultStatus::Success,
+            content: vec![InputContent::Text(
+                "Cargo.toml\n 1: [workspace]\n 2: members = [\n10:     \"crates/coox-tui\","
+                    .to_string(),
+            )],
+        });
+
+        let backend = TestBackend::new(48, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        render_conversation(&mut terminal, &state, &ImageRenderer::halfblocks(), 0, None);
+
+        let lines = buffer_lines(terminal.backend().buffer());
+        assert!(lines.iter().any(|line| line == "  1: [workspace]"));
+        assert!(lines.iter().any(|line| line == "  2: members = ["));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == " 10:     \"crates/coox-tui\",")
+        );
     }
 
     #[test]

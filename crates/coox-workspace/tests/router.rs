@@ -75,9 +75,9 @@ async fn router_root_can_be_workspace_cwd_inside_larger_filesystem() {
         .unwrap();
 
     assert_eq!(relative.status, ToolResultStatus::Success);
-    assert_eq!(tool_text(&relative), "src/main.rs\n1\tworkspace");
+    assert_eq!(tool_text(&relative), "src/main.rs\n1: workspace");
     assert_eq!(absolute.status, ToolResultStatus::Success);
-    assert_eq!(tool_text(&absolute), "/outside.txt\n1\toutside");
+    assert_eq!(tool_text(&absolute), "/outside.txt\n1: outside");
 }
 
 #[tokio::test]
