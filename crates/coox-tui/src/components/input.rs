@@ -17,6 +17,9 @@ const MAX_INPUT_ROWS: usize = 14;
 pub struct InputEditor {
     textarea: TextArea<'static>,
     text: String,
+    cursor_byte: usize,
+    textarea_dirty: bool,
+    viewport_top_row: usize,
     cursor_visual_hint: Option<CursorVisualHint>,
 }
 
@@ -25,6 +28,9 @@ impl Default for InputEditor {
         Self {
             textarea: configured_textarea(),
             text: String::new(),
+            cursor_byte: 0,
+            textarea_dirty: false,
+            viewport_top_row: 0,
             cursor_visual_hint: None,
         }
     }
@@ -36,7 +42,7 @@ impl InputEditor {
     }
 
     pub fn cursor(&self) -> usize {
-        self.cursor_byte()
+        self.cursor_byte
     }
 
     pub fn cursor_visual_position(&self, width: usize) -> (usize, usize) {
@@ -47,38 +53,55 @@ impl InputEditor {
     }
 
     pub fn insert_char(&mut self, ch: char) {
-        self.textarea.insert_char(ch);
-        self.sync_text();
+        let inserted = if ch == '\r' { '\n' } else { ch };
+        self.text.insert(self.cursor_byte, inserted);
+        self.cursor_byte += inserted.len_utf8();
+        self.textarea_dirty = true;
         self.cursor_visual_hint = None;
     }
 
     pub fn insert_str(&mut self, text: &str) {
-        if self.textarea.insert_str(text) {
-            self.sync_text();
-            self.cursor_visual_hint = None;
+        let inserted = normalize_textarea_insert(text);
+        if inserted.is_empty() {
+            return;
         }
+
+        self.text.insert_str(self.cursor_byte, &inserted);
+        self.cursor_byte += inserted.len();
+        self.textarea_dirty = true;
+        self.cursor_visual_hint = None;
     }
 
     pub fn insert_newline(&mut self) {
-        self.textarea.insert_newline();
-        self.sync_text();
+        self.text.insert(self.cursor_byte, '\n');
+        self.cursor_byte += 1;
+        self.textarea_dirty = true;
         self.cursor_visual_hint = None;
     }
 
     pub fn backspace(&mut self) {
-        if self.textarea.delete_char() {
-            self.sync_text();
-            self.cursor_visual_hint = None;
-        }
+        let Some((previous_cursor, _)) = self.text[..self.cursor_byte].char_indices().next_back()
+        else {
+            return;
+        };
+
+        self.text.drain(previous_cursor..self.cursor_byte);
+        self.cursor_byte = previous_cursor;
+        self.textarea_dirty = true;
+        self.cursor_visual_hint = None;
     }
 
     pub fn move_left(&mut self) {
+        self.sync_textarea();
         self.textarea.move_cursor(CursorMove::Back);
+        self.sync_cursor_byte();
         self.cursor_visual_hint = None;
     }
 
     pub fn move_right(&mut self) {
+        self.sync_textarea();
         self.textarea.move_cursor(CursorMove::Forward);
+        self.sync_cursor_byte();
         self.cursor_visual_hint = None;
     }
 
@@ -93,6 +116,7 @@ impl InputEditor {
     fn move_vertical(&mut self, width: usize, direction: CursorMove) {
         self.prepare_screen_map(width);
         self.textarea.move_cursor(direction);
+        self.sync_cursor_byte();
         self.cursor_visual_hint = Some(CursorVisualHint::new(
             width,
             self.textarea.screen_cursor().row,
@@ -106,6 +130,9 @@ impl InputEditor {
 
         let submission = std::mem::take(&mut self.text);
         self.textarea = configured_textarea();
+        self.cursor_byte = 0;
+        self.textarea_dirty = false;
+        self.viewport_top_row = 0;
         self.cursor_visual_hint = None;
         Some(submission)
     }
@@ -163,7 +190,7 @@ impl InputEditor {
                 continue;
             }
 
-            let next_col = display_width(&self.text[row_start..end]);
+            let next_col = next_display_col(&self.text, row_start, index, end, col);
             if col > 0 && next_col > width {
                 row += 1;
                 row_start = index;
@@ -175,7 +202,7 @@ impl InputEditor {
                 });
             }
 
-            col = display_width(&self.text[row_start..end]);
+            col = next_display_col(&self.text, row_start, index, end, col);
             positions.push(VisualPosition {
                 byte: end,
                 row,
@@ -187,7 +214,7 @@ impl InputEditor {
     }
 
     fn position_for_cursor(&self, positions: &[VisualPosition], width: usize) -> VisualPosition {
-        let cursor = self.cursor_byte();
+        let cursor = self.cursor_byte;
         if let Some(position) = self.cursor_visual_hint.and_then(|hint| {
             (hint.width == width.max(1)).then(|| {
                 positions
@@ -213,16 +240,29 @@ impl InputEditor {
             .unwrap_or_default()
     }
 
-    fn sync_text(&mut self) {
-        self.text = self.textarea.lines().join("\n");
+    fn sync_cursor_byte(&mut self) {
+        let DataCursor(row, col) = self.textarea.cursor();
+        self.cursor_byte = byte_for_data_cursor(&self.text, (row, col));
     }
 
-    fn cursor_byte(&self) -> usize {
-        let DataCursor(row, col) = self.textarea.cursor();
-        byte_for_data_cursor(&self.text, (row, col))
+    fn sync_textarea(&mut self) {
+        if !self.textarea_dirty {
+            return;
+        }
+
+        self.textarea = configured_textarea_from_lines(
+            self.text
+                .split('\n')
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        );
+        let (row, col) = data_cursor_for_byte(&self.text, self.cursor_byte);
+        self.textarea.move_cursor(CursorMove::Jump(row, col));
+        self.textarea_dirty = false;
     }
 
     fn prepare_render(&mut self, style: Style, padding: Padding) {
+        self.sync_textarea();
         self.textarea.set_style(style);
         self.textarea
             .set_block(Block::new().style(style).padding(padding));
@@ -233,6 +273,7 @@ impl InputEditor {
     }
 
     fn prepare_screen_map(&mut self, width: usize) {
+        self.sync_textarea();
         let width = width.clamp(1, usize::from(u16::MAX)) as u16;
         let area = Rect::new(0, 0, width, MAX_INPUT_ROWS as u16);
         let mut buffer = Buffer::empty(area);
@@ -240,15 +281,50 @@ impl InputEditor {
         self.textarea.remove_block();
         self.textarea.set_wrap_mode(WrapMode::Glyph);
         (&self.textarea).render(area, &mut buffer);
+        self.viewport_top_row = next_viewport_top(
+            self.viewport_top_row,
+            self.textarea.screen_cursor().row,
+            area.height,
+        );
     }
 }
 
 fn configured_textarea() -> TextArea<'static> {
-    let mut textarea = TextArea::default();
+    configured_textarea_from_lines(vec![String::new()])
+}
+
+fn configured_textarea_from_lines(lines: Vec<String>) -> TextArea<'static> {
+    let mut textarea = TextArea::new(lines);
     textarea.set_wrap_mode(WrapMode::Glyph);
     textarea.set_cursor_line_style(Style::default());
     textarea.set_cursor_style(Style::default());
     textarea
+}
+
+fn normalize_textarea_insert(text: &str) -> String {
+    text.split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn next_display_col(text: &str, row_start: usize, index: usize, end: usize, col: usize) -> usize {
+    if text[index..end].is_ascii() {
+        col + display_width(&text[index..end])
+    } else {
+        display_width(&text[row_start..end])
+    }
+}
+
+fn next_viewport_top(previous_top: usize, cursor_row: usize, height: u16) -> usize {
+    let height = usize::from(height).max(1);
+    if cursor_row < previous_top {
+        cursor_row
+    } else if previous_top + height <= cursor_row {
+        cursor_row + 1 - height
+    } else {
+        previous_top
+    }
 }
 
 fn byte_for_data_cursor(text: &str, cursor: (usize, usize)) -> usize {
@@ -270,6 +346,29 @@ fn byte_for_data_cursor(text: &str, cursor: (usize, usize)) -> usize {
     }
 
     text.len()
+}
+
+fn data_cursor_for_byte(text: &str, byte: usize) -> (u16, u16) {
+    let mut row = 0usize;
+    let mut col = 0usize;
+
+    for (index, ch) in text.char_indices() {
+        if index >= byte {
+            break;
+        }
+
+        if ch == '\n' {
+            row += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+
+    (
+        row.min(usize::from(u16::MAX)) as u16,
+        col.min(usize::from(u16::MAX)) as u16,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,6 +425,10 @@ impl InputBox {
     pub fn layout(&self, input: &InputEditor, area_width: u16) -> InputBoxLayout {
         InputBoxLayout::new(self.padding, input, area_width)
     }
+
+    pub fn content_width(&self, area_width: u16) -> usize {
+        InputBoxLayout::measure_content_width(self.padding, area_width)
+    }
 }
 
 impl Default for InputBox {
@@ -347,6 +450,7 @@ impl StatefulWidgetRef for InputBox {
         }
 
         let layout = self.layout(input, area.width);
+        input.viewport_top_row = layout.viewport_top_row;
         input.prepare_render(self.style, self.padding);
         (&input.textarea).render(area, buf);
 
@@ -363,7 +467,9 @@ pub struct InputBoxLayout {
     padding: Padding,
     area_width: u16,
     content_width: usize,
+    content_height: u16,
     render_height: u16,
+    viewport_top_row: usize,
     cursor_row: usize,
     cursor_col: usize,
 }
@@ -372,14 +478,20 @@ impl InputBoxLayout {
     fn new(padding: Padding, input: &InputEditor, area_width: u16) -> Self {
         let content_width = Self::measure_content_width(padding, area_width);
         let render_height = Self::measure_render_height(padding, input, content_width);
+        let content_height =
+            render_height.saturating_sub(padding.top.saturating_add(padding.bottom));
         let (cursor_row, cursor_col) = input.cursor_visual_position(content_width);
+        let viewport_top_row =
+            next_viewport_top(input.viewport_top_row, cursor_row, content_height);
 
         Self {
             padding,
             area_width,
             content_width,
+            content_height,
             render_height,
-            cursor_row,
+            viewport_top_row,
+            cursor_row: cursor_row.saturating_sub(viewport_top_row),
             cursor_col,
         }
     }
@@ -394,6 +506,10 @@ impl InputBoxLayout {
 
     pub const fn render_height(self) -> u16 {
         self.render_height
+    }
+
+    pub const fn content_height(self) -> u16 {
+        self.content_height
     }
 
     pub fn cursor_position(self, area: Rect) -> Option<Position> {
@@ -525,7 +641,7 @@ impl InputEditor {
                 continue;
             }
 
-            let next_col = display_width(&self.text[row_start..end]);
+            let next_col = next_display_col(&self.text, row_start, index, end, col);
             if col > 0 && next_col > width {
                 rows.push(InputSelectionRow::new(
                     &self.text[row_start..index],
@@ -537,7 +653,7 @@ impl InputEditor {
                 cells = Vec::new();
             }
 
-            let next_col = display_width(&self.text[row_start..end]);
+            let next_col = next_display_col(&self.text, row_start, index, end, col);
             push_selection_cell(&mut cells, ch, col, next_col);
             col = next_col;
         }
@@ -604,6 +720,7 @@ mod tests {
         let input_box = InputBox::new();
         let layout = input_box.layout(&input, 6);
 
+        assert_eq!(input_box.content_width(6), 4);
         assert_eq!(layout.area_width(), 6);
         assert_eq!(layout.content_width(), 4);
         assert_eq!(layout.render_height(), 4);
@@ -714,6 +831,44 @@ mod tests {
         terminal
             .backend_mut()
             .assert_cursor_position(Position::new(3, 1));
+    }
+
+    #[test]
+    fn cursor_position_tracks_scrolled_textarea_viewport() {
+        let mut input = InputEditor::default();
+        let text = (0..20)
+            .map(|index| format!("{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        input.insert_str(&text);
+        let backend = TestBackend::new(8, 16);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let input_box = InputBox::new();
+                let layout = input_box.layout(&input, area.width);
+                frame.render_stateful_widget_ref(input_box, area, &mut input);
+                frame.set_cursor_position(layout.cursor_position(area).expect("cursor"));
+            })
+            .expect("render initial input");
+
+        input.move_up(6);
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let input_box = InputBox::new();
+                let layout = input_box.layout(&input, area.width);
+                frame.render_stateful_widget_ref(input_box, area, &mut input);
+                frame.set_cursor_position(layout.cursor_position(area).expect("cursor"));
+            })
+            .expect("render moved input");
+
+        terminal
+            .backend_mut()
+            .assert_cursor_position(Position::new(3, 13));
     }
 
     #[test]

@@ -48,6 +48,7 @@ const MOUSE_SCROLL_ROWS: u32 = 3;
 const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
 const IDLE_INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 const IMAGE_INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(16);
+const MAX_EVENT_BURST: usize = 4096;
 
 #[derive(Debug)]
 pub struct App {
@@ -204,10 +205,16 @@ pub async fn run(tui: &mut Tui, app: &mut App) -> io::Result<()> {
         }
 
         if event::poll(poll_timeout)? {
-            let area = tui.terminal.size()?;
             let input_box = input_box();
-            let input_layout = input_box.layout(&app.input, area.width);
-            handle_event(app, event::read()?, input_layout.content_width());
+            for _ in 0..MAX_EVENT_BURST {
+                let area = tui.terminal.size()?;
+                let input_width = input_box.content_width(area.width);
+                handle_event(app, event::read()?, input_width);
+
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
+            }
         }
 
         tokio::task::yield_now().await;
