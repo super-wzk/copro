@@ -25,8 +25,8 @@ pub const GREP_TOOL_NAME: &str = "grep";
 const GREP_TOOL_DESCRIPTION: &str = concat!(
     "Search workspace files with ripgrep regex. Supports glob/type filters, ",
     "content/files_with_matches/count output modes, context lines, and multiline ",
-    "matching. Set include_ignored to true to include .gitignored files. VCS directories ",
-    "are always skipped."
+    "matching. Respects .gitignore rules and always skips VCS directories. Use bash ",
+    "with rg options for explicit ignored-file scans."
 );
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,9 +144,6 @@ pub struct GrepInput {
     /// Enable multiline matching like `rg -U --multiline-dotall`.
     #[serde(default)]
     pub multiline: bool,
-    /// Include files ignored by .gitignore rules. VCS directories are always skipped.
-    #[serde(default)]
-    pub include_ignored: bool,
 }
 
 #[async_trait]
@@ -188,7 +185,6 @@ impl Tool for GrepTool {
             filter: &filter,
             options: &search_options,
             mode: input.output_mode,
-            include_ignored: input.include_ignored,
             cancel,
         };
 
@@ -402,7 +398,6 @@ struct SearchPlan<'a> {
     filter: &'a GrepFilter,
     options: &'a SearchOptions,
     mode: GrepOutputMode,
-    include_ignored: bool,
     cancel: CancellationToken,
 }
 
@@ -424,13 +419,9 @@ async fn search_vfs(
 
     let metadata = start.metadata().await.map_err(|error| error.to_string())?;
     let is_dir = metadata.file_type == VfsFileType::Directory;
-    let inherited_gitignores = if plan.include_ignored {
-        Vec::new()
-    } else {
-        load_ancestor_gitignores(root, &start).await?
-    };
+    let inherited_gitignores = load_ancestor_gitignores(root, &start).await?;
 
-    if !plan.include_ignored && gitignore_is_ignored(&inherited_gitignores, &start, is_dir) {
+    if gitignore_is_ignored(&inherited_gitignores, &start, is_dir) {
         return Ok(());
     }
 
@@ -519,9 +510,7 @@ async fn collect_candidate_files(
             return Err("grep cancelled".to_string());
         }
 
-        if !plan.include_ignored
-            && let Some(matcher) = load_gitignore_in_dir(&path).await?
-        {
+        if let Some(matcher) = load_gitignore_in_dir(&path).await? {
             gitignores.push(matcher);
         }
 
@@ -532,8 +521,7 @@ async fn collect_candidate_files(
             match metadata.file_type {
                 VfsFileType::File => {
                     if !is_under_vcs_dir(&entry_path)
-                        && (plan.include_ignored
-                            || !gitignore_is_ignored(&gitignores, &entry_path, false))
+                        && !gitignore_is_ignored(&gitignores, &entry_path, false)
                         && plan.filter.matches(plan.root, &entry_path)
                     {
                         candidates.push(CandidateFile::new(plan.root, entry_path, &metadata));
@@ -541,8 +529,7 @@ async fn collect_candidate_files(
                 }
                 VfsFileType::Directory => {
                     if !is_vcs_dir(&entry_path)
-                        && (plan.include_ignored
-                            || !gitignore_is_ignored(&gitignores, &entry_path, true))
+                        && !gitignore_is_ignored(&gitignores, &entry_path, true)
                     {
                         pending.push(PendingDir {
                             path: entry_path,

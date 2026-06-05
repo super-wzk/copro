@@ -20,8 +20,8 @@ pub const GLOB_TOOL_NAME: &str = "glob";
 
 const GLOB_TOOL_DESCRIPTION: &str = concat!(
     "Find files matching a glob pattern like **/*.js or src/**/*.ts. Matches file paths, ",
-    "not file contents — use grep for content search. Set include_ignored to true to include ",
-    ".gitignored files. VCS directories are always skipped."
+    "not file contents — use grep for content search. Respects .gitignore rules and always ",
+    "skips VCS directories. Use bash with rg options for explicit ignored-file scans."
 );
 
 #[derive(Clone)]
@@ -64,9 +64,6 @@ pub struct GlobInput {
     /// Skip the first N output lines.
     #[serde(default)]
     pub offset: Option<usize>,
-    /// Include files ignored by .gitignore rules. VCS directories are always skipped.
-    #[serde(default)]
-    pub include_ignored: bool,
 }
 
 #[async_trait]
@@ -102,7 +99,6 @@ impl Tool for GlobTool {
             search_path,
             &context,
             &filter,
-            input.include_ignored,
             &mut output,
             cancel,
         )
@@ -217,7 +213,6 @@ async fn search_vfs(
     input_path: &str,
     context: &ToolContext,
     filter: &GlobFilter,
-    include_ignored: bool,
     output: &mut OutputCollector,
     cancel: CancellationToken,
 ) -> Result<(), String> {
@@ -233,13 +228,9 @@ async fn search_vfs(
 
     let metadata = start.metadata().await.map_err(|error| error.to_string())?;
     let is_dir = metadata.file_type == VfsFileType::Directory;
-    let inherited_gitignores = if include_ignored {
-        Vec::new()
-    } else {
-        load_ancestor_gitignores(root, &start).await?
-    };
+    let inherited_gitignores = load_ancestor_gitignores(root, &start).await?;
 
-    if !include_ignored && gitignore_is_ignored(&inherited_gitignores, &start, is_dir) {
+    if gitignore_is_ignored(&inherited_gitignores, &start, is_dir) {
         return Ok(());
     }
 
@@ -261,7 +252,6 @@ async fn search_vfs(
                 root,
                 context,
                 filter,
-                include_ignored,
                 output,
                 cancel,
                 progress: &mut progress,
@@ -283,7 +273,6 @@ struct GlobDirectorySearch<'a> {
     root: &'a AsyncVfsPath,
     context: &'a ToolContext,
     filter: &'a GlobFilter,
-    include_ignored: bool,
     output: &'a mut OutputCollector,
     cancel: CancellationToken,
     progress: &'a mut GlobProgressState,
@@ -307,9 +296,7 @@ async fn search_directory(
         if search.cancel.is_cancelled() {
             return Err("glob cancelled".to_string());
         }
-        if !search.include_ignored
-            && let Some(matcher) = load_gitignore_in_dir(&path).await?
-        {
+        if let Some(matcher) = load_gitignore_in_dir(&path).await? {
             gitignores.push(matcher);
         }
         search.progress.searched_directories += 1;
@@ -321,8 +308,7 @@ async fn search_directory(
             match metadata.file_type {
                 VfsFileType::File => {
                     if !is_under_vcs_dir(&entry_path)
-                        && (search.include_ignored
-                            || !gitignore_is_ignored(&gitignores, &entry_path, false))
+                        && !gitignore_is_ignored(&gitignores, &entry_path, false)
                     {
                         search.progress.searched_files += 1;
                         if search.filter.matches(search.root, &entry_path) {
@@ -334,8 +320,7 @@ async fn search_directory(
                 }
                 VfsFileType::Directory => {
                     if !is_vcs_dir(&entry_path)
-                        && (search.include_ignored
-                            || !gitignore_is_ignored(&gitignores, &entry_path, true))
+                        && !gitignore_is_ignored(&gitignores, &entry_path, true)
                     {
                         pending.push_back(PendingDir {
                             path: entry_path,

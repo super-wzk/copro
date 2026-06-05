@@ -131,30 +131,6 @@ async fn respects_nested_gitignore_rules() {
 }
 
 #[tokio::test]
-async fn include_ignored_searches_gitignored_files() {
-    let root = memory_root().await;
-    write_file(&root, ".gitignore", b"ignored.txt\ntarget/\n").await;
-    write_file(&root, "visible.txt", b"needle\n").await;
-    write_file(&root, "ignored.txt", b"needle\n").await;
-    write_file(&root, "target/output.txt", b"needle\n").await;
-
-    let result = execute_grep(
-        root,
-        json!({
-            "pattern": "needle",
-            "include_ignored": true
-        }),
-    )
-    .await;
-
-    assert_eq!(result.status, ToolResultStatus::Success);
-    assert_eq!(
-        tool_text(&result),
-        "ignored.txt\ntarget/output.txt\nvisible.txt\n[sort: path order; modification time unavailable from VFS for matched files]"
-    );
-}
-
-#[tokio::test]
 async fn excludes_vcs_directories_by_default() {
     let root = memory_root().await;
     write_file(&root, ".git/config", b"needle\n").await;
