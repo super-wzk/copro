@@ -1,19 +1,64 @@
 use copro_agent::{
-    AgentEvent, AgentHistory, AgentOutcome, AgentTurnConfig, ToolRouter, start_turn,
+    AgentEvent, AgentHistory, AgentOutcome, AgentTurnConfig, AgentTurnHandle, AgentTurnState,
+    ToolRouter, start_turn,
 };
 use copro_api::message::InputMessage;
 use copro_api::stream::Model;
 use futures_util::StreamExt;
-use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::{error::Error as StdError, fmt};
 use tokio::sync::mpsc;
 
-#[derive(Debug, Default)]
 struct RuntimeState {
-    history: Option<AgentHistory>,
-    active: bool,
+    turn: RuntimeTurn,
 }
 
+#[derive(Default)]
+enum RuntimeTurn {
+    #[default]
+    Idle,
+    Ready {
+        history: AgentHistory,
+    },
+    Running {
+        handle: AgentTurnHandle,
+        abort_requested: bool,
+    },
+    PendingAck {
+        history: AgentHistory,
+    },
+    Failed {
+        history: AgentHistory,
+    },
+}
+
+impl fmt::Debug for RuntimeTurn {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Idle => formatter.write_str("Idle"),
+            Self::Ready { history } => formatter
+                .debug_struct("Ready")
+                .field("history", history)
+                .finish(),
+            Self::Running {
+                abort_requested, ..
+            } => formatter
+                .debug_struct("Running")
+                .field("abort_requested", abort_requested)
+                .finish(),
+            Self::PendingAck { history } => formatter
+                .debug_struct("PendingAck")
+                .field("history", history)
+                .finish(),
+            Self::Failed { history } => formatter
+                .debug_struct("Failed")
+                .field("history", history)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct AgentRuntime {
     state: Arc<Mutex<RuntimeState>>,
     config: AgentTurnConfig,
@@ -25,9 +70,8 @@ impl fmt::Debug for AgentRuntime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = self.state.lock().map_err(|_| fmt::Error)?;
         f.debug_struct("AgentRuntime")
-            .field("history", &state.history)
+            .field("turn", &state.turn)
             .field("config", &self.config)
-            .field("active", &state.active)
             .finish_non_exhaustive()
     }
 }
@@ -48,12 +92,53 @@ pub enum RuntimeEvent {
         history: AgentHistory,
         message: String,
     },
+    ControlFailed {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitError {
     Busy,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeTurnSnapshot {
+    Idle,
+    Running,
+    Paused,
+    Preempting,
+    PendingAck,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeBusy;
+
+impl fmt::Display for RuntimeBusy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("runtime is busy")
+    }
+}
+
+impl StdError for RuntimeBusy {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeControlError {
+    NoActiveTurn,
+    Agent(String),
+}
+
+impl fmt::Display for RuntimeControlError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoActiveTurn => formatter.write_str("no active turn"),
+            Self::Agent(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl StdError for RuntimeControlError {}
 
 impl AgentRuntime {
     pub fn new(config: AgentTurnConfig, model: Arc<dyn Model>, tools: Arc<dyn ToolRouter>) -> Self {
@@ -68,8 +153,7 @@ impl AgentRuntime {
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(RuntimeState {
-                history: Some(history),
-                active: false,
+                turn: RuntimeTurn::Ready { history },
             })),
             config,
             model,
@@ -78,18 +162,59 @@ impl AgentRuntime {
     }
 
     pub fn is_busy(&self) -> bool {
-        self.state
-            .lock()
-            .expect("runtime state mutex poisoned")
-            .active
+        !matches!(
+            self.state
+                .lock()
+                .expect("runtime state mutex poisoned")
+                .turn,
+            RuntimeTurn::Idle | RuntimeTurn::Ready { .. }
+        )
     }
 
     pub fn history(&self) -> Option<AgentHistory> {
-        self.state
+        match &self
+            .state
             .lock()
             .expect("runtime state mutex poisoned")
-            .history
-            .clone()
+            .turn
+        {
+            RuntimeTurn::Ready { history }
+            | RuntimeTurn::PendingAck { history }
+            | RuntimeTurn::Failed { history } => Some(history.clone()),
+            RuntimeTurn::Idle | RuntimeTurn::Running { .. } => None,
+        }
+    }
+
+    pub fn config(&self) -> AgentTurnConfig {
+        self.config.clone()
+    }
+
+    pub fn turn_snapshot(&self) -> RuntimeTurnSnapshot {
+        let state = self.state.lock().expect("runtime state mutex poisoned");
+        match &state.turn {
+            RuntimeTurn::Idle | RuntimeTurn::Ready { .. } => RuntimeTurnSnapshot::Idle,
+            RuntimeTurn::Running { .. } => RuntimeTurnSnapshot::Running,
+            RuntimeTurn::PendingAck { .. } => RuntimeTurnSnapshot::PendingAck,
+            RuntimeTurn::Failed { .. } => RuntimeTurnSnapshot::Failed,
+        }
+    }
+
+    pub fn reset_history(&mut self, seed: AgentHistory) -> Result<(), RuntimeBusy> {
+        let mut state = self.state.lock().expect("runtime state mutex poisoned");
+        if matches!(state.turn, RuntimeTurn::Idle | RuntimeTurn::Ready { .. }) {
+            state.turn = RuntimeTurn::Ready { history: seed };
+            Ok(())
+        } else {
+            Err(RuntimeBusy)
+        }
+    }
+
+    pub fn set_config(&mut self, config: AgentTurnConfig) {
+        self.config = config;
+    }
+
+    pub fn set_model(&mut self, model: Arc<dyn Model>) {
+        self.model = model;
     }
 
     /// Starts an agent turn in a background task on the current Tokio runtime.
@@ -102,23 +227,27 @@ impl AgentRuntime {
         events: mpsc::UnboundedSender<RuntimeEvent>,
     ) -> Result<(), SubmitError> {
         let mut state = self.state.lock().expect("runtime state mutex poisoned");
-        if state.active {
+        let RuntimeTurn::Ready { history } = &state.turn else {
             return Err(SubmitError::Busy);
-        }
+        };
 
-        let mut history = state.history.take().unwrap_or_default();
+        let mut history = history.clone();
         let rollback = history.clone();
         history.push_input(input);
-        state.active = true;
-        drop(state);
-
         let config = self.config.clone();
         let model = Arc::clone(&self.model);
         let tools = Arc::clone(&self.tools);
+        let turn = start_turn(history, config, model, tools);
+        state.turn = RuntimeTurn::Running {
+            handle: turn.clone(),
+            abort_requested: false,
+        };
+        drop(state);
+
         let state = Arc::clone(&self.state);
 
         tokio::spawn(async move {
-            drive_turn(history, config, model, tools, rollback, events, state).await;
+            drive_turn(turn, rollback, events, state).await;
         });
 
         Ok(())
@@ -131,24 +260,79 @@ impl AgentRuntime {
     pub fn finish_failure(&mut self, history: AgentHistory) {
         complete_failure(&self.state, history);
     }
+
+    pub async fn abort_active(&self) -> Result<(), RuntimeControlError> {
+        let handle = self.active_handle(true)?;
+        if matches!(handle.state().await, Ok(AgentTurnState::Paused { .. })) {
+            handle
+                .resume()
+                .await
+                .map_err(|error| RuntimeControlError::Agent(error.to_string()))?;
+        }
+        handle
+            .preempt()
+            .await
+            .map_err(|error| RuntimeControlError::Agent(error.to_string()))
+    }
+
+    pub async fn pause_active(&self) -> Result<(), RuntimeControlError> {
+        self.active_handle(false)?
+            .pause()
+            .await
+            .map_err(|error| RuntimeControlError::Agent(error.to_string()))
+    }
+
+    pub async fn resume_active(&self) -> Result<(), RuntimeControlError> {
+        let handle = self.active_handle(false)?;
+        match handle.state().await {
+            Ok(AgentTurnState::Paused { .. }) => {}
+            Ok(_) => {
+                return Err(RuntimeControlError::Agent("turn is not paused".to_string()));
+            }
+            Err(error) => return Err(RuntimeControlError::Agent(error.to_string())),
+        }
+
+        handle
+            .resume()
+            .await
+            .map_err(|error| RuntimeControlError::Agent(error.to_string()))
+    }
+
+    fn active_handle(&self, mark_abort: bool) -> Result<AgentTurnHandle, RuntimeControlError> {
+        let mut state = self.state.lock().expect("runtime state mutex poisoned");
+        match &mut state.turn {
+            RuntimeTurn::Running {
+                handle,
+                abort_requested,
+            } => {
+                if mark_abort {
+                    *abort_requested = true;
+                }
+                Ok(handle.clone())
+            }
+            RuntimeTurn::Idle
+            | RuntimeTurn::Ready { .. }
+            | RuntimeTurn::PendingAck { .. }
+            | RuntimeTurn::Failed { .. } => Err(RuntimeControlError::NoActiveTurn),
+        }
+    }
 }
 
 async fn drive_turn(
-    history: AgentHistory,
-    config: AgentTurnConfig,
-    model: Arc<dyn Model>,
-    tools: Arc<dyn ToolRouter>,
+    turn: AgentTurnHandle,
     rollback: AgentHistory,
     events: mpsc::UnboundedSender<RuntimeEvent>,
     state: Arc<Mutex<RuntimeState>>,
 ) {
-    let turn = start_turn(history, config, model, tools);
-
     loop {
         let point = match turn.step_until_control().await {
             Ok(point) => point,
             Err(error) => {
-                fail_turn(&state, &events, &rollback, error.to_string());
+                if abort_requested(&state) {
+                    complete_intentional_abort(turn, &state, &events).await;
+                } else {
+                    fail_turn(&state, &events, &rollback, error.to_string());
+                }
                 return;
             }
         };
@@ -159,7 +343,11 @@ async fn drive_turn(
 
         let finished = matches!(point.pending_outcome(), AgentOutcome::TurnFinished);
         if let Err(error) = point.continue_turn().await {
-            fail_turn(&state, &events, &rollback, error.to_string());
+            if abort_requested(&state) {
+                complete_intentional_abort(turn, &state, &events).await;
+            } else {
+                fail_turn(&state, &events, &rollback, error.to_string());
+            }
             return;
         }
 
@@ -192,6 +380,41 @@ async fn drive_turn(
     }
 }
 
+async fn complete_intentional_abort(
+    turn: AgentTurnHandle,
+    state: &Arc<Mutex<RuntimeState>>,
+    events: &mpsc::UnboundedSender<RuntimeEvent>,
+) {
+    let mut stream = turn.clone().events();
+    while let Some(event) = stream.next().await {
+        if let Ok(event) = event {
+            let _ = events.send(RuntimeEvent::Agent(event));
+        }
+    }
+
+    let history = turn.into_history().await;
+    complete_pending_ack(state, history.clone());
+    if events
+        .send(RuntimeEvent::TurnFinished {
+            history: history.clone(),
+        })
+        .is_err()
+    {
+        complete_success(state, history);
+    }
+}
+
+fn abort_requested(state: &Arc<Mutex<RuntimeState>>) -> bool {
+    let state = state.lock().expect("runtime state mutex poisoned");
+    matches!(
+        state.turn,
+        RuntimeTurn::Running {
+            abort_requested: true,
+            ..
+        }
+    )
+}
+
 fn fail_turn(
     state: &Arc<Mutex<RuntimeState>>,
     events: &mpsc::UnboundedSender<RuntimeEvent>,
@@ -199,7 +422,7 @@ fn fail_turn(
     message: String,
 ) {
     let history = history.clone();
-    complete_pending_ack(state, history.clone());
+    complete_pending_failure(state, history.clone());
     if events
         .send(RuntimeEvent::TurnFailed {
             history: history.clone(),
@@ -213,20 +436,22 @@ fn fail_turn(
 
 fn complete_pending_ack(state: &Arc<Mutex<RuntimeState>>, history: AgentHistory) {
     let mut state = state.lock().expect("runtime state mutex poisoned");
-    state.history = Some(history);
-    state.active = true;
+    state.turn = RuntimeTurn::PendingAck { history };
+}
+
+fn complete_pending_failure(state: &Arc<Mutex<RuntimeState>>, history: AgentHistory) {
+    let mut state = state.lock().expect("runtime state mutex poisoned");
+    state.turn = RuntimeTurn::Failed { history };
 }
 
 fn complete_success(state: &Arc<Mutex<RuntimeState>>, history: AgentHistory) {
     let mut state = state.lock().expect("runtime state mutex poisoned");
-    state.history = Some(history);
-    state.active = false;
+    state.turn = RuntimeTurn::Ready { history };
 }
 
 fn complete_failure(state: &Arc<Mutex<RuntimeState>>, history: AgentHistory) {
     let mut state = state.lock().expect("runtime state mutex poisoned");
-    state.history = Some(history);
-    state.active = false;
+    state.turn = RuntimeTurn::Ready { history };
 }
 
 #[cfg(test)]

@@ -30,14 +30,18 @@ async fn main() -> io::Result<()> {
             workspace_context.current_workspace, workspace_context.filesystem_root,
         ),
     )])]);
-    let runtime =
-        AgentRuntime::new_with_history(AgentTurnConfig::default(), model, Arc::new(tools), history);
+    let runtime = AgentRuntime::new_with_history(
+        AgentTurnConfig::default(),
+        model,
+        Arc::new(tools),
+        history.clone(),
+    );
 
     let mut tui = Tui::new()?;
-    let mut app = App::new_with_image_renderer(
+    let mut app = App::new_with_runtime_config(
         runtime,
         workspace,
-        runtime_config.model_id,
+        runtime_config,
         tui.image_renderer.clone(),
     );
 

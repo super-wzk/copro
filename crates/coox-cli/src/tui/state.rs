@@ -78,6 +78,36 @@ impl AppState {
         self.push_block(BlockKind::Error { text: text.into() }, false);
     }
 
+    pub fn push_command_output(&mut self, text: impl Into<String>) {
+        self.push_block(
+            BlockKind::Command {
+                text: text.into(),
+                is_error: false,
+            },
+            false,
+        );
+    }
+
+    pub fn push_command_error(&mut self, text: impl Into<String>) {
+        self.push_block(
+            BlockKind::Command {
+                text: text.into(),
+                is_error: true,
+            },
+            false,
+        );
+    }
+
+    pub fn clear_conversation(&mut self) {
+        if self.blocks.is_empty() {
+            return;
+        }
+
+        self.blocks.clear();
+        self.content_blocks.clear();
+        self.bump_revision();
+    }
+
     pub fn apply_delta(&mut self, delta: OutputContentDelta) {
         self.apply_delta_at(0, delta);
     }
@@ -288,6 +318,7 @@ pub enum BlockKind {
     Thinking { text: String },
     Assistant { items: Vec<AssistantItem> },
     Error { text: String },
+    Command { text: String, is_error: bool },
     Tool(ToolBlockState),
 }
 

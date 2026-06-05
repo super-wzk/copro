@@ -3,9 +3,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::agent::config::{RuntimeConfig, build_model};
 use crate::agent::events::{apply_agent_event, apply_runtime_error};
-use crate::agent::runtime::{AgentRuntime, RuntimeEvent, SubmitError};
+use crate::agent::runtime::{AgentRuntime, RuntimeEvent, RuntimeTurnSnapshot, SubmitError};
+use crate::command::{
+    AppCommand, InputIntent, RuntimeCommand, SessionSnapshot, SlashCommandRegistry, SlashError,
+    TurnSnapshot, UiCommand, builtins, parse_input,
+};
 use crate::tui::components::{
+    command_menu::CommandMenu,
     conversation::{ConversationLayout, ConversationView},
     notifications::{NotificationCenter, NotificationKind},
     status::{StatusBar, StatusBarState},
@@ -21,6 +27,7 @@ use coox_tui::{
     },
     selection::{SelectionManager, SelectionMap},
 };
+use copro_agent::AgentHistory;
 use copro_api::message::{InputContent, InputMessage};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -45,12 +52,15 @@ const IMAGE_INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(16);
 #[derive(Debug)]
 pub struct App {
     runtime: AgentRuntime,
+    runtime_config: RuntimeConfig,
+    slash_commands: SlashCommandRegistry,
     runtime_events_tx: mpsc::UnboundedSender<RuntimeEvent>,
     runtime_events_rx: mpsc::UnboundedReceiver<RuntimeEvent>,
     image_renderer: ImageRenderer,
     state: AppState,
     conversation_scroll_from_bottom: u32,
     input: InputEditor,
+    command_menu: CommandMenu,
     status: StatusBarState,
     notifications: NotificationCenter,
     clipboard: ClipboardHandler,
@@ -123,16 +133,32 @@ impl App {
         model: String,
         image_renderer: ImageRenderer,
     ) -> Self {
+        let mut runtime_config = RuntimeConfig::from_env();
+        runtime_config.model_id = model;
+
+        Self::new_with_runtime_config(runtime, workspace, runtime_config, image_renderer)
+    }
+
+    pub fn new_with_runtime_config(
+        runtime: AgentRuntime,
+        workspace: String,
+        runtime_config: RuntimeConfig,
+        image_renderer: ImageRenderer,
+    ) -> Self {
         let (runtime_events_tx, runtime_events_rx) = mpsc::unbounded_channel();
+        let model = runtime_config.model_id.clone();
 
         Self {
             runtime,
+            runtime_config,
+            slash_commands: builtins(),
             runtime_events_tx,
             runtime_events_rx,
             image_renderer,
             state: AppState::default(),
             conversation_scroll_from_bottom: 0,
             input: InputEditor::default(),
+            command_menu: CommandMenu::new(),
             status: StatusBarState {
                 workspace,
                 model,
@@ -227,6 +253,10 @@ fn drain_runtime_events(app: &mut App) -> DirtyState {
                 push_notification(app, NotificationKind::Error, message.clone());
                 apply_runtime_error(message, &mut app.state);
             }
+            RuntimeEvent::ControlFailed { message } => {
+                app.state.push_command_error(message.clone());
+                push_notification(app, NotificationKind::Error, message);
+            }
         }
     }
 
@@ -259,6 +289,7 @@ fn render_app(frame: &mut Frame<'_>, app: &mut App) {
         frame.set_cursor_position(position);
     }
     frame.render_widget_ref(StatusBar::new(&app.status), chunks[3]);
+    render_command_menu(frame, app, chunks[0]);
     app.notifications.render(frame, chunks[0]);
 }
 
@@ -303,6 +334,12 @@ fn render_conversation_area(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
 }
 
+fn render_command_menu(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let input = app.input.text().to_string();
+    let registry = app.slash_commands;
+    app.command_menu.render(frame, area, &input, registry);
+}
+
 fn ensure_conversation_layout(app: &mut App, width: u16) {
     if app
         .conversation_layout
@@ -343,6 +380,12 @@ fn handle_event(app: &mut App, event: Event, input_width: usize) -> DirtyState {
 }
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) -> DirtyState {
+    if app.command_menu.is_open(app.input.text())
+        && app.command_menu.contains(mouse.column, mouse.row)
+    {
+        return DirtyState::none();
+    }
+
     let dirty = match mouse.kind {
         MouseEventKind::ScrollUp if mouse_in_conversation_area(app, mouse) => {
             let had_selection = has_conversation_selection(app);
@@ -572,6 +615,8 @@ fn refresh_conversation_selection_map(app: &mut App) {
 fn handle_key(app: &mut App, key: KeyEvent, input_width: usize) -> DirtyState {
     let dirty = if key.kind == KeyEventKind::Release {
         DirtyState::none()
+    } else if let Some(dirty) = handle_command_menu_key(app, key) {
+        dirty
     } else {
         match key.code {
             KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -624,6 +669,7 @@ fn handle_key(app: &mut App, key: KeyEvent, input_width: usize) -> DirtyState {
             }
             KeyCode::Backspace => {
                 app.input.backspace();
+                app.command_menu.input_changed();
                 DirtyState::frame()
             }
             KeyCode::Left => {
@@ -647,6 +693,7 @@ fn handle_key(app: &mut App, key: KeyEvent, input_width: usize) -> DirtyState {
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
                 app.input.insert_char(ch);
+                app.command_menu.input_changed();
                 DirtyState::frame()
             }
             _ => DirtyState::none(),
@@ -657,11 +704,82 @@ fn handle_key(app: &mut App, key: KeyEvent, input_width: usize) -> DirtyState {
     dirty
 }
 
+fn handle_command_menu_key(app: &mut App, key: KeyEvent) -> Option<DirtyState> {
+    if !app.command_menu.is_open(app.input.text()) || !key.modifiers.is_empty() {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Up => {
+            let input = app.input.text().to_string();
+            app.command_menu.select_prev(&input, app.slash_commands);
+            Some(DirtyState::frame())
+        }
+        KeyCode::Down => {
+            let input = app.input.text().to_string();
+            app.command_menu.select_next(&input, app.slash_commands);
+            Some(DirtyState::frame())
+        }
+        KeyCode::Esc => {
+            app.command_menu.dismiss();
+            Some(DirtyState::frame())
+        }
+        KeyCode::Tab => {
+            accept_selected_menu_command(app, false);
+            Some(DirtyState::frame())
+        }
+        KeyCode::Enter => {
+            if accept_selected_menu_command(app, true) {
+                Some(DirtyState::conversation())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn accept_selected_menu_command(app: &mut App, submit: bool) -> bool {
+    let input = app.input.text().to_string();
+    let Some(command) = app
+        .command_menu
+        .selected_command(&input, app.slash_commands)
+    else {
+        return false;
+    };
+
+    let replacement = if submit {
+        format!("/{}", command.spec.name)
+    } else {
+        format!("/{} ", command.spec.name)
+    };
+    let _ = app.input.take_submission();
+    restore_input(app, &replacement);
+    app.command_menu.input_changed();
+
+    if submit {
+        submit_input(app);
+    }
+
+    true
+}
+
 fn submit_input(app: &mut App) {
     let Some(text) = app.input.take_submission() else {
         return;
     };
-    let message = InputMessage::User(vec![InputContent::Text(text.clone())]);
+
+    match parse_input(&text) {
+        Some(InputIntent::UserText(user_text)) => submit_user_text(app, user_text, text),
+        Some(InputIntent::Slash(invocation)) => {
+            dispatch_slash(app, invocation.name, invocation.args, text)
+        }
+        None => {}
+    }
+}
+
+fn submit_user_text(app: &mut App, user_text: String, original_text: String) {
+    let message = InputMessage::User(vec![InputContent::Text(user_text)]);
 
     match app
         .runtime
@@ -672,11 +790,170 @@ fn submit_input(app: &mut App) {
             app.conversation_scroll_from_bottom = 0;
         }
         Err(SubmitError::Busy) => {
-            for ch in text.chars() {
-                app.input.insert_char(ch);
-            }
+            restore_input(app, &original_text);
             push_notification(app, NotificationKind::Warning, "busy");
         }
+    }
+}
+
+fn dispatch_slash(app: &mut App, name: String, args: String, original_text: String) {
+    let Some(command) = app.slash_commands.find(&name) else {
+        restore_input(app, &original_text);
+        app.state
+            .push_command_error(format!("unknown command: /{name}"));
+        return;
+    };
+
+    let snapshot = session_snapshot(app);
+    let commands = match (command.build)(&args, &snapshot) {
+        Ok(commands) => commands,
+        Err(error) => {
+            restore_input(app, &original_text);
+            render_slash_error(app, error);
+            return;
+        }
+    };
+
+    execute_app_commands(app, commands);
+    app.conversation_scroll_from_bottom = 0;
+}
+
+fn session_snapshot(app: &App) -> SessionSnapshot<'_> {
+    SessionSnapshot {
+        model_id: &app.runtime_config.model_id,
+        turn_state: turn_snapshot(app.runtime.turn_snapshot()),
+    }
+}
+
+fn turn_snapshot(snapshot: RuntimeTurnSnapshot) -> TurnSnapshot {
+    match snapshot {
+        RuntimeTurnSnapshot::Idle => TurnSnapshot::Idle,
+        RuntimeTurnSnapshot::Running => TurnSnapshot::Running,
+        RuntimeTurnSnapshot::Paused => TurnSnapshot::Paused,
+        RuntimeTurnSnapshot::Preempting => TurnSnapshot::Running,
+        RuntimeTurnSnapshot::PendingAck => TurnSnapshot::PendingAck,
+        RuntimeTurnSnapshot::Failed => TurnSnapshot::Failed,
+    }
+}
+
+fn execute_app_commands(app: &mut App, commands: Vec<AppCommand>) {
+    for command in commands {
+        if let Err(message) = execute_app_command(app, command) {
+            app.state.push_command_error(message.clone());
+            push_notification(app, NotificationKind::Error, message);
+            return;
+        }
+    }
+}
+
+fn execute_app_command(app: &mut App, command: AppCommand) -> Result<(), String> {
+    match command {
+        AppCommand::Ui(command) => execute_ui_command(app, command),
+        AppCommand::Runtime(command) => execute_runtime_command(app, command),
+    }
+}
+
+fn execute_ui_command(app: &mut App, command: UiCommand) -> Result<(), String> {
+    match command {
+        UiCommand::ShowHelp => app
+            .state
+            .push_command_output(format_help(app.slash_commands)),
+        UiCommand::ClearConversation => app.state.clear_conversation(),
+        UiCommand::PushCommandOutput(text) => app.state.push_command_output(text),
+        UiCommand::Scroll { rows } => {
+            scroll_conversation(app, rows);
+        }
+        UiCommand::ScrollToBottom => {
+            set_conversation_scroll_from_bottom(app, 0);
+        }
+        UiCommand::Quit => app.quit = true,
+    }
+    Ok(())
+}
+
+fn execute_runtime_command(app: &mut App, command: RuntimeCommand) -> Result<(), String> {
+    match command {
+        RuntimeCommand::ClearSessionHistory => app
+            .runtime
+            .reset_history(AgentHistory::default())
+            .map_err(|error| error.to_string()),
+        RuntimeCommand::SwitchModel(model_id) => switch_model(app, model_id),
+        RuntimeCommand::StopTurn => {
+            ensure_running(app.runtime.turn_snapshot())?;
+            spawn_runtime_control(app, |runtime| async move { runtime.abort_active().await });
+            Ok(())
+        }
+        RuntimeCommand::PauseTurn => {
+            ensure_running(app.runtime.turn_snapshot())?;
+            spawn_runtime_control(app, |runtime| async move { runtime.pause_active().await });
+            Ok(())
+        }
+        RuntimeCommand::ResumeTurn => {
+            ensure_running(app.runtime.turn_snapshot())?;
+            spawn_runtime_control(app, |runtime| async move { runtime.resume_active().await });
+            Ok(())
+        }
+    }
+}
+
+fn switch_model(app: &mut App, model_id: String) -> Result<(), String> {
+    let mut config = app.runtime_config.clone();
+    config.model_id.clone_from(&model_id);
+    let model = build_model(&config).map_err(|error| error.to_string())?;
+
+    app.runtime_config = config;
+    app.runtime.set_model(model);
+    app.status.model = model_id;
+    Ok(())
+}
+
+fn ensure_running(snapshot: RuntimeTurnSnapshot) -> Result<(), String> {
+    match snapshot {
+        RuntimeTurnSnapshot::Running
+        | RuntimeTurnSnapshot::Paused
+        | RuntimeTurnSnapshot::Preempting => Ok(()),
+        RuntimeTurnSnapshot::Idle
+        | RuntimeTurnSnapshot::PendingAck
+        | RuntimeTurnSnapshot::Failed => Err("no active turn".to_string()),
+    }
+}
+
+fn spawn_runtime_control<F, Fut>(app: &App, control: F)
+where
+    F: FnOnce(AgentRuntime) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), crate::agent::runtime::RuntimeControlError>>
+        + Send
+        + 'static,
+{
+    let runtime = app.runtime.clone();
+    let events = app.runtime_events_tx.clone();
+    tokio::spawn(async move {
+        if let Err(error) = control(runtime).await {
+            let _ = events.send(RuntimeEvent::ControlFailed {
+                message: error.to_string(),
+            });
+        }
+    });
+}
+
+fn format_help(registry: SlashCommandRegistry) -> String {
+    let mut lines = vec!["local commands:".to_string()];
+    for command in registry.iter() {
+        lines.push(format!(
+            "  {:<28} {}",
+            command.spec.usage, command.spec.summary
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_slash_error(app: &mut App, error: SlashError) {
+    app.state.push_command_error(error.render());
+}
+
+fn restore_input(app: &mut App, text: &str) {
+    for ch in text.chars() {
+        app.input.insert_char(ch);
     }
 }
 
@@ -699,7 +976,7 @@ mod tests {
     use copro_agent::AgentHistory;
     use copro_agent::{AgentTurnConfig, ToolExecutionPolicy, ToolRouter, async_trait};
     use copro_api::error::{Error, Result};
-    use copro_api::message::{ToolCall, ToolResult};
+    use copro_api::message::{Message, ToolCall, ToolResult};
     use copro_api::request::GenerateRequest;
     use copro_api::response::FinishReason;
     use copro_api::stream::{Model, ModelStream, OutputContentDelta, OutputStreamEvent};
@@ -762,6 +1039,23 @@ mod tests {
         App::new(runtime(model), "copro".to_string(), "gpt-test".to_string())
     }
 
+    fn app_with_seed(model: impl Model + 'static, seed: AgentHistory) -> App {
+        let runtime = AgentRuntime::new_with_history(
+            AgentTurnConfig::default(),
+            Arc::new(model),
+            Arc::new(NoopTools),
+            seed.clone(),
+        );
+        let mut runtime_config = RuntimeConfig::from_env();
+        runtime_config.model_id = "gpt-test".to_string();
+        App::new_with_runtime_config(
+            runtime,
+            "copro".to_string(),
+            runtime_config,
+            ImageRenderer::default(),
+        )
+    }
+
     fn insert_text(input: &mut InputEditor, text: &str) {
         for ch in text.chars() {
             input.insert_char(ch);
@@ -796,6 +1090,17 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    async fn wait_app_until_not_busy(app: &mut App) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while app.runtime.is_busy() {
+                drain_runtime_events(app);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("app runtime stayed busy");
     }
 
     #[test]
@@ -1074,6 +1379,256 @@ mod tests {
                 if content == &vec![InputContent::Text("你好 cursor".to_string())]
         ));
         assert_eq!(app.notifications.current_message(), None);
+    }
+
+    #[tokio::test]
+    async fn double_slash_submits_escaped_user_text() {
+        let mut app = app_with(FinishedModel);
+        insert_text(&mut app.input, "//hello");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+        );
+
+        assert!(matches!(
+            app.state.blocks()[0].kind(),
+            crate::tui::state::BlockKind::User { content }
+                if content == &vec![InputContent::Text("/hello".to_string())]
+        ));
+    }
+
+    #[test]
+    fn help_command_renders_local_command_output() {
+        let mut app = app_with(FinishedModel);
+        insert_text(&mut app.input, "/help");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+        );
+
+        assert!(matches!(
+            app.state.blocks()[0].kind(),
+            crate::tui::state::BlockKind::Command { text, is_error: false }
+                if text.contains("/help") && text.contains("/clear")
+        ));
+    }
+
+    #[test]
+    fn unknown_slash_command_restores_input_and_renders_error() {
+        let mut app = app_with(FinishedModel);
+        insert_text(&mut app.input, "/wat");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+        );
+
+        assert_eq!(app.input.text(), "/wat");
+        assert!(matches!(
+            app.state.blocks()[0].kind(),
+            crate::tui::state::BlockKind::Command { text, is_error: true }
+                if text == "unknown command: /wat"
+        ));
+    }
+
+    #[test]
+    fn clear_command_clears_session_history_and_visible_conversation() {
+        let seed = AgentHistory::from_messages(vec![Message::developer(vec![InputContent::Text(
+            "seed".to_string(),
+        )])]);
+        let mut app = app_with_seed(FinishedModel, seed);
+        app.runtime
+            .reset_history(AgentHistory::from_messages(vec![Message::user(vec![
+                InputContent::Text("other".to_string()),
+            ])]))
+            .expect("reset to other history");
+        app.state
+            .apply_delta(OutputContentDelta::Text("visible".to_string()));
+        insert_text(&mut app.input, "/clear");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+        );
+
+        assert!(app.state.blocks().is_empty());
+        assert_eq!(app.runtime.history(), Some(AgentHistory::default()));
+    }
+
+    #[test]
+    fn model_command_without_args_renders_current_model() {
+        let mut app = app_with(FinishedModel);
+        insert_text(&mut app.input, "/model");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+        );
+
+        assert!(matches!(
+            app.state.blocks()[0].kind(),
+            crate::tui::state::BlockKind::Command { text, is_error: false }
+                if text == "model: gpt-test"
+        ));
+    }
+
+    #[tokio::test]
+    async fn busy_clear_is_rejected_without_clearing_visible_blocks() {
+        let mut app = app_with(PendingModel);
+        insert_text(&mut app.input, "first");
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+        );
+        insert_text(&mut app.input, "/clear");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+        );
+
+        assert!(app.runtime.is_busy());
+        assert!(matches!(
+            app.state.blocks()[0].kind(),
+            crate::tui::state::BlockKind::User { .. }
+        ));
+        assert!(matches!(
+            app.state.blocks()[1].kind(),
+            crate::tui::state::BlockKind::Command { text, is_error: true }
+                if text == "runtime is busy"
+        ));
+    }
+
+    #[test]
+    fn stop_command_idle_renders_local_error() {
+        let mut app = app_with(FinishedModel);
+        insert_text(&mut app.input, "/stop");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+        );
+
+        assert!(matches!(
+            app.state.blocks()[0].kind(),
+            crate::tui::state::BlockKind::Command { text, is_error: true }
+                if text == "no active turn"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stop_command_aborts_pending_turn_and_preserves_user_message() {
+        let mut app = app_with(PendingModel);
+        insert_text(&mut app.input, "question");
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+        );
+        insert_text(&mut app.input, "/stop");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+        );
+        wait_app_until_not_busy(&mut app).await;
+
+        let messages = app
+            .runtime
+            .history()
+            .expect("runtime history")
+            .messages()
+            .to_vec();
+        assert_eq!(
+            messages.first(),
+            Some(&Message::user(vec![InputContent::Text(
+                "question".to_string()
+            )]))
+        );
+    }
+
+    #[test]
+    fn command_menu_tab_accepts_without_submission() {
+        let mut app = app_with(FinishedModel);
+        insert_text(&mut app.input, "/mo");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            20,
+        );
+
+        assert_eq!(app.input.text(), "/model ");
+        assert!(app.state.blocks().is_empty());
+    }
+
+    #[test]
+    fn command_menu_enter_accepts_and_submits() {
+        let mut app = app_with(FinishedModel);
+        app.state
+            .apply_delta(OutputContentDelta::Text("visible".to_string()));
+        insert_text(&mut app.input, "/cl");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+        );
+
+        assert!(app.state.blocks().is_empty());
+        assert_eq!(app.input.text(), "");
+    }
+
+    #[test]
+    fn command_menu_down_changes_selected_command() {
+        let mut app = app_with(FinishedModel);
+        app.state
+            .apply_delta(OutputContentDelta::Text("visible".to_string()));
+        insert_text(&mut app.input, "/");
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            20,
+        );
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+        );
+
+        assert!(app.state.blocks().is_empty());
+    }
+
+    #[test]
+    fn command_menu_mouse_shields_conversation_scroll() {
+        let mut app = app_with(FinishedModel);
+        app.state.apply_delta(OutputContentDelta::Text(
+            (0..20)
+                .map(|index| format!("line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        insert_text(&mut app.input, "/");
+        render_text(&mut app, 40, 10);
+        let rect = app.command_menu.overlay_rect().expect("menu overlay rect");
+        let before = app.conversation_scroll_from_bottom;
+
+        let dirty = handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, rect.x, rect.y));
+
+        assert_eq!(dirty, DirtyState::none());
+        assert_eq!(app.conversation_scroll_from_bottom, before);
     }
 
     #[tokio::test]

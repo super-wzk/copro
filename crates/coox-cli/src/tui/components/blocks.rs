@@ -43,6 +43,9 @@ pub fn render_block_segments(block: &BlockState) -> Vec<BlockSegment> {
         BlockKind::Thinking { text } => render_text_segments(text, thinking_style()),
         BlockKind::Assistant { items } => render_assistant_items(items),
         BlockKind::Error { text } => render_text_segments(text, error_text_style()),
+        BlockKind::Command { text, is_error } => {
+            render_text_segments(text, command_text_style(*is_error))
+        }
         BlockKind::Tool(tool) => render_tool_segments(tool),
     };
     apply_block_fold(block, raw)
@@ -54,6 +57,7 @@ pub fn block_container_style(block: &BlockState) -> Style {
         BlockKind::Thinking { .. } => thinking_style(),
         BlockKind::Assistant { .. } => Style::default(),
         BlockKind::Error { .. } => error_block_style(),
+        BlockKind::Command { is_error, .. } => command_block_style(*is_error),
         BlockKind::Tool(tool) => tool_block_style(tool),
     }
 }
@@ -222,6 +226,22 @@ fn error_block_style() -> Style {
 
 fn error_text_style() -> Style {
     Style::default().fg(Color::LightRed)
+}
+
+fn command_block_style(is_error: bool) -> Style {
+    if is_error {
+        Style::default().fg(Color::White).bg(Color::Rgb(52, 34, 34))
+    } else {
+        Style::default().fg(Color::Gray).bg(Color::Rgb(28, 32, 36))
+    }
+}
+
+fn command_text_style(is_error: bool) -> Style {
+    if is_error {
+        Style::default().fg(Color::LightRed)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
 }
 
 fn tool_divider_text_style() -> Style {
