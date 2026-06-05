@@ -77,6 +77,7 @@ pub struct App {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AppSelectionSurface {
     Conversation,
+    Input,
 }
 
 #[derive(Debug)]
@@ -284,7 +285,18 @@ fn render_app(frame: &mut Frame<'_>, app: &mut App) {
         .split(area);
 
     render_conversation_area(frame, app, chunks[0]);
-    frame.render_stateful_widget_ref(input_box, chunks[2], &mut app.input);
+    let input_selection = app
+        .selection_manager
+        .selection_for(&AppSelectionSurface::Input);
+    frame.render_stateful_widget_ref(
+        input_box.selection(input_selection),
+        chunks[2],
+        &mut app.input,
+    );
+    app.selection_manager.register(
+        AppSelectionSurface::Input,
+        input_layout.selection_map(&app.input, chunks[2]),
+    );
     if let Some(position) = input_layout.cursor_position(chunks[2]) {
         frame.set_cursor_position(position);
     }
@@ -405,30 +417,21 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> DirtyState {
                 DirtyState::none()
             }
         }
-        MouseEventKind::Down(MouseButton::Left) if mouse_in_conversation_area(app, mouse) => {
-            app.conversation_selection_autoscroll = None;
-            if app
-                .selection_manager
-                .start_at(mouse.column, mouse.row)
-                .is_some()
-            {
-                app.frozen_selection_viewport_start = app
-                    .selection_manager
-                    .map_for(&AppSelectionSurface::Conversation)
-                    .map(SelectionMap::viewport_start);
-                DirtyState::conversation()
-            } else {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(dirty) = start_selection_at(app, mouse) {
+                dirty
+            } else if mouse_in_conversation_area(app, mouse) {
                 clear_conversation_selection(app);
                 DirtyState::conversation()
+            } else {
+                DirtyState::none()
             }
         }
         MouseEventKind::Drag(MouseButton::Left) if app.selection_manager.is_dragging() => {
-            update_conversation_selection_drag(app, mouse);
-            DirtyState::conversation()
+            update_active_selection_drag(app, mouse)
         }
         MouseEventKind::Up(MouseButton::Left) if app.selection_manager.is_dragging() => {
-            finish_conversation_selection(app);
-            DirtyState::conversation()
+            finish_active_selection(app)
         }
         _ => DirtyState::none(),
     };
@@ -441,7 +444,8 @@ fn has_conversation_selection(app: &App) -> bool {
     app.selection_manager
         .selection_for(&AppSelectionSurface::Conversation)
         .is_some()
-        || app.selection_manager.is_dragging()
+        || (app.selection_manager.is_dragging()
+            && app.selection_manager.active_key() == Some(&AppSelectionSurface::Conversation))
         || app.conversation_selection_autoscroll.is_some()
 }
 
@@ -508,14 +512,47 @@ fn update_conversation_selection_drag(app: &mut App, mouse: MouseEvent) {
     });
 }
 
-fn finish_conversation_selection(app: &mut App) {
+fn start_selection_at(app: &mut App, mouse: MouseEvent) -> Option<DirtyState> {
+    app.conversation_selection_autoscroll = None;
+    let surface = app.selection_manager.start_at(mouse.column, mouse.row)?;
+
+    match surface {
+        AppSelectionSurface::Conversation => {
+            app.frozen_selection_viewport_start = app
+                .selection_manager
+                .map_for(&AppSelectionSurface::Conversation)
+                .map(SelectionMap::viewport_start);
+            Some(DirtyState::conversation())
+        }
+        AppSelectionSurface::Input => {
+            app.frozen_selection_viewport_start = None;
+            Some(DirtyState::frame())
+        }
+    }
+}
+
+fn update_active_selection_drag(app: &mut App, mouse: MouseEvent) -> DirtyState {
+    match app.selection_manager.active_key().copied() {
+        Some(AppSelectionSurface::Conversation) => {
+            update_conversation_selection_drag(app, mouse);
+            DirtyState::conversation()
+        }
+        Some(AppSelectionSurface::Input) => {
+            app.selection_manager
+                .update_focus_nearest(mouse.column, mouse.row);
+            DirtyState::frame()
+        }
+        None => DirtyState::none(),
+    }
+}
+
+fn finish_active_selection(app: &mut App) -> DirtyState {
     app.conversation_selection_autoscroll = None;
 
-    let text = app
+    let (surface, text) = app
         .selection_manager
         .finish_copy()
-        .map(|(_, text)| text)
-        .unwrap_or_default();
+        .unwrap_or((AppSelectionSurface::Input, String::new()));
 
     if text.is_empty() {
         push_notification(app, NotificationKind::Info, "no selection");
@@ -525,7 +562,13 @@ fn finish_conversation_selection(app: &mut App) {
         push_notification(app, NotificationKind::Error, "copy failed");
     }
 
-    clear_conversation_selection(app);
+    match surface {
+        AppSelectionSurface::Conversation => {
+            app.frozen_selection_viewport_start = None;
+            DirtyState::conversation()
+        }
+        AppSelectionSurface::Input => DirtyState::frame(),
+    }
 }
 
 fn clear_conversation_selection(app: &mut App) {
@@ -1282,6 +1325,56 @@ mod tests {
         assert!(
             app.selection_manager
                 .selection_for(&AppSelectionSurface::Conversation)
+                .is_none()
+        );
+        assert!(!app.selection_manager.is_dragging());
+    }
+
+    #[test]
+    fn input_mouse_selection_release_copies_and_clears_selection() {
+        let mut app = app_with(FinishedModel);
+        insert_text(&mut app.input, "alpha beta");
+        render_text(&mut app, 40, 8);
+        let line = app
+            .selection_manager
+            .map_for(&AppSelectionSurface::Input)
+            .expect("input selection map")
+            .lines()
+            .iter()
+            .find(|line| line.text.contains("alpha"))
+            .expect("alpha line is visible")
+            .clone();
+        let row = line.screen_y.expect("line has screen row");
+
+        let down_dirty = handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), line.x, row),
+        );
+        let drag_dirty = handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                line.x.saturating_add(5),
+                row,
+            ),
+        );
+        let up_dirty = handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                line.x.saturating_add(5),
+                row,
+            ),
+        );
+
+        assert_eq!(down_dirty, DirtyState::frame());
+        assert_eq!(drag_dirty, DirtyState::frame());
+        assert_eq!(up_dirty, DirtyState::frame());
+        assert_eq!(app.clipboard.last_written_text(), Some("alpha"));
+        assert_eq!(app.notifications.current_message(), Some("copied"));
+        assert!(
+            app.selection_manager
+                .selection_for(&AppSelectionSurface::Input)
                 .is_none()
         );
         assert!(!app.selection_manager.is_dragging());

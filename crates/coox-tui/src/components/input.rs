@@ -6,6 +6,9 @@ use ratatui::{
     widgets::{Block, Padding, Paragraph, StatefulWidgetRef, Widget},
 };
 
+use crate::selection::{
+    CopySeparator, Selection, SelectionCell, SelectionMap, SelectionRow, SelectionRowContent,
+};
 use crate::text::display_width;
 
 const MAX_INPUT_ROWS: usize = 14;
@@ -269,6 +272,7 @@ pub const INPUT_BOX_PADDING: Padding = Padding::new(1, 1, 1, 1);
 pub struct InputBox {
     style: Style,
     padding: Padding,
+    selection: Option<Selection>,
 }
 
 impl InputBox {
@@ -286,6 +290,11 @@ impl InputBox {
         self
     }
 
+    pub fn selection(mut self, selection: Option<Selection>) -> Self {
+        self.selection = selection;
+        self
+    }
+
     pub fn layout(&self, input: &InputEditor, area_width: u16) -> InputBoxLayout {
         InputBoxLayout::new(self.padding, input, area_width)
     }
@@ -296,6 +305,7 @@ impl Default for InputBox {
         Self {
             style: Style::default(),
             padding: INPUT_BOX_PADDING,
+            selection: None,
         }
     }
 }
@@ -319,6 +329,12 @@ impl StatefulWidgetRef for InputBox {
         .style(self.style)
         .block(Block::new().style(self.style).padding(self.padding))
         .render(area, buf);
+
+        if let Some(selection) = self.selection {
+            layout
+                .selection_map(input, area)
+                .apply_selection_highlight(buf, selection);
+        }
     }
 }
 
@@ -385,6 +401,60 @@ impl InputBoxLayout {
         Some(Position::new(cursor_x, cursor_y))
     }
 
+    pub fn selection_map(self, input: &InputEditor, area: Rect) -> SelectionMap {
+        debug_assert_eq!(
+            area.width, self.area_width,
+            "InputBoxLayout must be used with the same width it was measured for"
+        );
+
+        let content_area = self.content_area(area);
+        let rows = input.selection_rows(self.content_width);
+        let mut map = SelectionMap::new(content_area, 0, rows.len() as u32);
+        if content_area.is_empty() {
+            return map;
+        }
+
+        for (index, row) in rows.into_iter().enumerate() {
+            let y = index as u32;
+            let screen_y = (index < usize::from(content_area.height))
+                .then(|| content_area.y.saturating_add(index as u16));
+            map.push_line(SelectionRow::new(
+                content_area.x,
+                y,
+                screen_y,
+                content_area.width,
+                SelectionRowContent::new(
+                    row.text_width.min(content_area.width),
+                    row.text,
+                    row.copy_separator,
+                    row.cells,
+                ),
+            ));
+        }
+
+        map
+    }
+
+    fn content_area(self, area: Rect) -> Rect {
+        if area.is_empty() {
+            return Rect::default();
+        }
+
+        let width = area
+            .width
+            .saturating_sub(self.padding.left.saturating_add(self.padding.right));
+        let height = area
+            .height
+            .saturating_sub(self.padding.top.saturating_add(self.padding.bottom));
+
+        Rect::new(
+            area.x.saturating_add(self.padding.left),
+            area.y.saturating_add(self.padding.top),
+            width,
+            height,
+        )
+    }
+
     fn measure_content_width(padding: Padding, area_width: u16) -> usize {
         usize::from(area_width.saturating_sub(padding.left.saturating_add(padding.right)))
     }
@@ -397,12 +467,113 @@ impl InputBoxLayout {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputSelectionRow {
+    text_width: u16,
+    text: String,
+    copy_separator: CopySeparator,
+    cells: Vec<SelectionCell>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputSelectionCell {
+    column: u16,
+    width: u16,
+    text: String,
+}
+
+impl InputEditor {
+    fn selection_rows(&self, width: usize) -> Vec<InputSelectionRow> {
+        let width = width.max(1);
+        let mut rows = Vec::new();
+        let mut row_start = 0;
+        let mut col = 0;
+        let mut cells = Vec::new();
+
+        for (index, ch) in self.text.char_indices() {
+            let end = index + ch.len_utf8();
+
+            if ch == '\n' {
+                rows.push(InputSelectionRow::new(
+                    &self.text[row_start..index],
+                    CopySeparator::HardLine,
+                    cells,
+                ));
+                row_start = end;
+                col = 0;
+                cells = Vec::new();
+                continue;
+            }
+
+            let next_col = display_width(&self.text[row_start..end]);
+            if col > 0 && next_col > width {
+                rows.push(InputSelectionRow::new(
+                    &self.text[row_start..index],
+                    CopySeparator::None,
+                    cells,
+                ));
+                row_start = index;
+                col = 0;
+                cells = Vec::new();
+            }
+
+            let next_col = display_width(&self.text[row_start..end]);
+            push_selection_cell(&mut cells, ch, col, next_col);
+            col = next_col;
+        }
+
+        rows.push(InputSelectionRow::new(
+            &self.text[row_start..],
+            CopySeparator::None,
+            cells,
+        ));
+        rows
+    }
+}
+
+impl InputSelectionRow {
+    fn new(
+        text: &str,
+        copy_separator: CopySeparator,
+        cells: Vec<InputSelectionCell>,
+    ) -> InputSelectionRow {
+        InputSelectionRow {
+            text_width: display_width(text).min(usize::from(u16::MAX)) as u16,
+            text: text.to_string(),
+            copy_separator,
+            cells: cells
+                .into_iter()
+                .map(|cell| SelectionCell::new(cell.column, cell.width, cell.text))
+                .collect(),
+        }
+    }
+}
+
+fn push_selection_cell(cells: &mut Vec<InputSelectionCell>, ch: char, col: usize, next_col: usize) {
+    let width = next_col.saturating_sub(col);
+    if width == 0 {
+        if let Some(previous) = cells.last_mut() {
+            previous.text.push(ch);
+        }
+        return;
+    }
+
+    cells.push(InputSelectionCell {
+        column: col.min(usize::from(u16::MAX)) as u16,
+        width: width.min(usize::from(u16::MAX)) as u16,
+        text: ch.to_string(),
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::{
-        Terminal, backend::TestBackend, buffer::Buffer, layout::Position, widgets::FrameExt,
+        Terminal, backend::TestBackend, buffer::Buffer, layout::Position, style::Modifier,
+        widgets::FrameExt,
     };
+
+    use crate::selection::{Selection, TextPosition};
 
     #[test]
     fn input_box_layout_reports_shared_measurements() {
@@ -669,6 +840,141 @@ mod tests {
         input.move_down(2);
         assert_eq!(input.cursor_visual_position(2), (1, 0));
         assert_eq!(input.cursor(), 2);
+    }
+
+    #[test]
+    fn selection_map_rejoins_soft_wrapped_input_without_newline() {
+        let mut input = InputEditor::default();
+        for ch in "abcde".chars() {
+            input.insert_char(ch);
+        }
+        let input_box = InputBox::new();
+        let layout = input_box.layout(&input, 6);
+        let map = layout.selection_map(&input, Rect::new(0, 0, 6, 4));
+
+        assert_eq!(
+            map.lines()
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["abcd", "e"]
+        );
+        assert_eq!(map.lines()[0].copy_separator, CopySeparator::None);
+        assert_eq!(map.copy_visible_text(), "abcde");
+    }
+
+    #[test]
+    fn selection_map_preserves_hard_newlines() {
+        let mut input = InputEditor::default();
+        for ch in "ab\ncd".chars() {
+            input.insert_char(ch);
+        }
+        let input_box = InputBox::new();
+        let layout = input_box.layout(&input, 10);
+        let map = layout.selection_map(&input, Rect::new(0, 0, 10, 4));
+
+        assert_eq!(
+            map.lines()
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["ab", "cd"]
+        );
+        assert_eq!(map.lines()[0].copy_separator, CopySeparator::HardLine);
+        assert_eq!(map.copy_visible_text(), "ab\ncd");
+    }
+
+    #[test]
+    fn selection_map_uses_display_width_for_wide_text() {
+        let mut input = InputEditor::default();
+        for ch in "你a".chars() {
+            input.insert_char(ch);
+        }
+        let input_box = InputBox::new();
+        let layout = input_box.layout(&input, 10);
+        let map = layout.selection_map(&input, Rect::new(0, 0, 10, 3));
+        let line = &map.lines()[0];
+
+        let selection = Selection::new(
+            TextPosition::new(line.x, line.y),
+            TextPosition::new(line.x + 2, line.y),
+        );
+
+        assert_eq!(map.copy_selection(selection), "你");
+    }
+
+    #[test]
+    fn selection_map_clamps_wide_text_width_to_content_area() {
+        let mut input = InputEditor::default();
+        input.insert_char('你');
+        let input_box = InputBox::new();
+        let layout = input_box.layout(&input, 3);
+        let map = layout.selection_map(&input, Rect::new(0, 0, 3, 3));
+        let line = &map.lines()[0];
+        let selection = Selection::new(
+            TextPosition::new(line.x, line.y),
+            TextPosition::new(line.end_x(), line.y),
+        );
+        let backend = TestBackend::new(3, 3);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_stateful_widget_ref(
+                    input_box.selection(Some(selection)),
+                    area,
+                    &mut input,
+                );
+            })
+            .expect("render input");
+
+        assert_eq!(line.end_x(), line.x + 1);
+        assert_eq!(map.copy_selection(selection), "你");
+    }
+
+    #[test]
+    fn input_box_highlights_selection() {
+        let mut input = InputEditor::default();
+        for ch in "select".chars() {
+            input.insert_char(ch);
+        }
+        let input_box = InputBox::new();
+        let layout = input_box.layout(&input, 10);
+        let map = layout.selection_map(&input, Rect::new(0, 0, 10, 3));
+        let line = &map.lines()[0];
+        let selection = Selection::new(
+            TextPosition::new(line.x + 1, line.y),
+            TextPosition::new(line.x + 4, line.y),
+        );
+        let backend = TestBackend::new(10, 3);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_stateful_widget_ref(
+                    input_box.selection(Some(selection)),
+                    area,
+                    &mut input,
+                );
+            })
+            .expect("render input");
+
+        let buffer = terminal.backend().buffer();
+        let screen_y = line.screen_y.expect("visible row");
+        assert!(
+            buffer[(line.x + 1, screen_y)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            !buffer[(line.x, screen_y)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 
     fn buffer_lines(buffer: &Buffer) -> Vec<String> {
