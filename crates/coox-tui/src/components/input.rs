@@ -2,9 +2,9 @@ use ratatui::{
     buffer::Buffer,
     layout::{Position, Rect},
     style::Style,
-    text::Line,
-    widgets::{Block, Padding, Paragraph, StatefulWidgetRef, Widget},
+    widgets::{Block, Padding, StatefulWidgetRef, Widget},
 };
+use ratatui_textarea::{CursorMove, DataCursor, TextArea, WrapMode};
 
 use crate::selection::{
     CopySeparator, Selection, SelectionCell, SelectionMap, SelectionRow, SelectionRowContent,
@@ -13,11 +13,21 @@ use crate::text::display_width;
 
 const MAX_INPUT_ROWS: usize = 14;
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct InputEditor {
+    textarea: TextArea<'static>,
     text: String,
-    cursor: usize,
     cursor_visual_hint: Option<CursorVisualHint>,
+}
+
+impl Default for InputEditor {
+    fn default() -> Self {
+        Self {
+            textarea: configured_textarea(),
+            text: String::new(),
+            cursor_visual_hint: None,
+        }
+    }
 }
 
 impl InputEditor {
@@ -26,7 +36,7 @@ impl InputEditor {
     }
 
     pub fn cursor(&self) -> usize {
-        self.cursor
+        self.cursor_byte()
     }
 
     pub fn cursor_visual_position(&self, width: usize) -> (usize, usize) {
@@ -37,80 +47,56 @@ impl InputEditor {
     }
 
     pub fn insert_char(&mut self, ch: char) {
-        self.text.insert(self.cursor, ch);
-        self.cursor += ch.len_utf8();
+        self.textarea.insert_char(ch);
+        self.sync_text();
         self.cursor_visual_hint = None;
     }
 
+    pub fn insert_str(&mut self, text: &str) {
+        if self.textarea.insert_str(text) {
+            self.sync_text();
+            self.cursor_visual_hint = None;
+        }
+    }
+
     pub fn insert_newline(&mut self) {
-        self.insert_char('\n');
+        self.textarea.insert_newline();
+        self.sync_text();
+        self.cursor_visual_hint = None;
     }
 
     pub fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-
-        if let Some((previous_cursor, _)) = self.text[..self.cursor].char_indices().next_back() {
-            self.text.drain(previous_cursor..self.cursor);
-            self.cursor = previous_cursor;
+        if self.textarea.delete_char() {
+            self.sync_text();
             self.cursor_visual_hint = None;
         }
     }
 
     pub fn move_left(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-
-        if let Some((previous_cursor, _)) = self.text[..self.cursor].char_indices().next_back() {
-            self.cursor = previous_cursor;
-            self.cursor_visual_hint = None;
-        }
+        self.textarea.move_cursor(CursorMove::Back);
+        self.cursor_visual_hint = None;
     }
 
     pub fn move_right(&mut self) {
-        if self.cursor >= self.text.len() {
-            return;
-        }
-
-        self.cursor = self.text[self.cursor..]
-            .char_indices()
-            .nth(1)
-            .map(|(offset, _)| self.cursor + offset)
-            .unwrap_or(self.text.len());
+        self.textarea.move_cursor(CursorMove::Forward);
         self.cursor_visual_hint = None;
     }
 
     pub fn move_up(&mut self, width: usize) {
-        let (positions, _) = self.visual_positions(width);
-        let position = self.position_for_cursor(&positions, width);
-
-        if position.row == 0 {
-            return;
-        }
-
-        if let Some(target) =
-            Self::nearest_position_in_row(&positions, position.row - 1, position.col)
-        {
-            self.cursor = target.byte;
-            self.cursor_visual_hint = Some(CursorVisualHint::new(width, target.row));
-        }
+        self.move_vertical(width, CursorMove::Up);
     }
 
     pub fn move_down(&mut self, width: usize) {
-        let (positions, row_count) = self.visual_positions(width);
-        let position = self.position_for_cursor(&positions, width);
-        let target_row = position.row + 1;
+        self.move_vertical(width, CursorMove::Down);
+    }
 
-        if target_row >= row_count {
-            return;
-        }
-
-        if let Some(target) = Self::nearest_position_in_row(&positions, target_row, position.col) {
-            self.cursor = target.byte;
-            self.cursor_visual_hint = Some(CursorVisualHint::new(width, target.row));
-        }
+    fn move_vertical(&mut self, width: usize, direction: CursorMove) {
+        self.prepare_screen_map(width);
+        self.textarea.move_cursor(direction);
+        self.cursor_visual_hint = Some(CursorVisualHint::new(
+            width,
+            self.textarea.screen_cursor().row,
+        ));
     }
 
     pub fn take_submission(&mut self) -> Option<String> {
@@ -118,9 +104,10 @@ impl InputEditor {
             return None;
         }
 
-        self.cursor = 0;
+        let submission = std::mem::take(&mut self.text);
+        self.textarea = configured_textarea();
         self.cursor_visual_hint = None;
-        Some(std::mem::take(&mut self.text))
+        Some(submission)
     }
 
     pub fn visual_rows(&self, width: usize) -> usize {
@@ -200,11 +187,12 @@ impl InputEditor {
     }
 
     fn position_for_cursor(&self, positions: &[VisualPosition], width: usize) -> VisualPosition {
+        let cursor = self.cursor_byte();
         if let Some(position) = self.cursor_visual_hint.and_then(|hint| {
             (hint.width == width.max(1)).then(|| {
                 positions
                     .iter()
-                    .find(|position| position.byte == self.cursor && position.row == hint.row)
+                    .find(|position| position.byte == cursor && position.row == hint.row)
                     .copied()
             })?
         }) {
@@ -213,35 +201,75 @@ impl InputEditor {
 
         positions
             .iter()
-            .find(|position| position.byte == self.cursor)
+            .find(|position| position.byte == cursor)
             .copied()
             .or_else(|| {
                 positions
                     .iter()
                     .rev()
-                    .find(|position| position.byte < self.cursor)
+                    .find(|position| position.byte < cursor)
                     .copied()
             })
             .unwrap_or_default()
     }
 
-    fn nearest_position_in_row(
-        positions: &[VisualPosition],
-        row: usize,
-        col: usize,
-    ) -> Option<VisualPosition> {
-        positions
-            .iter()
-            .filter(|position| position.row == row)
-            .min_by_key(|position| {
-                (
-                    position.col.abs_diff(col),
-                    usize::from(position.col > col),
-                    position.byte,
-                )
-            })
-            .copied()
+    fn sync_text(&mut self) {
+        self.text = self.textarea.lines().join("\n");
     }
+
+    fn cursor_byte(&self) -> usize {
+        let DataCursor(row, col) = self.textarea.cursor();
+        byte_for_data_cursor(&self.text, (row, col))
+    }
+
+    fn prepare_render(&mut self, style: Style, padding: Padding) {
+        self.textarea.set_style(style);
+        self.textarea
+            .set_block(Block::new().style(style).padding(padding));
+        self.textarea.set_wrap_mode(WrapMode::Glyph);
+        self.textarea.set_cursor_line_style(Style::default());
+        self.textarea.set_cursor_style(Style::default());
+        self.textarea.remove_line_number();
+    }
+
+    fn prepare_screen_map(&mut self, width: usize) {
+        let width = width.clamp(1, usize::from(u16::MAX)) as u16;
+        let area = Rect::new(0, 0, width, MAX_INPUT_ROWS as u16);
+        let mut buffer = Buffer::empty(area);
+
+        self.textarea.remove_block();
+        self.textarea.set_wrap_mode(WrapMode::Glyph);
+        (&self.textarea).render(area, &mut buffer);
+    }
+}
+
+fn configured_textarea() -> TextArea<'static> {
+    let mut textarea = TextArea::default();
+    textarea.set_wrap_mode(WrapMode::Glyph);
+    textarea.set_cursor_line_style(Style::default());
+    textarea.set_cursor_style(Style::default());
+    textarea
+}
+
+fn byte_for_data_cursor(text: &str, cursor: (usize, usize)) -> usize {
+    let (target_row, target_col) = cursor;
+    let mut row = 0;
+    let mut col = 0;
+
+    for (index, ch) in text.char_indices() {
+        if row == target_row && col == target_col {
+            return index;
+        }
+
+        if ch == '\n' {
+            row += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+
+    text.len()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,16 +347,8 @@ impl StatefulWidgetRef for InputBox {
         }
 
         let layout = self.layout(input, area.width);
-        Paragraph::new(
-            input
-                .visual_lines(layout.content_width())
-                .into_iter()
-                .map(Line::from)
-                .collect::<Vec<_>>(),
-        )
-        .style(self.style)
-        .block(Block::new().style(self.style).padding(self.padding))
-        .render(area, buf);
+        input.prepare_render(self.style, self.padding);
+        (&input.textarea).render(area, buf);
 
         if let Some(selection) = self.selection {
             layout
@@ -810,7 +830,7 @@ mod tests {
     }
 
     #[test]
-    fn vertical_cursor_movement_uses_wrapped_rows() {
+    fn vertical_cursor_movement_uses_textarea_soft_wrap_rows() {
         let mut input = InputEditor::default();
         for ch in "abcd".chars() {
             input.insert_char(ch);
@@ -818,21 +838,23 @@ mod tests {
 
         assert_eq!(input.cursor_visual_position(2), (1, 2));
         input.move_up(2);
-        assert_eq!(input.cursor_visual_position(2), (0, 2));
-        assert_eq!(input.cursor(), 2);
+        assert_eq!(input.cursor_visual_position(2), (0, 1));
+        assert_eq!(input.cursor(), 1);
 
         input.move_down(2);
-        assert_eq!(input.cursor_visual_position(2), (1, 2));
-        assert_eq!(input.cursor(), 4);
+        assert_eq!(input.cursor_visual_position(2), (1, 1));
+        assert_eq!(input.cursor(), 3);
     }
 
     #[test]
     fn moving_to_wrapped_row_start_reports_row_start_position() {
-        let mut input = InputEditor {
-            text: "abcd".to_string(),
-            cursor: 0,
-            ..InputEditor::default()
-        };
+        let mut input = InputEditor::default();
+        for ch in "abcd".chars() {
+            input.insert_char(ch);
+        }
+        for _ in 0..4 {
+            input.move_left();
+        }
 
         assert_eq!(input.cursor_visual_position(2), (0, 0));
         assert_eq!(input.cursor(), 0);

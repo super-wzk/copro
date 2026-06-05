@@ -13,4 +13,5 @@ image = { version = "0.25", default-features = false, features = ["default-forma
 pulldown-cmark.workspace = true
 ratatui = { version = "0.30", features = ["unstable-widget-ref"] }
 ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
+ratatui-textarea.workspace = true
 unicode-width = "0.2"

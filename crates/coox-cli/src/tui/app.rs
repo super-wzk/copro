@@ -995,9 +995,7 @@ fn render_slash_error(app: &mut App, error: SlashError) {
 }
 
 fn restore_input(app: &mut App, text: &str) {
-    for ch in text.chars() {
-        app.input.insert_char(ch);
-    }
+    app.input.insert_str(text);
 }
 
 fn tick_notifications(app: &mut App) -> DirtyState {
@@ -1100,9 +1098,7 @@ mod tests {
     }
 
     fn insert_text(input: &mut InputEditor, text: &str) {
-        for ch in text.chars() {
-            input.insert_char(ch);
-        }
+        input.insert_str(text);
     }
 
     fn buffer_text(buffer: &Buffer) -> String {
