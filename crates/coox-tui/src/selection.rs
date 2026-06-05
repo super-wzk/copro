@@ -27,7 +27,7 @@ impl Selection {
         Self { anchor, focus }
     }
 
-    fn normalized(self) -> (TextPosition, TextPosition) {
+    pub fn normalized(self) -> (TextPosition, TextPosition) {
         if position_before_or_equal(self.anchor, self.focus) {
             (self.anchor, self.focus)
         } else {
@@ -262,19 +262,6 @@ impl SelectionMap {
         Some(line.clamped_position(x))
     }
 
-    pub fn selection_for_points(
-        &self,
-        anchor_x: u16,
-        anchor_y: u16,
-        focus_x: u16,
-        focus_y: u16,
-    ) -> Option<Selection> {
-        Some(Selection::new(
-            self.nearest_position(anchor_x, anchor_y)?,
-            self.nearest_position(focus_x, focus_y)?,
-        ))
-    }
-
     pub fn copy_visible_text(&self) -> String {
         self.copy_line_indices(self.visible_line_indices.iter().copied())
     }
@@ -392,10 +379,6 @@ impl SelectionMap {
     }
 }
 
-pub trait Selectable {
-    fn selection_map(&self) -> SelectionMap;
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SelectionSurface<K> {
     key: K,
@@ -495,15 +478,11 @@ impl<K: Clone + Eq> SelectionManager<K> {
         true
     }
 
-    pub fn finish_copy(&mut self) -> Option<(K, String)> {
+    pub fn finish_selection(&mut self) -> Option<(K, Selection)> {
         self.dragging = false;
         let active = self.active.clone()?;
-        let text = self
-            .map_for(&active.key)
-            .map(|map| map.copy_selection(active.selection))
-            .unwrap_or_default();
         self.active = None;
-        Some((active.key, text))
+        Some((active.key, active.selection))
     }
 
     pub fn clear(&mut self) {

@@ -25,7 +25,7 @@ use coox_tui::{
         input::{InputBox, InputEditor},
         scroll_view::ScrollViewState,
     },
-    selection::{SelectionManager, SelectionMap},
+    selection::{Selection, SelectionManager, SelectionMap},
 };
 use copro_agent::AgentHistory;
 use copro_api::message::{InputContent, InputMessage};
@@ -85,7 +85,6 @@ enum AppSelectionSurface {
 struct ConversationCache {
     area: Rect,
     buffer: Buffer,
-    copy_map: SelectionMap,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -338,27 +337,32 @@ fn render_conversation_area(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             area,
         );
         app.selection_manager
-            .register(AppSelectionSurface::Conversation, selection_map.clone());
+            .register(AppSelectionSurface::Conversation, selection_map);
         app.conversation_cache = Some(ConversationCache {
             area,
             buffer: copy_buffer_area(frame.buffer_mut(), area),
-            copy_map: selection_map.clone(),
         });
         if let Some(selection) = selection {
-            selection_map.apply_selection_highlight(frame.buffer_mut(), selection);
+            if let Some(map) = app
+                .selection_manager
+                .map_for(&AppSelectionSurface::Conversation)
+            {
+                map.apply_selection_highlight(frame.buffer_mut(), selection);
+            }
         }
         app.conversation_dirty = false;
     } else if let Some(cache) = &app.conversation_cache {
         copy_cached_area(&cache.buffer, frame.buffer_mut(), cache.area);
-        app.selection_manager
-            .register(AppSelectionSurface::Conversation, cache.copy_map.clone());
         if let Some(selection) = app
             .selection_manager
             .selection_for(&AppSelectionSurface::Conversation)
         {
-            cache
-                .copy_map
-                .apply_selection_highlight(frame.buffer_mut(), selection);
+            if let Some(map) = app
+                .selection_manager
+                .map_for(&AppSelectionSurface::Conversation)
+            {
+                map.apply_selection_highlight(frame.buffer_mut(), selection);
+            }
         }
     }
 }
@@ -575,10 +579,11 @@ fn update_active_selection_drag(app: &mut App, mouse: MouseEvent) -> DirtyState 
 fn finish_active_selection(app: &mut App) -> DirtyState {
     app.conversation_selection_autoscroll = None;
 
-    let (surface, text) = app
-        .selection_manager
-        .finish_copy()
-        .unwrap_or((AppSelectionSurface::Input, String::new()));
+    let Some((surface, selection)) = app.selection_manager.finish_selection() else {
+        push_notification(app, NotificationKind::Info, "no selection");
+        return DirtyState::frame();
+    };
+    let text = copy_finished_selection(app, surface, selection);
 
     if text.is_empty() {
         push_notification(app, NotificationKind::Info, "no selection");
@@ -594,6 +599,29 @@ fn finish_active_selection(app: &mut App) -> DirtyState {
             DirtyState::frame()
         }
         AppSelectionSurface::Input => DirtyState::frame(),
+    }
+}
+
+fn copy_finished_selection(
+    app: &App,
+    surface: AppSelectionSurface,
+    selection: Selection,
+) -> String {
+    match surface {
+        AppSelectionSurface::Conversation => {
+            let Some(area) = conversation_selection_map(app).map(SelectionMap::area) else {
+                return String::new();
+            };
+            app.conversation_layout
+                .as_ref()
+                .map(|layout| layout.copy_selection(area, selection))
+                .unwrap_or_default()
+        }
+        AppSelectionSurface::Input => app
+            .selection_manager
+            .map_for(&AppSelectionSurface::Input)
+            .map(|map| map.copy_selection(selection))
+            .unwrap_or_default(),
     }
 }
 
@@ -1402,6 +1430,65 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::REVERSED)
         );
+    }
+
+    #[test]
+    fn cached_conversation_selection_render_keeps_existing_map() {
+        let mut app = app_with(FinishedModel);
+        app.state.apply_delta(OutputContentDelta::Text(
+            (0..1_000)
+                .map(|index| format!("line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_app(frame, &mut app))
+            .expect("initial render");
+
+        let line = app
+            .selection_manager
+            .map_for(&AppSelectionSurface::Conversation)
+            .expect("conversation selection map")
+            .lines()
+            .iter()
+            .find(|line| line.screen_y.is_some())
+            .expect("visible line")
+            .clone();
+        let row = line.screen_y.expect("line has screen row");
+        let map_lines_ptr = app
+            .selection_manager
+            .map_for(&AppSelectionSurface::Conversation)
+            .expect("conversation selection map")
+            .lines()
+            .as_ptr();
+
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), line.x, row),
+        );
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                line.x.saturating_add(4),
+                row,
+            ),
+        );
+        terminal
+            .draw(|frame| render_app(frame, &mut app))
+            .expect("cached selection render");
+
+        let after_lines_ptr = app
+            .selection_manager
+            .map_for(&AppSelectionSurface::Conversation)
+            .expect("conversation selection map")
+            .lines()
+            .as_ptr();
+
+        assert_eq!(after_lines_ptr, map_lines_ptr);
     }
 
     #[test]

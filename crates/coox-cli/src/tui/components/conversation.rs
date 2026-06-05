@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use ratatui::{
     buffer::Buffer,
     layout::{Rect, Size},
@@ -125,6 +127,11 @@ impl ConversationLayout {
         )
     }
 
+    pub fn copy_selection(&self, area: Rect, selection: Selection) -> String {
+        build_selection_copy_map(&self.blocks, &self.prefix_heights, area, selection)
+            .copy_selection(selection)
+    }
+
     pub fn viewport(&self, area: Rect, scroll_from_bottom: u32) -> VirtualViewport {
         VirtualViewport::new(area, self.total_height(), scroll_from_bottom)
     }
@@ -193,25 +200,89 @@ fn build_selection_map(
 ) -> SelectionMap {
     let area = viewport.area();
     let mut map = SelectionMap::new(area, viewport.source_start(), viewport.total_height());
+    let source_start = viewport.source_start();
+    let source_end = source_start.saturating_add(u32::from(area.height));
 
     if area.is_empty() {
         return map;
     }
 
-    for (block, block_top) in blocks.iter().zip(prefix_heights.iter().copied()) {
-        collect_block_copy_map(block, block_top, area, &mut map);
+    for index in block_range_for_source(prefix_heights, source_start, source_end) {
+        let Some(block) = blocks.get(index) else {
+            continue;
+        };
+        let Some(block_top) = prefix_heights.get(index).copied() else {
+            continue;
+        };
+        collect_block_selection_rows(block, block_top, area, source_start, source_end, &mut map);
     }
 
     map
 }
 
-fn collect_block_copy_map(
+fn build_selection_copy_map(
+    blocks: &[PreparedBlock],
+    prefix_heights: &[u32],
+    area: Rect,
+    selection: Selection,
+) -> SelectionMap {
+    let (start, end) = selection.normalized();
+    let total_height = prefix_heights.last().copied().unwrap_or_default();
+    let mut map = SelectionMap::new(area, u32::MAX, total_height);
+
+    if area.is_empty() {
+        return map;
+    }
+
+    let source_start = start.y;
+    let source_end = end.y.saturating_add(1);
+    for index in block_range_for_source(prefix_heights, source_start, source_end) {
+        let Some(block) = blocks.get(index) else {
+            continue;
+        };
+        let Some(block_top) = prefix_heights.get(index).copied() else {
+            continue;
+        };
+        collect_block_selection_rows(block, block_top, area, source_start, source_end, &mut map);
+    }
+
+    map
+}
+
+fn block_range_for_source(
+    prefix_heights: &[u32],
+    source_start: u32,
+    source_end: u32,
+) -> Range<usize> {
+    if source_start >= source_end || prefix_heights.len() < 2 {
+        return 0..0;
+    }
+
+    let item_count = prefix_heights.len() - 1;
+    let start = prefix_heights
+        .partition_point(|height| *height <= source_start)
+        .saturating_sub(1)
+        .min(item_count);
+    let end = prefix_heights
+        .partition_point(|height| *height < source_end)
+        .min(item_count);
+
+    start..end.max(start)
+}
+
+fn collect_block_selection_rows(
     block: &PreparedBlock,
     block_top: u32,
     area: Rect,
+    source_start: u32,
+    source_end: u32,
     map: &mut SelectionMap,
 ) {
     if area.is_empty() {
+        return;
+    }
+    let block_bottom = block_top.saturating_add(block.height);
+    if visible_range(block_top, block_bottom, source_start, source_end).is_none() {
         return;
     }
 
@@ -223,8 +294,8 @@ fn collect_block_copy_map(
         target: area,
         target_x: inner_x,
         width: inner_width,
-        source_start: 0,
-        source_end: block.height,
+        source_start,
+        source_end,
     };
     let mut virtual_y = u32::from(BLOCK_PADDING.top);
     let mut line_group = Vec::new();
@@ -233,7 +304,7 @@ fn collect_block_copy_map(
         match segment {
             BlockSegment::Line(line) => line_group.push(line.clone()),
             BlockSegment::Image(image) => {
-                virtual_y = collect_line_group_copy_map(
+                virtual_y = collect_line_group_selection_rows(
                     std::mem::take(&mut line_group),
                     block.style,
                     block_top,
@@ -241,7 +312,7 @@ fn collect_block_copy_map(
                     clip,
                     map,
                 );
-                collect_image_placeholder_copy_map(
+                collect_image_placeholder_selection_rows(
                     &image_placeholder_text(image),
                     block_top,
                     virtual_y,
@@ -253,10 +324,10 @@ fn collect_block_copy_map(
         }
     }
 
-    collect_line_group_copy_map(line_group, block.style, block_top, virtual_y, clip, map);
+    collect_line_group_selection_rows(line_group, block.style, block_top, virtual_y, clip, map);
 }
 
-fn collect_line_group_copy_map(
+fn collect_line_group_selection_rows(
     lines: Vec<Line<'static>>,
     style: Style,
     block_top: u32,
@@ -270,9 +341,24 @@ fn collect_line_group_copy_map(
 
     let mut row = virtual_y;
     for line in lines {
-        let rendered_rows = rendered_line_copy_rows(&line, clip.width, style);
-        let line_height = rendered_rows.len() as u32;
+        let line_height = line_height(clip.width, &line, style);
         let line_bottom = row.saturating_add(line_height);
+        let global_top = block_top.saturating_add(row);
+        let global_bottom = block_top.saturating_add(line_bottom);
+
+        if visible_range(
+            global_top,
+            global_bottom,
+            clip.source_start,
+            clip.source_end,
+        )
+        .is_none()
+        {
+            row = line_bottom;
+            continue;
+        }
+
+        let rendered_rows = rendered_line_selection_rows(&line, clip.width, style);
 
         for source_row in row..line_bottom {
             let row_index = source_row.saturating_sub(row) as usize;
@@ -280,6 +366,9 @@ fn collect_line_group_copy_map(
                 continue;
             };
             let y = block_top.saturating_add(source_row);
+            if y < clip.source_start || y >= clip.source_end {
+                continue;
+            }
             map.push_line(SelectionRow::new(
                 clip.target_x,
                 y,
@@ -300,7 +389,7 @@ fn collect_line_group_copy_map(
     row
 }
 
-fn collect_image_placeholder_copy_map(
+fn collect_image_placeholder_selection_rows(
     placeholder: &str,
     block_top: u32,
     virtual_y: u32,
@@ -316,6 +405,9 @@ fn collect_image_placeholder_copy_map(
         let y = block_top
             .saturating_add(virtual_y)
             .saturating_add(u32::from(offset));
+        if y < clip.source_start || y >= clip.source_end {
+            continue;
+        }
         map.push_line(
             SelectionRow::new(
                 clip.target_x,
@@ -344,18 +436,18 @@ fn map_screen_y(map: &SelectionMap, y: u32) -> Option<u16> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct RenderedLineCopyRow {
+struct RenderedSelectionRow {
     text_width: u16,
     text: String,
     copy_separator: CopySeparator,
     cells: Vec<SelectionCell>,
 }
 
-fn rendered_line_copy_rows(
+fn rendered_line_selection_rows(
     line: &Line<'static>,
     width: u16,
     style: Style,
-) -> Vec<RenderedLineCopyRow> {
+) -> Vec<RenderedSelectionRow> {
     let height = line_height(width, line, style);
     let virtual_area = Rect::new(0, 0, width, u16_saturated(height));
     let mut virtual_buf = Buffer::empty(virtual_area);
@@ -363,8 +455,8 @@ fn rendered_line_copy_rows(
 
     let mut rows = (0..virtual_area.height)
         .map(|y| {
-            let (text, text_width, cells) = rendered_row_copy_cells(&virtual_buf, y, width);
-            RenderedLineCopyRow {
+            let (text, text_width, cells) = rendered_row_selection_cells(&virtual_buf, y, width);
+            RenderedSelectionRow {
                 text_width,
                 text,
                 copy_separator: CopySeparator::HardLine,
@@ -381,7 +473,7 @@ fn rendered_line_copy_rows(
     rows
 }
 
-fn rendered_row_copy_cells(
+fn rendered_row_selection_cells(
     buffer: &Buffer,
     y: u16,
     width: u16,
@@ -418,7 +510,7 @@ fn rendered_row_copy_cells(
     (text, text_width, cells)
 }
 
-fn line_copy_separators(line: &Line<'static>, rows: &[RenderedLineCopyRow]) -> Vec<CopySeparator> {
+fn line_copy_separators(line: &Line<'static>, rows: &[RenderedSelectionRow]) -> Vec<CopySeparator> {
     let text = line_plain_text(line);
     let ranges = rendered_row_ranges(&text, rows);
 
@@ -448,7 +540,7 @@ fn line_copy_separators(line: &Line<'static>, rows: &[RenderedLineCopyRow]) -> V
         .collect()
 }
 
-fn rendered_row_ranges(text: &str, rows: &[RenderedLineCopyRow]) -> Vec<Option<(usize, usize)>> {
+fn rendered_row_ranges(text: &str, rows: &[RenderedSelectionRow]) -> Vec<Option<(usize, usize)>> {
     let mut cursor = 0;
     rows.iter()
         .map(|row| {
@@ -860,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_map_rejoins_soft_wraps_with_copy_separator() {
+    fn selection_map_rejoins_visible_soft_wraps_with_copy_separator() {
         let mut state = AppState::default();
         state.push_input(InputMessage::User(vec![InputContent::Text(
             "hello world".to_string(),
@@ -883,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_map_rejoins_split_words_without_newline() {
+    fn selection_map_rejoins_visible_split_words_without_newline() {
         let mut state = AppState::default();
         state.push_input(InputMessage::User(vec![InputContent::Text(
             "abcdefg".to_string(),
@@ -929,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_selection_can_include_rows_outside_current_viewport() {
+    fn lazy_copy_selection_can_include_rows_outside_current_viewport() {
         let mut state = AppState::default();
         state.apply_delta(OutputContentDelta::Text(
             (0..8)
@@ -937,32 +1029,46 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n"),
         ));
-        let map = selection_map(&state, Rect::new(0, 0, 20, 4), 0);
-        let first = map
-            .lines()
-            .iter()
-            .find(|line| line.text == "line 0")
-            .expect("offscreen first line exists in copy map");
+        let area = Rect::new(0, 0, 20, 4);
+        let layout = ConversationLayout::prepare(&state, area.width);
+        let map = layout.selection_map(area, 0);
         let last = map
             .lines()
             .iter()
             .find(|line| line.text == "line 7")
             .expect("visible last line exists in copy map");
 
-        assert!(first.screen_y.is_none());
+        assert!(map.lines().iter().all(|line| line.text != "line 0"));
         assert!(last.screen_y.is_some());
         let selection = Selection::new(
-            TextPosition::new(first.x, first.y),
+            TextPosition::new(last.x, last.y.saturating_sub(7)),
             TextPosition::new(last.end_x(), last.y),
         );
 
-        let copied = map.copy_selection(selection);
+        let copied = layout.copy_selection(area, selection);
         assert!(copied.contains("line 0"));
         assert!(copied.contains("line 7"));
     }
 
     #[test]
-    fn copy_map_includes_visible_image_placeholder_text() {
+    fn selection_map_contains_only_viewport_rows_for_large_content() {
+        let mut state = AppState::default();
+        state.apply_delta(OutputContentDelta::Text(
+            (0..1_000)
+                .map(|index| format!("line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        let area = Rect::new(0, 0, 24, 6);
+        let map = selection_map(&state, area, 0);
+
+        assert!(map.lines().len() <= usize::from(area.height));
+        assert!(map.lines().iter().all(|line| line.screen_y.is_some()));
+        assert!(map.lines().iter().all(|line| line.text != "line 0"));
+    }
+
+    #[test]
+    fn selection_map_includes_visible_image_placeholder_text() {
         let mut state = AppState::default();
         state.push_input(InputMessage::User(vec![InputContent::Image(
             copro_api::message::ImageContent::Url {
@@ -975,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_map_includes_placeholder_for_data_image() {
+    fn selection_map_includes_placeholder_for_data_image() {
         let mut state = AppState::default();
         let image = png_bytes();
         let expected = format!("[image: image/png, {} bytes]", image.len());
