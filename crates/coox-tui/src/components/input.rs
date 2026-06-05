@@ -545,15 +545,21 @@ impl InputBoxLayout {
 
         let content_area = self.content_area(area);
         let rows = input.selection_rows(self.content_width);
-        let mut map = SelectionMap::new(content_area, 0, rows.len() as u32);
+        let mut map = SelectionMap::new(
+            content_area,
+            self.viewport_top_row as u32,
+            rows.len() as u32,
+        );
         if content_area.is_empty() {
             return map;
         }
 
         for (index, row) in rows.into_iter().enumerate() {
             let y = index as u32;
-            let screen_y = (index < usize::from(content_area.height))
-                .then(|| content_area.y.saturating_add(index as u16));
+            let screen_y = index
+                .checked_sub(self.viewport_top_row)
+                .filter(|visible_index| *visible_index < usize::from(content_area.height))
+                .map(|visible_index| content_area.y.saturating_add(visible_index as u16));
             map.push_line(SelectionRow::new(
                 content_area.x,
                 y,
@@ -869,6 +875,43 @@ mod tests {
         terminal
             .backend_mut()
             .assert_cursor_position(Position::new(3, 13));
+    }
+
+    #[test]
+    fn selection_map_tracks_scrolled_textarea_viewport() {
+        let mut input = InputEditor::default();
+        let text = (0..20)
+            .map(|index| format!("{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        input.insert_str(&text);
+        let backend = TestBackend::new(8, 16);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_stateful_widget_ref(InputBox::new(), area, &mut input);
+            })
+            .expect("render input");
+
+        let input_box = InputBox::new();
+        let area = Rect::new(0, 0, 8, 16);
+        let layout = input_box.layout(&input, area.width);
+        let map = layout.selection_map(&input, area);
+        let visible_lines = map
+            .lines()
+            .iter()
+            .filter_map(|line| line.screen_y.map(|_| line.text.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(map.viewport_start(), 6);
+        assert_eq!(
+            visible_lines,
+            [
+                "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19"
+            ]
+        );
     }
 
     #[test]

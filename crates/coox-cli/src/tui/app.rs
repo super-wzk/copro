@@ -334,8 +334,7 @@ fn render_conversation_area(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let selection_map = layout.selection_map(area, app.conversation_scroll_from_bottom);
         frame.render_widget_ref(
             ConversationView::new(layout, &app.image_renderer)
-                .scroll_from_bottom(app.conversation_scroll_from_bottom)
-                .selection(selection),
+                .scroll_from_bottom(app.conversation_scroll_from_bottom),
             area,
         );
         app.selection_manager
@@ -343,13 +342,24 @@ fn render_conversation_area(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         app.conversation_cache = Some(ConversationCache {
             area,
             buffer: copy_buffer_area(frame.buffer_mut(), area),
-            copy_map: selection_map,
+            copy_map: selection_map.clone(),
         });
+        if let Some(selection) = selection {
+            selection_map.apply_selection_highlight(frame.buffer_mut(), selection);
+        }
         app.conversation_dirty = false;
     } else if let Some(cache) = &app.conversation_cache {
         copy_cached_area(&cache.buffer, frame.buffer_mut(), cache.area);
         app.selection_manager
             .register(AppSelectionSurface::Conversation, cache.copy_map.clone());
+        if let Some(selection) = app
+            .selection_manager
+            .selection_for(&AppSelectionSurface::Conversation)
+        {
+            cache
+                .copy_map
+                .apply_selection_highlight(frame.buffer_mut(), selection);
+        }
     }
 }
 
@@ -409,8 +419,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> DirtyState {
         MouseEventKind::ScrollUp if mouse_in_conversation_area(app, mouse) => {
             let had_selection = has_conversation_selection(app);
             clear_conversation_selection(app);
-            if scroll_conversation(app, MOUSE_SCROLL_ROWS as i32) || had_selection {
+            if scroll_conversation(app, MOUSE_SCROLL_ROWS as i32) {
                 DirtyState::conversation()
+            } else if had_selection {
+                DirtyState::frame()
             } else {
                 DirtyState::none()
             }
@@ -418,8 +430,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> DirtyState {
         MouseEventKind::ScrollDown if mouse_in_conversation_area(app, mouse) => {
             let had_selection = has_conversation_selection(app);
             clear_conversation_selection(app);
-            if scroll_conversation(app, -(MOUSE_SCROLL_ROWS as i32)) || had_selection {
+            if scroll_conversation(app, -(MOUSE_SCROLL_ROWS as i32)) {
                 DirtyState::conversation()
+            } else if had_selection {
+                DirtyState::frame()
             } else {
                 DirtyState::none()
             }
@@ -428,8 +442,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> DirtyState {
             if let Some(dirty) = start_selection_at(app, mouse) {
                 dirty
             } else if mouse_in_conversation_area(app, mouse) {
+                let had_selection = has_conversation_selection(app);
                 clear_conversation_selection(app);
-                DirtyState::conversation()
+                if had_selection {
+                    DirtyState::frame()
+                } else {
+                    DirtyState::none()
+                }
             } else {
                 DirtyState::none()
             }
@@ -529,7 +548,7 @@ fn start_selection_at(app: &mut App, mouse: MouseEvent) -> Option<DirtyState> {
                 .selection_manager
                 .map_for(&AppSelectionSurface::Conversation)
                 .map(SelectionMap::viewport_start);
-            Some(DirtyState::conversation())
+            Some(DirtyState::frame())
         }
         AppSelectionSurface::Input => {
             app.frozen_selection_viewport_start = None;
@@ -542,7 +561,7 @@ fn update_active_selection_drag(app: &mut App, mouse: MouseEvent) -> DirtyState 
     match app.selection_manager.active_key().copied() {
         Some(AppSelectionSurface::Conversation) => {
             update_conversation_selection_drag(app, mouse);
-            DirtyState::conversation()
+            DirtyState::frame()
         }
         Some(AppSelectionSurface::Input) => {
             app.selection_manager
@@ -572,7 +591,7 @@ fn finish_active_selection(app: &mut App) -> DirtyState {
     match surface {
         AppSelectionSurface::Conversation => {
             app.frozen_selection_viewport_start = None;
-            DirtyState::conversation()
+            DirtyState::frame()
         }
         AppSelectionSurface::Input => DirtyState::frame(),
     }
@@ -1029,7 +1048,7 @@ mod tests {
     use copro_api::response::FinishReason;
     use copro_api::stream::{Model, ModelStream, OutputContentDelta, OutputStreamEvent};
     use copro_api::tool::ToolDefinition;
-    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Modifier};
     use std::sync::Arc;
 
     struct FinishedModel;
@@ -1331,6 +1350,58 @@ mod tests {
                 .is_none()
         );
         assert!(!app.selection_manager.is_dragging());
+    }
+
+    #[test]
+    fn conversation_selection_drag_reuses_cached_frame() {
+        let mut app = app_with(FinishedModel);
+        app.state
+            .apply_delta(OutputContentDelta::Text("alpha beta".to_string()));
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_app(frame, &mut app))
+            .expect("initial render");
+
+        let line = app
+            .selection_manager
+            .map_for(&AppSelectionSurface::Conversation)
+            .expect("conversation selection map")
+            .lines()
+            .iter()
+            .find(|line| line.text.contains("alpha"))
+            .expect("alpha line is visible")
+            .clone();
+        let row = line.screen_y.expect("line has screen row");
+
+        let down_dirty = handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), line.x, row),
+        );
+        let drag_dirty = handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                line.x.saturating_add(5),
+                row,
+            ),
+        );
+
+        assert_eq!(down_dirty, DirtyState::frame());
+        assert_eq!(drag_dirty, DirtyState::frame());
+        assert!(!app.conversation_dirty);
+
+        terminal
+            .draw(|frame| render_app(frame, &mut app))
+            .expect("selection render");
+
+        assert!(
+            terminal.backend().buffer()[(line.x, row)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 
     #[test]

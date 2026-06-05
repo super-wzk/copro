@@ -199,6 +199,7 @@ pub struct SelectionMap {
     viewport_start: u32,
     total_height: u32,
     lines: Vec<SelectionRow>,
+    visible_line_indices: Vec<usize>,
 }
 
 impl SelectionMap {
@@ -208,6 +209,7 @@ impl SelectionMap {
             viewport_start,
             total_height,
             lines: Vec::new(),
+            visible_line_indices: Vec::new(),
         }
     }
 
@@ -220,6 +222,9 @@ impl SelectionMap {
     }
 
     pub fn push_line(&mut self, line: SelectionRow) {
+        if line.screen_y.is_some() {
+            self.visible_line_indices.push(self.lines.len());
+        }
         self.lines.push(line);
     }
 
@@ -250,9 +255,7 @@ impl SelectionMap {
 
     pub fn nearest_position(&self, x: u16, y: u16) -> Option<TextPosition> {
         let line = self.line_at_screen_y(y).or_else(|| {
-            self.lines
-                .iter()
-                .filter(|line| line.screen_y.is_some())
+            self.visible_lines()
                 .min_by_key(|line| line.screen_y.unwrap_or_default().abs_diff(y))
         })?;
 
@@ -273,12 +276,7 @@ impl SelectionMap {
     }
 
     pub fn copy_visible_text(&self) -> String {
-        self.copy_line_indices(
-            self.lines
-                .iter()
-                .enumerate()
-                .filter_map(|(index, line)| line.screen_y.is_some().then_some(index)),
-        )
+        self.copy_line_indices(self.visible_line_indices.iter().copied())
     }
 
     pub fn copy_selection(&self, selection: Selection) -> String {
@@ -296,8 +294,7 @@ impl SelectionMap {
         let style = selection_style();
 
         for line in self
-            .lines
-            .iter()
+            .visible_lines()
             .filter(|line| line.y >= start.y && line.y <= end.y)
         {
             let start_column = if line.y == start.y {
@@ -317,9 +314,7 @@ impl SelectionMap {
 
             let start_x = line.x.saturating_add(start_column);
             let end_x = line.x.saturating_add(end_column);
-            let Some(screen_y) = line.screen_y else {
-                continue;
-            };
+            let screen_y = line.screen_y.expect("visible lines have a screen row");
             for x in start_x..end_x {
                 buf[(x, screen_y)].set_style(style);
             }
@@ -327,7 +322,13 @@ impl SelectionMap {
     }
 
     fn line_at_screen_y(&self, y: u16) -> Option<&SelectionRow> {
-        self.lines.iter().find(|line| line.screen_y == Some(y))
+        self.visible_lines().find(|line| line.screen_y == Some(y))
+    }
+
+    fn visible_lines(&self) -> impl Iterator<Item = &SelectionRow> {
+        self.visible_line_indices
+            .iter()
+            .map(|index| &self.lines[*index])
     }
 
     fn copy_line_indices(&self, indices: impl IntoIterator<Item = usize>) -> String {
