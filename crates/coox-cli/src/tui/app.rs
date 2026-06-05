@@ -25,7 +25,7 @@ use coox_tui::{
         input::{INPUT_BOX_PADDING, InputBox, InputEditor},
         scroll_view::ScrollViewState,
     },
-    selection::{Selection, SelectionManager, SelectionMap},
+    selection::{Selection, SelectionManager, SelectionMap, TextPosition},
 };
 use copro_agent::AgentHistory;
 use copro_api::message::{InputContent, InputMessage};
@@ -533,6 +533,9 @@ fn update_surface_selection_drag(app: &mut App, surface: AppSelectionSurface, mo
         app.selection_autoscroll = None;
         app.selection_manager
             .update_focus_nearest(mouse.column, mouse.row);
+        if surface == AppSelectionSurface::Input {
+            sync_input_cursor_to_selection_focus(app);
+        }
         return;
     }
 
@@ -560,6 +563,7 @@ fn start_selection_at(app: &mut App, mouse: MouseEvent) -> Option<DirtyState> {
         }
         AppSelectionSurface::Input => {
             app.frozen_selection_viewport_start = None;
+            move_input_cursor_to_mouse(app, mouse);
             Some(DirtyState::frame())
         }
     }
@@ -585,7 +589,9 @@ fn finish_active_selection(app: &mut App) -> DirtyState {
     let text = copy_finished_selection(app, surface, selection);
 
     if text.is_empty() {
-        push_notification(app, NotificationKind::Info, "no selection");
+        if surface != AppSelectionSurface::Input {
+            push_notification(app, NotificationKind::Info, "no selection");
+        }
     } else if app.clipboard.write_text(&text).is_ok() {
         push_notification(app, NotificationKind::Success, "copied");
     } else {
@@ -627,6 +633,36 @@ fn copy_finished_selection(
                 .copy_selection(usize::from(area.width), area.x, selection)
         }
     }
+}
+
+fn move_input_cursor_to_mouse(app: &mut App, mouse: MouseEvent) -> bool {
+    let Some((area, position)) = selection_map(app, AppSelectionSurface::Input).and_then(|map| {
+        map.position_at(mouse.column, mouse.row)
+            .map(|position| (map.area(), position))
+    }) else {
+        return false;
+    };
+
+    move_input_cursor_to_position(app, area, position)
+}
+
+fn sync_input_cursor_to_selection_focus(app: &mut App) -> bool {
+    let Some(selection) = app
+        .selection_manager
+        .selection_for(&AppSelectionSurface::Input)
+    else {
+        return false;
+    };
+    let Some(area) = selection_map(app, AppSelectionSurface::Input).map(SelectionMap::area) else {
+        return false;
+    };
+
+    move_input_cursor_to_position(app, area, selection.focus)
+}
+
+fn move_input_cursor_to_position(app: &mut App, area: Rect, position: TextPosition) -> bool {
+    app.input
+        .move_cursor_to_position(usize::from(area.width), area.x, position)
 }
 
 fn clear_conversation_selection(app: &mut App) {
@@ -735,6 +771,9 @@ fn tick_selection_autoscroll(app: &mut App) -> DirtyState {
     };
     app.selection_manager
         .update_focus_nearest(autoscroll.column, edge_row);
+    if autoscroll.surface == AppSelectionSurface::Input {
+        sync_input_cursor_to_selection_focus(app);
+    }
 
     app.selection_autoscroll = Some(SelectionAutoscroll {
         next_tick: now + SELECTION_AUTOSCROLL_INTERVAL,
@@ -1591,6 +1630,9 @@ mod tests {
                 row,
             ),
         );
+
+        assert_eq!(app.input.cursor(), "alpha".len());
+
         let up_dirty = handle_mouse(
             &mut app,
             mouse(
@@ -1605,6 +1647,52 @@ mod tests {
         assert_eq!(up_dirty, DirtyState::frame());
         assert_eq!(app.clipboard.last_written_text(), Some("alpha"));
         assert_eq!(app.notifications.current_message(), Some("copied"));
+        assert!(
+            app.selection_manager
+                .selection_for(&AppSelectionSurface::Input)
+                .is_none()
+        );
+        assert!(!app.selection_manager.is_dragging());
+    }
+
+    #[test]
+    fn input_mouse_click_moves_cursor_without_copying() {
+        let mut app = app_with(FinishedModel);
+        insert_text(&mut app.input, "alpha beta");
+        render_text(&mut app, 40, 8);
+        let line = app
+            .selection_manager
+            .map_for(&AppSelectionSurface::Input)
+            .expect("input selection map")
+            .lines()
+            .iter()
+            .find(|line| line.text.contains("alpha"))
+            .expect("alpha line is visible")
+            .clone();
+        let row = line.screen_y.expect("line has screen row");
+
+        let down_dirty = handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                line.x.saturating_add(2),
+                row,
+            ),
+        );
+        let up_dirty = handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                line.x.saturating_add(2),
+                row,
+            ),
+        );
+
+        assert_eq!(down_dirty, DirtyState::frame());
+        assert_eq!(up_dirty, DirtyState::frame());
+        assert_eq!(app.input.cursor(), "al".len());
+        assert_eq!(app.clipboard.last_written_text(), None);
+        assert_eq!(app.notifications.current_message(), None);
         assert!(
             app.selection_manager
                 .selection_for(&AppSelectionSurface::Input)
@@ -1662,12 +1750,29 @@ mod tests {
 
         assert_eq!(dirty, DirtyState::frame());
         assert!(after < before);
-        assert_eq!(app.input.cursor(), cursor);
         assert!(
             app.selection_manager
                 .selection_for(&AppSelectionSurface::Input)
                 .is_some()
         );
+        let map = app
+            .selection_manager
+            .map_for(&AppSelectionSurface::Input)
+            .expect("input selection map");
+        let area = map.area();
+        let focus = app
+            .selection_manager
+            .selection_for(&AppSelectionSurface::Input)
+            .expect("input selection")
+            .focus;
+        let cursor_after_autoscroll = app.input.cursor();
+
+        assert!(cursor_after_autoscroll < cursor);
+        assert!(
+            !app.input
+                .move_cursor_to_position(usize::from(area.width), area.x, focus)
+        );
+        assert_eq!(app.input.cursor(), cursor_after_autoscroll);
     }
 
     #[test]

@@ -10,6 +10,7 @@ use ratatui::{
 use crate::components::scroll_view::{ScrollViewState, VirtualViewport, max_scroll_from_bottom};
 use crate::selection::{
     CopySeparator, Selection, SelectionCell, SelectionMap, SelectionRow, SelectionRowContent,
+    TextPosition,
 };
 use crate::text::display_width;
 
@@ -48,6 +49,26 @@ impl InputEditor {
         let position = self.position_for_cursor(&positions, width);
 
         (position.row, position.col)
+    }
+
+    pub fn move_cursor_to_position(
+        &mut self,
+        width: usize,
+        origin_x: u16,
+        position: TextPosition,
+    ) -> bool {
+        let (positions, row_count) = self.visual_positions(width);
+        let row = (position.y as usize).min(row_count.saturating_sub(1));
+        let col = usize::from(position.x.saturating_sub(origin_x));
+        let target = visual_position_for_row_col(&positions, row_count, row, col);
+        let changed = self.cursor_byte != target.byte
+            || self
+                .cursor_visual_hint
+                .is_none_or(|hint| hint.width != width.max(1) || hint.row != target.row);
+
+        self.cursor_byte = target.byte;
+        self.cursor_visual_hint = Some(CursorVisualHint::new(width, target.row));
+        changed
     }
 
     pub fn insert_char(&mut self, ch: char) {
@@ -921,6 +942,28 @@ mod tests {
         terminal
             .backend_mut()
             .assert_cursor_position(Position::new(3, 1));
+    }
+
+    #[test]
+    fn moves_cursor_to_selection_position() {
+        let mut input = InputEditor::default();
+        input.insert_str("alpha\nbeta");
+        let area = Rect::new(0, 0, 10, 4);
+        let layout = InputBox::new().layout(&input, area.width);
+        let map = layout.selection_map(&input, area);
+        let line = map
+            .lines()
+            .iter()
+            .find(|line| line.text == "beta")
+            .expect("beta line is visible");
+        let row = line.screen_y.expect("beta line has screen row");
+        let position = map
+            .position_at(line.x.saturating_add(2), row)
+            .expect("position in beta line");
+
+        assert!(input.move_cursor_to_position(layout.content_width(), line.x, position));
+        assert_eq!(input.cursor(), "alpha\nbe".len());
+        assert_eq!(input.cursor_visual_position(layout.content_width()), (1, 2));
     }
 
     #[test]
