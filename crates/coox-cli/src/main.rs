@@ -22,7 +22,7 @@ async fn main() -> io::Result<()> {
     let fs_root_path = filesystem_root(&current_dir);
     let fs_root = AsyncPhysicalFS::new(fs_root_path).into();
     let workspace_root = workspace_vfs_root(&fs_root, &current_dir)?;
-    let tools = WorkspaceToolRouter::read_only(workspace_root);
+    let tools = WorkspaceToolRouter::new(workspace_root);
     let workspace_context = tools.workspace_context();
     let history = AgentHistory::from_messages(vec![Message::developer(vec![InputContent::Text(
         format!(

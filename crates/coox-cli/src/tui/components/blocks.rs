@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use coox_tui::components::{
     fold::{FoldHint, FoldedText},
     image::ImageSource,
@@ -9,16 +11,225 @@ use ratatui::{
     text::{Line, Span},
     widgets::Padding,
 };
+use syntect::{
+    easy::HighlightLines,
+    highlighting::{FontStyle, Style as SyntectStyle, Theme, ThemeSet},
+    parsing::{SyntaxReference, SyntaxSet},
+};
 
 use crate::tui::state::{AssistantItem, BlockKind, BlockState, ToolBlockState};
 
 const MAX_COLLAPSED_LINES: usize = 14;
 pub const BLOCK_PADDING: Padding = Padding::new(1, 1, 1, 1);
+static CODE_HIGHLIGHTER: LazyLock<CodeHighlighter> = LazyLock::new(CodeHighlighter::new);
 
 #[derive(Clone, Debug)]
 pub enum BlockSegment {
     Line(BlockLine),
     Image(ImageContent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FenceNode {
+    MarkdownText(String),
+    Markdown {
+        children: Vec<FenceNode>,
+    },
+    Code {
+        language: Option<String>,
+        text: String,
+    },
+}
+
+struct CodeHighlighter {
+    syntax_set: SyntaxSet,
+    theme: Theme,
+}
+
+impl CodeHighlighter {
+    fn new() -> Self {
+        let syntax_set = SyntaxSet::load_defaults_nonewlines();
+        let mut themes = ThemeSet::load_defaults();
+        let theme = themes
+            .themes
+            .remove("base16-ocean.dark")
+            .expect("syntect default themes include base16-ocean.dark");
+
+        Self { syntax_set, theme }
+    }
+
+    fn highlight_lines(
+        &self,
+        language: Option<&str>,
+        raw_lines: &[String],
+        fallback_style: Style,
+    ) -> Option<Vec<Line<'static>>> {
+        let syntax = self.syntax_for_language(language?)?;
+        let mut highlighter = HighlightLines::new(syntax, &self.theme);
+        let mut lines = Vec::with_capacity(raw_lines.len());
+
+        for line in raw_lines {
+            if line.is_empty() {
+                lines.push(Line::from(Span::styled(String::new(), fallback_style)));
+                continue;
+            }
+
+            let ranges = highlighter.highlight_line(line, &self.syntax_set).ok()?;
+            let spans = ranges
+                .into_iter()
+                .map(|(style, text)| {
+                    Span::styled(
+                        text.to_string(),
+                        syntect_style_to_ratatui(style, fallback_style),
+                    )
+                })
+                .collect::<Vec<_>>();
+            lines.push(Line::from(spans));
+        }
+
+        Some(lines)
+    }
+
+    fn syntax_for_language(&self, language: &str) -> Option<&SyntaxReference> {
+        let language = language_token(language)?;
+        std::iter::once(language)
+            .chain(language_aliases(language).iter().copied())
+            .find_map(|token| self.syntax_set.find_syntax_by_token(token))
+    }
+}
+
+fn language_token(language: &str) -> Option<&str> {
+    let token = language
+        .trim()
+        .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == '{')
+        .next()
+        .unwrap_or_default()
+        .trim_matches('.');
+    (!token.is_empty()).then_some(token)
+}
+
+fn language_aliases(language: &str) -> &'static [&'static str] {
+    match language.to_ascii_lowercase().as_str() {
+        "shell" | "shell-script" | "sh" | "zsh" => &["bash"],
+        "js" | "jsx" => &["javascript"],
+        "ts" | "tsx" => &["typescript"],
+        "jsonc" => &["json"],
+        "yml" => &["yaml"],
+        "md" => &["markdown"],
+        _ => &[],
+    }
+}
+
+fn plain_text_lines(raw_lines: &[String], style: Style) -> Vec<Line<'static>> {
+    raw_lines
+        .iter()
+        .map(|line| Line::from(Span::styled(line.clone(), style)))
+        .collect()
+}
+
+fn syntect_style_to_ratatui(style: SyntectStyle, fallback_style: Style) -> Style {
+    let mut output = fallback_style.fg(Color::Rgb(
+        style.foreground.r,
+        style.foreground.g,
+        style.foreground.b,
+    ));
+
+    if style.font_style.contains(FontStyle::BOLD) {
+        output = output.add_modifier(Modifier::BOLD);
+    }
+    if style.font_style.contains(FontStyle::ITALIC) {
+        output = output.add_modifier(Modifier::ITALIC);
+    }
+    if style.font_style.contains(FontStyle::UNDERLINE) {
+        output = output.add_modifier(Modifier::UNDERLINED);
+    }
+
+    output
+}
+
+fn parse_fence_tree(text: &str) -> Vec<FenceNode> {
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut cursor = 0;
+    parse_markdown_fence_nodes(&lines, &mut cursor, true)
+}
+
+fn parse_markdown_fence_nodes(lines: &[&str], cursor: &mut usize, is_root: bool) -> Vec<FenceNode> {
+    let mut nodes = Vec::new();
+    let mut text_lines = Vec::new();
+
+    while let Some(line) = lines.get(*cursor) {
+        if let Some(language) = fence_language(line) {
+            if language.is_none() && !is_root {
+                *cursor += 1;
+                break;
+            }
+
+            flush_markdown_text(&mut nodes, &mut text_lines);
+            *cursor += 1;
+
+            if language.as_deref().is_some_and(is_markdown_language) {
+                let children = parse_markdown_fence_nodes(lines, cursor, false);
+                nodes.push(FenceNode::Markdown { children });
+            } else {
+                nodes.push(parse_code_fence_node(lines, cursor, language));
+            }
+            continue;
+        }
+
+        text_lines.push((*line).to_string());
+        *cursor += 1;
+    }
+
+    flush_markdown_text(&mut nodes, &mut text_lines);
+    nodes
+}
+
+fn parse_code_fence_node(
+    lines: &[&str],
+    cursor: &mut usize,
+    language: Option<String>,
+) -> FenceNode {
+    let mut text_lines = Vec::new();
+
+    while let Some(line) = lines.get(*cursor) {
+        if fence_language(line).is_some_and(|language| language.is_none()) {
+            *cursor += 1;
+            break;
+        }
+
+        text_lines.push((*line).to_string());
+        *cursor += 1;
+    }
+
+    FenceNode::Code {
+        language,
+        text: text_lines.join("\n"),
+    }
+}
+
+fn flush_markdown_text(nodes: &mut Vec<FenceNode>, text_lines: &mut Vec<String>) {
+    if text_lines.is_empty() {
+        return;
+    }
+
+    nodes.push(FenceNode::MarkdownText(text_lines.join("\n")));
+    text_lines.clear();
+}
+
+fn fence_language(line: &str) -> Option<Option<String>> {
+    let rest = line.trim().strip_prefix("```")?;
+    if rest.starts_with('`') {
+        return None;
+    }
+
+    let language = rest.trim();
+    Some((!language.is_empty()).then(|| language.to_string()))
+}
+
+fn is_markdown_language(language: &str) -> bool {
+    language_token(language)
+        .map(|token| matches!(token.to_ascii_lowercase().as_str(), "markdown" | "md"))
+        .unwrap_or(false)
 }
 
 #[derive(Clone, Debug)]
@@ -99,20 +310,60 @@ fn render_assistant_items(items: &[AssistantItem]) -> Vec<BlockSegment> {
 
     for item in items {
         match item {
-            AssistantItem::Text(text) => {
-                segments.extend(
-                    MarkdownPreview::new(text)
-                        .styles(markdown_styles())
-                        .lines()
-                        .into_iter()
-                        .map(BlockSegment::line),
-                );
-            }
+            AssistantItem::Text(text) => segments.extend(render_assistant_text_segments(text)),
             AssistantItem::Image(image) => segments.push(BlockSegment::Image(image.clone())),
         }
     }
 
     non_empty(segments)
+}
+
+fn render_assistant_text_segments(text: &str) -> Vec<BlockSegment> {
+    render_fence_nodes(&parse_fence_tree(text))
+}
+
+fn render_fence_nodes(nodes: &[FenceNode]) -> Vec<BlockSegment> {
+    let mut segments = Vec::new();
+
+    for node in nodes {
+        let node_segments = match node {
+            FenceNode::MarkdownText(text) => render_markdown_preview_segments(text),
+            FenceNode::Markdown { children } => render_fence_nodes(children),
+            FenceNode::Code { language, text } => {
+                render_highlighted_text_segments(text, language.as_deref(), Style::default())
+            }
+        };
+
+        if node_segments.is_empty() {
+            continue;
+        }
+        if !segments.is_empty() && !segments.last().is_some_and(block_segment_is_blank) {
+            segments.push(BlockSegment::line(Line::from(String::new())));
+        }
+        segments.extend(node_segments);
+    }
+
+    segments
+}
+
+fn block_segment_is_blank(segment: &BlockSegment) -> bool {
+    match segment {
+        BlockSegment::Line(line) => line.line().spans.iter().all(|span| span.content.is_empty()),
+        BlockSegment::Image(_) => false,
+    }
+}
+
+fn render_markdown_preview_segments(text: &str) -> Vec<BlockSegment> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    MarkdownPreview::new(text)
+        .styles(markdown_styles())
+        .lines()
+        .into_iter()
+        .map(BlockSegment::line)
+        .collect()
 }
 
 fn render_tool_segments(tool: &ToolBlockState) -> Vec<BlockSegment> {
@@ -200,6 +451,29 @@ fn render_preformatted_text_segments(text: &str, style: Style) -> Vec<BlockSegme
 
     text.lines()
         .map(|line| Line::from(Span::styled(line.to_string(), style)))
+        .map(BlockSegment::preformatted_line)
+        .collect()
+}
+
+fn render_highlighted_text_segments(
+    text: &str,
+    language: Option<&str>,
+    style: Style,
+) -> Vec<BlockSegment> {
+    if text.is_empty() {
+        return vec![BlockSegment::preformatted_line(Line::from(Span::styled(
+            String::new(),
+            style,
+        )))];
+    }
+
+    let raw_lines = text.lines().map(str::to_string).collect::<Vec<_>>();
+    let lines = CODE_HIGHLIGHTER
+        .highlight_lines(language, &raw_lines, style)
+        .unwrap_or_else(|| plain_text_lines(&raw_lines, style));
+
+    lines
+        .into_iter()
         .map(BlockSegment::preformatted_line)
         .collect()
 }
@@ -328,6 +602,7 @@ fn tool_divider_text_style() -> Style {
 fn markdown_styles() -> MarkdownStyles {
     MarkdownStyles {
         text: Style::default(),
+        heading: heading_style(),
         code: code_style(),
         quote_marker: quote_marker_style(),
         quote: quote_style(),
@@ -335,8 +610,12 @@ fn markdown_styles() -> MarkdownStyles {
     }
 }
 
+fn heading_style() -> Style {
+    Style::default().add_modifier(Modifier::BOLD)
+}
+
 fn code_style() -> Style {
-    Style::default().fg(Color::Cyan).bg(Color::Black)
+    Style::default().fg(Color::Cyan)
 }
 
 fn quote_marker_style() -> Style {
@@ -390,6 +669,49 @@ mod tests {
 
         assert_eq!(text, vec!["• first"]);
         assert!(!text.iter().any(|line| line.contains("assistant")));
+    }
+
+    #[test]
+    fn assistant_fence_tree_previews_markdown_and_highlights_code() {
+        let mut state = AppState::default();
+        state.apply_delta(OutputContentDelta::Text(
+            "```markdown\n# Title\n\n- item\n\n```rust\nfn main() {}\n```\n```".to_string(),
+        ));
+
+        let lines = render_lines(&state.blocks()[0]);
+
+        assert_eq!(
+            lines.iter().map(line_text).collect::<Vec<_>>(),
+            vec!["Title", "", "• item", "", "fn main() {}"]
+        );
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| span.content.contains("fn") && span.style.fg.is_some())
+        );
+    }
+
+    #[test]
+    fn assistant_markdown_inline_code_is_styled() {
+        let mut state = AppState::default();
+        state.apply_delta(OutputContentDelta::Text("Use `copro-agent`.".to_string()));
+
+        let lines = render_lines(&state.blocks()[0]);
+        let code_span = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "copro-agent")
+            .expect("inline code span");
+
+        assert_eq!(line_text(&lines[0]), "Use copro-agent.");
+        assert_eq!(code_span.style.fg, Some(Color::Cyan));
     }
 
     #[test]
@@ -492,10 +814,14 @@ mod tests {
     }
 
     fn render_text(block: &BlockState) -> Vec<String> {
-        render_block_lines(block)
+        render_lines(block)
             .iter()
             .map(line_text)
             .collect::<Vec<_>>()
+    }
+
+    fn render_lines(block: &BlockState) -> Vec<Line<'static>> {
+        render_block_lines(block)
     }
 
     fn line_text(line: &Line<'_>) -> String {

@@ -1010,6 +1010,28 @@ mod tests {
     }
 
     #[test]
+    fn assistant_fence_tree_previews_markdown_and_highlights_nested_code() {
+        let mut state = AppState::default();
+        state.apply_delta(OutputContentDelta::Text(
+            "```markdown\n# Copro\n\n```sh\ncargo run\n```\ntext\n```".to_string(),
+        ));
+
+        let backend = TestBackend::new(48, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        render_conversation(&mut terminal, &state, &ImageRenderer::halfblocks(), 0, None);
+
+        let lines = buffer_lines(terminal.backend().buffer());
+        assert!(lines.iter().any(|line| line.contains("Copro")));
+        assert!(lines.iter().any(|line| line.contains("cargo run")));
+        assert!(lines.iter().any(|line| line.contains("text")));
+        assert!(!lines.iter().any(|line| line.contains("```markdown")));
+        assert!(!lines.iter().any(|line| line.contains("```sh")));
+        assert!(!lines.iter().any(|line| line.contains("╭")));
+        assert!(!lines.iter().any(|line| line.contains("╰")));
+    }
+
+    #[test]
     fn renders_latest_blocks_when_feed_is_taller_than_viewport() {
         let mut state = AppState::default();
         for text in ["one", "two", "three", "four"] {
@@ -1091,6 +1113,40 @@ mod tests {
         );
         assert_eq!(map.lines()[0].copy_separator, CopySeparator::None);
         assert_eq!(map.copy_visible_text(), "abcdefg");
+    }
+
+    #[test]
+    fn assistant_fence_tree_selection_copies_rendered_code_body() {
+        let mut state = AppState::default();
+        state.apply_delta(OutputContentDelta::Text(
+            "```rust\nfn main() {\n    println!(\"hi\");\n}\n```".to_string(),
+        ));
+
+        let map = selection_map(&state, Rect::new(0, 0, 48, 10), 0);
+
+        assert!(map.lines().iter().all(|line| !line.text.contains("```")));
+        assert!(map.lines().iter().all(|line| !line.text.contains("╭")));
+        assert!(map.lines().iter().all(|line| !line.text.contains("╰")));
+        let first = map
+            .lines()
+            .iter()
+            .find(|line| line.text == "fn main() {")
+            .expect("first code line in selection map");
+        let last = map
+            .lines()
+            .iter()
+            .find(|line| line.text == "}")
+            .expect("last code line in selection map");
+
+        let selection = Selection::new(
+            TextPosition::new(first.x, first.y),
+            TextPosition::new(last.end_x(), last.y),
+        );
+
+        assert_eq!(
+            map.copy_selection(selection),
+            "fn main() {\n    println!(\"hi\");\n}"
+        );
     }
 
     #[test]

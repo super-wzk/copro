@@ -13,6 +13,7 @@ coox-tui.workspace = true
 crossterm = "0.29"
 futures-util.workspace = true
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info", "unstable-widget-ref"] }
+syntect = "5"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 tui-overlay = "0.1.2"
 unicode-width = "0.2"
