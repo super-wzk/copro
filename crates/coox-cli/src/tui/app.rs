@@ -3,12 +3,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::agent::config::{build_model, RuntimeConfig};
+use crate::agent::config::{RuntimeConfig, build_model};
 use crate::agent::events::{apply_agent_event, apply_runtime_error};
 use crate::agent::runtime::{AgentRuntime, RuntimeEvent, RuntimeTurnSnapshot, SubmitError};
 use crate::command::{
-    builtins, parse_input, AppCommand, InputIntent, RuntimeCommand, SessionSnapshot,
-    SlashCommandRegistry, SlashError, TurnSnapshot, UiCommand,
+    AppCommand, InputIntent, RuntimeCommand, SessionSnapshot, SlashCommandRegistry, SlashError,
+    TurnSnapshot, UiCommand, builtins, parse_input,
 };
 use crate::tui::components::{
     command_menu::CommandMenu,
@@ -22,7 +22,7 @@ use coox_tui::{
     clipboard::ClipboardHandler,
     components::{
         image::ImageRenderer,
-        input::{InputBox, InputEditor, INPUT_BOX_PADDING},
+        input::{INPUT_BOX_PADDING, InputBox, InputEditor},
         scroll_view::ScrollViewState,
     },
     selection::{Selection, SelectionManager, SelectionMap, TextPosition},
@@ -34,11 +34,11 @@ use crossterm::event::{
     MouseEventKind,
 };
 use ratatui::{
-    backend::Backend, buffer::Buffer,
+    Frame, Terminal,
+    backend::Backend,
+    buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     widgets::FrameExt,
-    Frame,
-    Terminal,
 };
 use tokio::sync::mpsc;
 
@@ -521,6 +521,10 @@ fn set_conversation_scroll_from_bottom(app: &mut App, scroll_from_bottom: u32) -
     changed
 }
 
+fn scroll_conversation_to_bottom(app: &mut App) -> bool {
+    set_conversation_scroll_from_bottom(app, 0)
+}
+
 fn update_surface_selection_drag(app: &mut App, surface: AppSelectionSurface, mouse: MouseEvent) {
     let Some(area) = app.selection_manager.active_area() else {
         return;
@@ -859,7 +863,7 @@ fn handle_key(app: &mut App, key: KeyEvent, input_width: usize) -> DirtyState {
                 }
             }
             KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if set_conversation_scroll_from_bottom(app, 0) {
+                if scroll_conversation_to_bottom(app) {
                     DirtyState::conversation()
                 } else {
                     DirtyState::none()
@@ -1051,7 +1055,7 @@ fn submit_user_text(app: &mut App, user_text: String, original_text: String) {
     {
         Ok(()) => {
             app.state.push_input(message);
-            app.conversation_scroll_from_bottom = 0;
+            scroll_conversation_to_bottom(app);
         }
         Err(SubmitError::Busy) => {
             restore_input(app, &original_text);
@@ -1079,7 +1083,7 @@ fn dispatch_slash(app: &mut App, name: String, args: String, original_text: Stri
     };
 
     execute_app_commands(app, commands);
-    app.conversation_scroll_from_bottom = 0;
+    scroll_conversation_to_bottom(app);
 }
 
 fn session_snapshot(app: &App) -> SessionSnapshot<'_> {
@@ -1128,7 +1132,7 @@ fn execute_ui_command(app: &mut App, command: UiCommand) -> Result<(), String> {
             scroll_conversation(app, rows);
         }
         UiCommand::ScrollToBottom => {
-            set_conversation_scroll_from_bottom(app, 0);
+            scroll_conversation_to_bottom(app);
         }
         UiCommand::Quit => app.quit = true,
     }
@@ -1236,14 +1240,14 @@ fn push_notification(app: &mut App, kind: NotificationKind, message: impl Into<S
 mod tests {
     use super::*;
     use copro_agent::AgentHistory;
-    use copro_agent::{async_trait, AgentTurnConfig, ToolExecutionPolicy, ToolRouter};
+    use copro_agent::{AgentTurnConfig, ToolExecutionPolicy, ToolRouter, async_trait};
     use copro_api::error::{Error, Result};
     use copro_api::message::{Message, ToolCall, ToolResult};
     use copro_api::request::GenerateRequest;
     use copro_api::response::FinishReason;
     use copro_api::stream::{Model, ModelStream, OutputContentDelta, OutputStreamEvent};
     use copro_api::tool::ToolDefinition;
-    use ratatui::{backend::TestBackend, buffer::Buffer, style::Modifier, Terminal};
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Modifier};
     use std::sync::Arc;
 
     struct FinishedModel;
@@ -2351,11 +2355,14 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n"),
         ));
+        render_text(&mut app, 40, 8);
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
             40,
         );
+        assert!(app.conversation_scroll_from_bottom > 0);
+        assert!(app.frozen_selection_viewport_start.is_some());
         insert_text(&mut app.input, "next question");
 
         handle_key(
@@ -2365,6 +2372,7 @@ mod tests {
         );
 
         assert_eq!(app.conversation_scroll_from_bottom, 0);
+        assert_eq!(app.frozen_selection_viewport_start, None);
     }
 
     #[tokio::test]
