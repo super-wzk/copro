@@ -12,13 +12,16 @@ use crate::command::{
     AppCommand, InputIntent, RuntimeCommand, SessionSnapshot, SlashCommandRegistry, SlashError,
     TurnSnapshot, UiCommand, builtins, parse_input,
 };
+#[cfg(test)]
+use crate::tui::components::pending_inputs::PendingInput;
 use crate::tui::components::{
     command_menu::CommandMenu,
     conversation::{ConversationLayout, ConversationView},
     notifications::{NotificationCenter, NotificationKind},
+    pending_inputs::{PendingDelivery, PendingInputs},
     status::{StatusBar, StatusBarState},
 };
-use crate::tui::state::{AppState, PendingDelivery};
+use crate::tui::state::AppState;
 use crate::tui::terminal::Tui;
 use coox_tui::{
     clipboard::ClipboardHandler,
@@ -40,9 +43,7 @@ use ratatui::{
     backend::Backend,
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{FrameExt, Paragraph},
+    widgets::FrameExt,
 };
 use tokio::sync::mpsc;
 
@@ -53,7 +54,6 @@ const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
 const IDLE_INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 const IMAGE_INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(16);
 const MAX_EVENT_BURST: usize = 4096;
-const MAX_PENDING_INPUT_ROWS: usize = 3;
 
 #[derive(Debug)]
 pub struct App {
@@ -99,80 +99,6 @@ struct SelectionAutoscroll {
     scroll_delta: i32,
     column: u16,
     next_tick: Instant,
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct PendingInputs {
-    items: Vec<PendingInput>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingInput {
-    delivery: PendingDelivery,
-    content: Vec<InputContent>,
-}
-
-impl PendingInputs {
-    fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
-    fn push(&mut self, message: InputMessage, delivery: PendingDelivery) {
-        if let InputMessage::User(content) = message {
-            self.items.push(PendingInput { delivery, content });
-        }
-    }
-
-    fn commit_next(&mut self, message: &InputMessage, delivery: PendingDelivery) -> bool {
-        let InputMessage::User(expected) = message else {
-            return false;
-        };
-        let Some(index) = self
-            .items
-            .iter()
-            .position(|pending| pending.delivery == delivery && pending.content == *expected)
-        else {
-            return false;
-        };
-        self.items.remove(index);
-        true
-    }
-
-    fn requeue_next_steer(&mut self, message: &InputMessage) -> bool {
-        let InputMessage::User(expected) = message else {
-            return false;
-        };
-        let Some(pending) = self.items.iter_mut().find(|pending| {
-            pending.delivery == PendingDelivery::Steer && pending.content == *expected
-        }) else {
-            return false;
-        };
-        pending.delivery = PendingDelivery::Queue;
-        true
-    }
-
-    fn render_height(&self) -> u16 {
-        self.render_lines().len() as u16
-    }
-
-    fn render_lines(&self) -> Vec<Line<'static>> {
-        if self.items.len() <= MAX_PENDING_INPUT_ROWS {
-            return self.items.iter().map(pending_input_line).collect();
-        }
-
-        let visible = MAX_PENDING_INPUT_ROWS.saturating_sub(1);
-        let mut lines = self
-            .items
-            .iter()
-            .take(visible)
-            .map(pending_input_line)
-            .collect::<Vec<_>>();
-        lines.push(Line::from(Span::styled(
-            format!("+{} pending", self.items.len().saturating_sub(visible)),
-            pending_overflow_style(),
-        )));
-        lines
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -393,7 +319,7 @@ fn render_app(frame: &mut Frame<'_>, app: &mut App) {
         .split(area);
 
     render_conversation_area(frame, app, chunks[0]);
-    render_pending_inputs(frame, &app.pending_inputs, chunks[1]);
+    app.pending_inputs.render(frame, chunks[1]);
     frame.render_stateful_widget_ref(
         input_box.selection(input_selection),
         chunks[3],
@@ -413,68 +339,6 @@ fn render_app(frame: &mut Frame<'_>, app: &mut App) {
 
 fn input_box() -> InputBox {
     InputBox::new().style(crate::tui::components::blocks::user_style())
-}
-
-fn render_pending_inputs(frame: &mut Frame<'_>, pending: &PendingInputs, area: Rect) {
-    if area.is_empty() || pending.is_empty() {
-        return;
-    }
-
-    frame.render_widget(
-        Paragraph::new(pending.render_lines()).style(pending_area_style()),
-        area,
-    );
-}
-
-fn pending_input_line(pending: &PendingInput) -> Line<'static> {
-    let label = match pending.delivery {
-        PendingDelivery::Steer => "steer",
-        PendingDelivery::Queue => "queue",
-    };
-    Line::from(vec![
-        Span::styled(label.to_string(), pending_label_style(pending.delivery)),
-        Span::raw(" "),
-        Span::styled(
-            pending_input_preview(&pending.content),
-            pending_text_style(),
-        ),
-    ])
-}
-
-fn pending_input_preview(content: &[InputContent]) -> String {
-    content
-        .iter()
-        .map(|item| match item {
-            InputContent::Text(text) => text.replace(['\n', '\r'], " "),
-            InputContent::Image(_) => "[image]".to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn pending_area_style() -> Style {
-    Style::default().fg(Color::Gray).bg(Color::Rgb(31, 34, 40))
-}
-
-fn pending_label_style(delivery: PendingDelivery) -> Style {
-    match delivery {
-        PendingDelivery::Steer => Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-        PendingDelivery::Queue => Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD),
-    }
-}
-
-fn pending_text_style() -> Style {
-    Style::default().fg(Color::Gray)
-}
-
-fn pending_overflow_style() -> Style {
-    Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::ITALIC)
 }
 
 fn render_conversation_area(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -2608,11 +2472,11 @@ mod tests {
         assert_eq!(app.notifications.current_message(), None);
         assert!(app.state.blocks().is_empty());
         assert_eq!(
-            app.pending_inputs.items,
-            vec![PendingInput {
-                delivery: PendingDelivery::Steer,
-                content: vec![InputContent::Text("second\nline".to_string())],
-            }]
+            app.pending_inputs.items(),
+            &[PendingInput::new(
+                PendingDelivery::Steer,
+                vec![InputContent::Text("second\nline".to_string())],
+            )]
         );
 
         app.runtime_events_tx
@@ -2680,11 +2544,11 @@ mod tests {
         assert_eq!(app.input.text(), "");
         assert!(app.state.blocks().is_empty());
         assert_eq!(
-            app.pending_inputs.items,
-            vec![PendingInput {
-                delivery: PendingDelivery::Queue,
-                content: vec![InputContent::Text("second".to_string())],
-            }]
+            app.pending_inputs.items(),
+            &[PendingInput::new(
+                PendingDelivery::Queue,
+                vec![InputContent::Text("second".to_string())],
+            )]
         );
 
         app.runtime_events_tx

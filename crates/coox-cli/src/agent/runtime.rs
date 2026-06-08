@@ -10,12 +10,14 @@ use std::sync::{Arc, Mutex};
 use std::{error::Error as StdError, fmt};
 use tokio::sync::mpsc;
 
-type QueuedInputBatch = Vec<InputMessage>;
+struct QueuedInputBatch {
+    inputs: Vec<InputMessage>,
+    events: mpsc::UnboundedSender<RuntimeEvent>,
+}
 
 struct RuntimeState {
     turn: RuntimeTurn,
     queue: VecDeque<QueuedInputBatch>,
-    events: Option<mpsc::UnboundedSender<RuntimeEvent>>,
 }
 
 #[derive(Default)]
@@ -181,7 +183,6 @@ impl AgentRuntime {
             state: Arc::new(Mutex::new(RuntimeState {
                 turn: RuntimeTurn::Ready { history },
                 queue: VecDeque::new(),
-                events: None,
             })),
             config,
             model,
@@ -283,7 +284,6 @@ impl AgentRuntime {
         let model = Arc::clone(&self.model);
         let tools = Arc::clone(&self.tools);
         let turn = start_turn(history, config, model, tools);
-        state.events = Some(events.clone());
         state.turn = RuntimeTurn::Running {
             handle: turn.clone(),
             abort_requested: false,
@@ -318,12 +318,15 @@ impl AgentRuntime {
 
     fn queue_input(&mut self, input: InputMessage, events: mpsc::UnboundedSender<RuntimeEvent>) {
         let mut state = self.state.lock().expect("runtime state mutex poisoned");
-        state.events = Some(events);
-        state.queue.push_back(vec![input]);
+        state.queue.push_back(QueuedInputBatch {
+            inputs: vec![input],
+            events,
+        });
     }
 
     pub fn finish_success(&mut self, history: AgentHistory) {
-        if let Some((turn, rollback, events, inputs)) = self.promote_next_queued(history) {
+        if let Some((turn, rollback, batch)) = self.promote_next_queued(history) {
+            let QueuedInputBatch { inputs, events } = batch;
             for input in inputs {
                 let _ = events.send(RuntimeEvent::QueuedInputSubmitted { input });
             }
@@ -398,27 +401,16 @@ impl AgentRuntime {
     fn promote_next_queued(
         &mut self,
         history: AgentHistory,
-    ) -> Option<(
-        AgentTurnHandle,
-        AgentHistory,
-        mpsc::UnboundedSender<RuntimeEvent>,
-        QueuedInputBatch,
-    )> {
+    ) -> Option<(AgentTurnHandle, AgentHistory, QueuedInputBatch)> {
         let mut state = self.state.lock().expect("runtime state mutex poisoned");
-        let Some(inputs) = state.queue.pop_front() else {
+        let Some(batch) = state.queue.pop_front() else {
             state.turn = RuntimeTurn::Ready { history };
-            return None;
-        };
-
-        let Some(events) = state.events.clone() else {
-            state.turn = RuntimeTurn::Ready { history };
-            state.queue.push_front(inputs);
             return None;
         };
 
         let mut history = history;
         let rollback = history.clone();
-        for input in inputs.iter().cloned() {
+        for input in batch.inputs.iter().cloned() {
             history.push_input(input);
         }
         let turn = start_turn(
@@ -433,7 +425,7 @@ impl AgentRuntime {
             pending_steers: VecDeque::new(),
         };
 
-        Some((turn, rollback, events, inputs))
+        Some((turn, rollback, batch))
     }
 }
 
@@ -562,7 +554,10 @@ fn requeue_uncommitted_steers(
             pending_steers.drain(..).collect::<Vec<_>>()
         };
         if !inputs.is_empty() {
-            state.queue.push_front(inputs.clone());
+            state.queue.push_front(QueuedInputBatch {
+                inputs: inputs.clone(),
+                events: events.clone(),
+            });
         }
         inputs
     };
@@ -786,6 +781,18 @@ mod tests {
         }
     }
 
+    async fn recv_queued_input(rx: &mut mpsc::UnboundedReceiver<RuntimeEvent>) -> InputMessage {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("runtime event timed out")
+                .expect("runtime event channel closed");
+            if let RuntimeEvent::QueuedInputSubmitted { input } = event {
+                return input;
+            }
+        }
+    }
+
     async fn wait_until_not_busy(runtime: &AgentRuntime) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while runtime.is_busy() {
@@ -908,6 +915,8 @@ mod tests {
             Arc::new(NoopTools),
         );
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        let (third_tx, mut third_rx) = mpsc::unbounded_channel();
 
         assert_eq!(
             deliver(&mut runtime, DeliveryIntent::Submit, "first", tx.clone()),
@@ -918,21 +927,31 @@ mod tests {
         };
 
         assert_eq!(
-            deliver(&mut runtime, DeliveryIntent::Queue, "second", tx.clone()),
+            deliver(&mut runtime, DeliveryIntent::Queue, "second", second_tx),
             Ok(DeliveryResult::Queued)
         );
         assert_eq!(
-            deliver(&mut runtime, DeliveryIntent::Queue, "third", tx),
+            deliver(&mut runtime, DeliveryIntent::Queue, "third", third_tx),
             Ok(DeliveryResult::Queued)
         );
         runtime.finish_success(history);
 
-        let RuntimeEvent::TurnFinished { history } = recv_terminal_event(&mut rx).await else {
+        assert_eq!(
+            recv_queued_input(&mut second_rx).await,
+            user_message("second")
+        );
+        let RuntimeEvent::TurnFinished { history } = recv_terminal_event(&mut second_rx).await
+        else {
             panic!("expected second turn finished event");
         };
         runtime.finish_success(history);
 
-        let RuntimeEvent::TurnFinished { history } = recv_terminal_event(&mut rx).await else {
+        assert_eq!(
+            recv_queued_input(&mut third_rx).await,
+            user_message("third")
+        );
+        let RuntimeEvent::TurnFinished { history } = recv_terminal_event(&mut third_rx).await
+        else {
             panic!("expected third turn finished event");
         };
         runtime.finish_success(history);
