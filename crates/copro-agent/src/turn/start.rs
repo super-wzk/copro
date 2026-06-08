@@ -1,5 +1,5 @@
 use super::handle::{AgentTurnCompletion, AgentTurnHandle};
-use super::{AgentTurn, AgentTurnConfig, AgentTurnResources};
+use super::{AgentTurn, AgentTurnConfig, AgentTurnResources, PendingTurnInputs};
 use crate::cancel::TurnCancellation;
 use crate::history::AgentHistory;
 use crate::tools::ToolRouter;
@@ -18,10 +18,16 @@ pub fn start_turn(
     let (events, rx) = mpsc::channel(EVENT_BUFFER);
     let cancellation = TurnCancellation::new();
     let completion = AgentTurnCompletion::new();
-    let handle = AgentTurnHandle::new(rx, cancellation.clone(), completion.clone());
+    let pending_inputs = PendingTurnInputs::new();
+    let handle = AgentTurnHandle::new(
+        rx,
+        cancellation.clone(),
+        completion.clone(),
+        pending_inputs.clone(),
+    );
 
     tokio::spawn(async move {
-        let mut resources = AgentTurnResources::new(history, config, model, tools);
+        let mut resources = AgentTurnResources::new(history, config, model, tools, pending_inputs);
         AgentTurn::new(&mut resources, cancellation)
             .execute(events)
             .await;

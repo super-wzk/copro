@@ -1759,6 +1759,73 @@ async fn build_request_carries_agent_baseline_config() {
 }
 
 #[tokio::test]
+async fn turn_handle_commits_multiple_pending_inputs_before_request() {
+    let captured = Arc::new(Mutex::new(None));
+    let model = Arc::new(CapturingModel {
+        captured: Arc::clone(&captured),
+    });
+    let agent = TestSession::new(model, Arc::new(EmptyToolRouter));
+    agent
+        .replace_messages(vec![Message::user(vec![InputContent::Text(
+            "initial".to_string(),
+        )])])
+        .await
+        .unwrap();
+
+    let turn = agent.start_turn().await.unwrap();
+    let steer_one = InputMessage::User(vec![InputContent::Text("steer one".to_string())]);
+    let steer_two = InputMessage::User(vec![InputContent::Text("steer two".to_string())]);
+    turn.push_input(steer_one.clone());
+    turn.push_input(steer_two.clone());
+
+    let events = turn
+        .clone()
+        .events()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    let committed = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::InputCommitted {
+                message_index,
+                input,
+                ..
+            } => Some((*message_index, input.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        committed,
+        vec![(1, steer_one.clone()), (2, steer_two.clone())]
+    );
+
+    let request = captured.lock().unwrap().take().expect("request captured");
+    assert_eq!(
+        request.messages,
+        vec![
+            Message::user(vec![InputContent::Text("initial".to_string())]),
+            steer_one.clone().into(),
+            steer_two.clone().into(),
+        ]
+    );
+
+    let history = turn.into_history().await;
+    assert_eq!(
+        history.messages(),
+        &[
+            Message::user(vec![InputContent::Text("initial".to_string())]),
+            steer_one.into(),
+            steer_two.into(),
+            Message::assistant(Vec::new()),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn agent_history_and_turn_config_round_trip_state() {
     let mut options = GenerateRequestOptions {
         temperature: Some(0.7),

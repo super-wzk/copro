@@ -4,6 +4,9 @@ use copro_agent::AgentEvent;
 pub fn apply_agent_event(event: AgentEvent, state: &mut AppState) {
     match event {
         AgentEvent::TurnStarted | AgentEvent::TurnFinished | AgentEvent::TurnAborted => {}
+        AgentEvent::InputCommitted { input, .. } => {
+            state.push_input(input);
+        }
         AgentEvent::ModelDelta {
             content_index,
             delta,

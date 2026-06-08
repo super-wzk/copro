@@ -5,7 +5,9 @@ use std::{
 
 use crate::agent::config::{RuntimeConfig, build_model};
 use crate::agent::events::{apply_agent_event, apply_runtime_error};
-use crate::agent::runtime::{AgentRuntime, RuntimeEvent, RuntimeTurnSnapshot, SubmitError};
+use crate::agent::{
+    AgentRuntime, DeliveryIntent, DeliveryResult, RuntimeEvent, RuntimeTurnSnapshot, SubmitError,
+};
 use crate::command::{
     AppCommand, InputIntent, RuntimeCommand, SessionSnapshot, SlashCommandRegistry, SlashError,
     TurnSnapshot, UiCommand, builtins, parse_input,
@@ -16,7 +18,7 @@ use crate::tui::components::{
     notifications::{NotificationCenter, NotificationKind},
     status::{StatusBar, StatusBarState},
 };
-use crate::tui::state::AppState;
+use crate::tui::state::{AppState, PendingDelivery};
 use crate::tui::terminal::Tui;
 use coox_tui::{
     clipboard::ClipboardHandler,
@@ -38,7 +40,9 @@ use ratatui::{
     backend::Backend,
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
-    widgets::FrameExt,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{FrameExt, Paragraph},
 };
 use tokio::sync::mpsc;
 
@@ -49,6 +53,7 @@ const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
 const IDLE_INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 const IMAGE_INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(16);
 const MAX_EVENT_BURST: usize = 4096;
+const MAX_PENDING_INPUT_ROWS: usize = 3;
 
 #[derive(Debug)]
 pub struct App {
@@ -59,6 +64,7 @@ pub struct App {
     runtime_events_rx: mpsc::UnboundedReceiver<RuntimeEvent>,
     image_renderer: ImageRenderer,
     state: AppState,
+    pending_inputs: PendingInputs,
     conversation_scroll_from_bottom: u32,
     input: InputEditor,
     command_menu: CommandMenu,
@@ -93,6 +99,80 @@ struct SelectionAutoscroll {
     scroll_delta: i32,
     column: u16,
     next_tick: Instant,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PendingInputs {
+    items: Vec<PendingInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingInput {
+    delivery: PendingDelivery,
+    content: Vec<InputContent>,
+}
+
+impl PendingInputs {
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    fn push(&mut self, message: InputMessage, delivery: PendingDelivery) {
+        if let InputMessage::User(content) = message {
+            self.items.push(PendingInput { delivery, content });
+        }
+    }
+
+    fn commit_next(&mut self, message: &InputMessage, delivery: PendingDelivery) -> bool {
+        let InputMessage::User(expected) = message else {
+            return false;
+        };
+        let Some(index) = self
+            .items
+            .iter()
+            .position(|pending| pending.delivery == delivery && pending.content == *expected)
+        else {
+            return false;
+        };
+        self.items.remove(index);
+        true
+    }
+
+    fn requeue_next_steer(&mut self, message: &InputMessage) -> bool {
+        let InputMessage::User(expected) = message else {
+            return false;
+        };
+        let Some(pending) = self.items.iter_mut().find(|pending| {
+            pending.delivery == PendingDelivery::Steer && pending.content == *expected
+        }) else {
+            return false;
+        };
+        pending.delivery = PendingDelivery::Queue;
+        true
+    }
+
+    fn render_height(&self) -> u16 {
+        self.render_lines().len() as u16
+    }
+
+    fn render_lines(&self) -> Vec<Line<'static>> {
+        if self.items.len() <= MAX_PENDING_INPUT_ROWS {
+            return self.items.iter().map(pending_input_line).collect();
+        }
+
+        let visible = MAX_PENDING_INPUT_ROWS.saturating_sub(1);
+        let mut lines = self
+            .items
+            .iter()
+            .take(visible)
+            .map(pending_input_line)
+            .collect::<Vec<_>>();
+        lines.push(Line::from(Span::styled(
+            format!("+{} pending", self.items.len().saturating_sub(visible)),
+            pending_overflow_style(),
+        )));
+        lines
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,6 +238,7 @@ impl App {
             runtime_events_rx,
             image_renderer,
             state: AppState::default(),
+            pending_inputs: PendingInputs::default(),
             conversation_scroll_from_bottom: 0,
             input: InputEditor::default(),
             command_menu: CommandMenu::new(),
@@ -248,6 +329,10 @@ fn drain_runtime_events(app: &mut App) -> DirtyState {
         match event {
             RuntimeEvent::Agent(event) => {
                 let aborted = matches!(&event, copro_agent::AgentEvent::TurnAborted);
+                if let copro_agent::AgentEvent::InputCommitted { input, .. } = &event {
+                    app.pending_inputs
+                        .commit_next(input, PendingDelivery::Steer);
+                }
                 apply_agent_event(event, &mut app.state);
                 if aborted {
                     push_notification(app, NotificationKind::Warning, "aborted");
@@ -260,6 +345,17 @@ fn drain_runtime_events(app: &mut App) -> DirtyState {
                 app.runtime.finish_failure(history);
                 push_notification(app, NotificationKind::Error, message.clone());
                 apply_runtime_error(message, &mut app.state);
+            }
+            RuntimeEvent::SteerQueued { input } => {
+                if !app.pending_inputs.requeue_next_steer(&input) {
+                    app.pending_inputs.push(input, PendingDelivery::Queue);
+                }
+            }
+            RuntimeEvent::QueuedInputSubmitted { input } => {
+                app.pending_inputs
+                    .commit_next(&input, PendingDelivery::Queue);
+                app.state.push_input(input);
+                scroll_conversation_to_bottom(app);
             }
             RuntimeEvent::ControlFailed { message } => {
                 app.state.push_command_error(message.clone());
@@ -284,10 +380,12 @@ fn render_app(frame: &mut Frame<'_>, app: &mut App) {
     let input_box = input_box().preserve_viewport(input_selection.is_some());
     let input_layout = input_box.layout(&app.input, area.width);
     let input_height = input_layout.render_height();
+    let pending_height = app.pending_inputs.render_height();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
+            Constraint::Length(pending_height),
             Constraint::Length(INPUT_TOP_GAP),
             Constraint::Length(input_height),
             Constraint::Length(1),
@@ -295,25 +393,88 @@ fn render_app(frame: &mut Frame<'_>, app: &mut App) {
         .split(area);
 
     render_conversation_area(frame, app, chunks[0]);
+    render_pending_inputs(frame, &app.pending_inputs, chunks[1]);
     frame.render_stateful_widget_ref(
         input_box.selection(input_selection),
-        chunks[2],
+        chunks[3],
         &mut app.input,
     );
     app.selection_manager.register(
         AppSelectionSurface::Input,
-        input_layout.selection_map(&app.input, chunks[2]),
+        input_layout.selection_map(&app.input, chunks[3]),
     );
-    if let Some(position) = input_layout.cursor_position(chunks[2]) {
+    if let Some(position) = input_layout.cursor_position(chunks[3]) {
         frame.set_cursor_position(position);
     }
-    frame.render_widget_ref(StatusBar::new(&app.status), chunks[3]);
+    frame.render_widget_ref(StatusBar::new(&app.status), chunks[4]);
     render_command_menu(frame, app, chunks[0]);
     app.notifications.render(frame, chunks[0]);
 }
 
 fn input_box() -> InputBox {
     InputBox::new().style(crate::tui::components::blocks::user_style())
+}
+
+fn render_pending_inputs(frame: &mut Frame<'_>, pending: &PendingInputs, area: Rect) {
+    if area.is_empty() || pending.is_empty() {
+        return;
+    }
+
+    frame.render_widget(
+        Paragraph::new(pending.render_lines()).style(pending_area_style()),
+        area,
+    );
+}
+
+fn pending_input_line(pending: &PendingInput) -> Line<'static> {
+    let label = match pending.delivery {
+        PendingDelivery::Steer => "steer",
+        PendingDelivery::Queue => "queue",
+    };
+    Line::from(vec![
+        Span::styled(label.to_string(), pending_label_style(pending.delivery)),
+        Span::raw(" "),
+        Span::styled(
+            pending_input_preview(&pending.content),
+            pending_text_style(),
+        ),
+    ])
+}
+
+fn pending_input_preview(content: &[InputContent]) -> String {
+    content
+        .iter()
+        .map(|item| match item {
+            InputContent::Text(text) => text.replace(['\n', '\r'], " "),
+            InputContent::Image(_) => "[image]".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn pending_area_style() -> Style {
+    Style::default().fg(Color::Gray).bg(Color::Rgb(31, 34, 40))
+}
+
+fn pending_label_style(delivery: PendingDelivery) -> Style {
+    match delivery {
+        PendingDelivery::Steer => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        PendingDelivery::Queue => Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+    }
+}
+
+fn pending_text_style() -> Style {
+    Style::default().fg(Color::Gray)
+}
+
+fn pending_overflow_style() -> Style {
+    Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC)
 }
 
 fn render_conversation_area(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -878,7 +1039,15 @@ fn handle_key(app: &mut App, key: KeyEvent, input_width: usize) -> DirtyState {
                 DirtyState::frame()
             }
             KeyCode::Enter if key.modifiers.is_empty() => {
-                submit_input(app);
+                send_current_input(app, input_submit_delivery(app));
+                DirtyState::conversation()
+            }
+            KeyCode::Tab if app.runtime.is_busy() => {
+                send_current_input(app, DeliveryIntent::Queue);
+                DirtyState::conversation()
+            }
+            KeyCode::Tab if key.modifiers.is_empty() => {
+                send_current_input(app, DeliveryIntent::Submit);
                 DirtyState::conversation()
             }
             KeyCode::Backspace => {
@@ -1026,19 +1195,19 @@ fn accept_selected_menu_command(app: &mut App, submit: bool) -> bool {
     app.command_menu.input_changed();
 
     if submit {
-        submit_input(app);
+        send_current_input(app, input_submit_delivery(app));
     }
 
     true
 }
 
-fn submit_input(app: &mut App) {
+fn send_current_input(app: &mut App, delivery: DeliveryIntent) {
     let Some(text) = app.input.take_submission() else {
         return;
     };
 
     match parse_input(&text) {
-        Some(InputIntent::UserText(user_text)) => submit_user_text(app, user_text, text),
+        Some(InputIntent::UserText(user_text)) => send_user_text(app, user_text, text, delivery),
         Some(InputIntent::Slash(invocation)) => {
             dispatch_slash(app, invocation.name, invocation.args, text)
         }
@@ -1046,15 +1215,36 @@ fn submit_input(app: &mut App) {
     }
 }
 
-fn submit_user_text(app: &mut App, user_text: String, original_text: String) {
+fn input_submit_delivery(app: &App) -> DeliveryIntent {
+    if app.runtime.is_busy() {
+        DeliveryIntent::Steer
+    } else {
+        DeliveryIntent::Submit
+    }
+}
+
+fn send_user_text(
+    app: &mut App,
+    user_text: String,
+    original_text: String,
+    delivery: DeliveryIntent,
+) {
     let message = InputMessage::User(vec![InputContent::Text(user_text)]);
 
     match app
         .runtime
-        .submit(message.clone(), app.runtime_events_tx.clone())
+        .accept_user_input(message.clone(), delivery, app.runtime_events_tx.clone())
     {
-        Ok(()) => {
+        Ok(DeliveryResult::Submitted) => {
             app.state.push_input(message);
+            scroll_conversation_to_bottom(app);
+        }
+        Ok(DeliveryResult::Steered) => {
+            app.pending_inputs.push(message, PendingDelivery::Steer);
+            scroll_conversation_to_bottom(app);
+        }
+        Ok(DeliveryResult::Queued) => {
+            app.pending_inputs.push(message, PendingDelivery::Queue);
             scroll_conversation_to_bottom(app);
         }
         Err(SubmitError::Busy) => {
@@ -1968,6 +2158,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_tab_submits_user_message() {
+        let mut app = app_with(FinishedModel);
+        insert_text(&mut app.input, "tab submit");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            20,
+        );
+
+        assert!(matches!(
+            app.state.blocks()[0].kind(),
+            crate::tui::state::BlockKind::User { content }
+                if content == &vec![InputContent::Text("tab submit".to_string())]
+        ));
+        assert!(app.pending_inputs.is_empty());
+        assert_eq!(app.notifications.current_message(), None);
+    }
+
+    #[tokio::test]
     async fn double_slash_submits_escaped_user_text() {
         let mut app = app_with(FinishedModel);
         insert_text(&mut app.input, "//hello");
@@ -2376,14 +2586,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn busy_submit_restores_input_and_does_not_append_user_block() {
+    async fn busy_submit_creates_pending_steer_block() {
         let mut app = app_with(PendingModel);
-        app.runtime
-            .submit(
+        assert_eq!(
+            app.runtime.accept_user_input(
                 InputMessage::User(vec![InputContent::Text("first".to_string())]),
+                DeliveryIntent::Submit,
                 app.runtime_events_tx.clone(),
-            )
-            .unwrap();
+            ),
+            Ok(DeliveryResult::Submitted)
+        );
         insert_text(&mut app.input, "second\nline");
 
         handle_key(
@@ -2392,9 +2604,102 @@ mod tests {
             20,
         );
 
-        assert_eq!(app.input.text(), "second\nline");
+        assert_eq!(app.input.text(), "");
+        assert_eq!(app.notifications.current_message(), None);
         assert!(app.state.blocks().is_empty());
-        assert_eq!(app.notifications.current_message(), Some("busy"));
+        assert_eq!(
+            app.pending_inputs.items,
+            vec![PendingInput {
+                delivery: PendingDelivery::Steer,
+                content: vec![InputContent::Text("second\nline".to_string())],
+            }]
+        );
+
+        app.runtime_events_tx
+            .send(RuntimeEvent::Agent(
+                copro_agent::AgentEvent::InputCommitted {
+                    step_id: copro_agent::AgentStepId { tick: 2 },
+                    message_index: 1,
+                    input: InputMessage::User(vec![InputContent::Text("second\nline".to_string())]),
+                },
+            ))
+            .unwrap();
+        drain_runtime_events(&mut app);
+
+        assert!(app.pending_inputs.is_empty());
+        assert!(matches!(
+            app.state.blocks()[0].kind(),
+            crate::tui::state::BlockKind::User { content }
+                if content == &vec![InputContent::Text("second\nline".to_string())]
+        ));
+    }
+
+    #[tokio::test]
+    async fn pending_input_renders_above_input_without_entering_conversation() {
+        let mut app = app_with(PendingModel);
+        assert_eq!(
+            app.runtime.accept_user_input(
+                InputMessage::User(vec![InputContent::Text("first".to_string())]),
+                DeliveryIntent::Submit,
+                app.runtime_events_tx.clone(),
+            ),
+            Ok(DeliveryResult::Submitted)
+        );
+        insert_text(&mut app.input, "second");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            40,
+        );
+        let screen = render_text(&mut app, 40, 8);
+
+        assert!(app.state.blocks().is_empty());
+        assert!(screen.contains("steer second"));
+    }
+
+    #[tokio::test]
+    async fn busy_tab_creates_pending_queue_block() {
+        let mut app = app_with(PendingModel);
+        assert_eq!(
+            app.runtime.accept_user_input(
+                InputMessage::User(vec![InputContent::Text("first".to_string())]),
+                DeliveryIntent::Submit,
+                app.runtime_events_tx.clone(),
+            ),
+            Ok(DeliveryResult::Submitted)
+        );
+        insert_text(&mut app.input, "second");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            20,
+        );
+
+        assert_eq!(app.input.text(), "");
+        assert!(app.state.blocks().is_empty());
+        assert_eq!(
+            app.pending_inputs.items,
+            vec![PendingInput {
+                delivery: PendingDelivery::Queue,
+                content: vec![InputContent::Text("second".to_string())],
+            }]
+        );
+
+        app.runtime_events_tx
+            .send(RuntimeEvent::QueuedInputSubmitted {
+                input: InputMessage::User(vec![InputContent::Text("second".to_string())]),
+            })
+            .unwrap();
+        drain_runtime_events(&mut app);
+
+        assert!(app.pending_inputs.is_empty());
+        assert!(matches!(
+            app.state.blocks()[0].kind(),
+            crate::tui::state::BlockKind::User { content }
+                if content == &vec![InputContent::Text("second".to_string())]
+        ));
     }
 
     #[tokio::test]

@@ -5,12 +5,17 @@ use copro_agent::{
 use copro_api::message::InputMessage;
 use copro_api::stream::Model;
 use futures_util::StreamExt;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::{error::Error as StdError, fmt};
 use tokio::sync::mpsc;
 
+type QueuedInputBatch = Vec<InputMessage>;
+
 struct RuntimeState {
     turn: RuntimeTurn,
+    queue: VecDeque<QueuedInputBatch>,
+    events: Option<mpsc::UnboundedSender<RuntimeEvent>>,
 }
 
 #[derive(Default)]
@@ -23,6 +28,7 @@ enum RuntimeTurn {
     Running {
         handle: AgentTurnHandle,
         abort_requested: bool,
+        pending_steers: VecDeque<InputMessage>,
     },
     PendingAck {
         history: AgentHistory,
@@ -92,6 +98,12 @@ pub enum RuntimeEvent {
         history: AgentHistory,
         message: String,
     },
+    SteerQueued {
+        input: InputMessage,
+    },
+    QueuedInputSubmitted {
+        input: InputMessage,
+    },
     ControlFailed {
         message: String,
     },
@@ -100,6 +112,20 @@ pub enum RuntimeEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitError {
     Busy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryIntent {
+    Submit,
+    Steer,
+    Queue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryResult {
+    Submitted,
+    Steered,
+    Queued,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +180,8 @@ impl AgentRuntime {
         Self {
             state: Arc::new(Mutex::new(RuntimeState {
                 turn: RuntimeTurn::Ready { history },
+                queue: VecDeque::new(),
+                events: None,
             })),
             config,
             model,
@@ -202,6 +230,7 @@ impl AgentRuntime {
     pub fn reset_history(&mut self, seed: AgentHistory) -> Result<(), RuntimeBusy> {
         let mut state = self.state.lock().expect("runtime state mutex poisoned");
         if matches!(state.turn, RuntimeTurn::Idle | RuntimeTurn::Ready { .. }) {
+            state.queue.clear();
             state.turn = RuntimeTurn::Ready { history: seed };
             Ok(())
         } else {
@@ -221,11 +250,27 @@ impl AgentRuntime {
     ///
     /// This method calls [`tokio::spawn`] and must be called from within an
     /// active Tokio runtime.
-    pub fn submit(
+    pub fn accept_user_input(
+        &mut self,
+        input: InputMessage,
+        delivery: DeliveryIntent,
+        events: mpsc::UnboundedSender<RuntimeEvent>,
+    ) -> Result<DeliveryResult, SubmitError> {
+        match delivery {
+            DeliveryIntent::Submit => self.start_input_turn(input, events),
+            DeliveryIntent::Steer => self.steer_input(input),
+            DeliveryIntent::Queue => {
+                self.queue_input(input, events);
+                Ok(DeliveryResult::Queued)
+            }
+        }
+    }
+
+    fn start_input_turn(
         &mut self,
         input: InputMessage,
         events: mpsc::UnboundedSender<RuntimeEvent>,
-    ) -> Result<(), SubmitError> {
+    ) -> Result<DeliveryResult, SubmitError> {
         let mut state = self.state.lock().expect("runtime state mutex poisoned");
         let RuntimeTurn::Ready { history } = &state.turn else {
             return Err(SubmitError::Busy);
@@ -238,9 +283,11 @@ impl AgentRuntime {
         let model = Arc::clone(&self.model);
         let tools = Arc::clone(&self.tools);
         let turn = start_turn(history, config, model, tools);
+        state.events = Some(events.clone());
         state.turn = RuntimeTurn::Running {
             handle: turn.clone(),
             abort_requested: false,
+            pending_steers: VecDeque::new(),
         };
         drop(state);
 
@@ -250,11 +297,41 @@ impl AgentRuntime {
             drive_turn(turn, rollback, events, state).await;
         });
 
-        Ok(())
+        Ok(DeliveryResult::Submitted)
+    }
+
+    fn steer_input(&mut self, input: InputMessage) -> Result<DeliveryResult, SubmitError> {
+        let mut state = self.state.lock().expect("runtime state mutex poisoned");
+        let RuntimeTurn::Running {
+            handle,
+            pending_steers,
+            ..
+        } = &mut state.turn
+        else {
+            return Err(SubmitError::Busy);
+        };
+
+        handle.push_input(input.clone());
+        pending_steers.push_back(input);
+        Ok(DeliveryResult::Steered)
+    }
+
+    fn queue_input(&mut self, input: InputMessage, events: mpsc::UnboundedSender<RuntimeEvent>) {
+        let mut state = self.state.lock().expect("runtime state mutex poisoned");
+        state.events = Some(events);
+        state.queue.push_back(vec![input]);
     }
 
     pub fn finish_success(&mut self, history: AgentHistory) {
-        complete_success(&self.state, history);
+        if let Some((turn, rollback, events, inputs)) = self.promote_next_queued(history) {
+            for input in inputs {
+                let _ = events.send(RuntimeEvent::QueuedInputSubmitted { input });
+            }
+            let state = Arc::clone(&self.state);
+            tokio::spawn(async move {
+                drive_turn(turn, rollback, events, state).await;
+            });
+        }
     }
 
     pub fn finish_failure(&mut self, history: AgentHistory) {
@@ -304,6 +381,7 @@ impl AgentRuntime {
             RuntimeTurn::Running {
                 handle,
                 abort_requested,
+                ..
             } => {
                 if mark_abort {
                     *abort_requested = true;
@@ -315,6 +393,47 @@ impl AgentRuntime {
             | RuntimeTurn::PendingAck { .. }
             | RuntimeTurn::Failed { .. } => Err(RuntimeControlError::NoActiveTurn),
         }
+    }
+
+    fn promote_next_queued(
+        &mut self,
+        history: AgentHistory,
+    ) -> Option<(
+        AgentTurnHandle,
+        AgentHistory,
+        mpsc::UnboundedSender<RuntimeEvent>,
+        QueuedInputBatch,
+    )> {
+        let mut state = self.state.lock().expect("runtime state mutex poisoned");
+        let Some(inputs) = state.queue.pop_front() else {
+            state.turn = RuntimeTurn::Ready { history };
+            return None;
+        };
+
+        let Some(events) = state.events.clone() else {
+            state.turn = RuntimeTurn::Ready { history };
+            state.queue.push_front(inputs);
+            return None;
+        };
+
+        let mut history = history;
+        let rollback = history.clone();
+        for input in inputs.iter().cloned() {
+            history.push_input(input);
+        }
+        let turn = start_turn(
+            history,
+            self.config.clone(),
+            Arc::clone(&self.model),
+            Arc::clone(&self.tools),
+        );
+        state.turn = RuntimeTurn::Running {
+            handle: turn.clone(),
+            abort_requested: false,
+            pending_steers: VecDeque::new(),
+        };
+
+        Some((turn, rollback, events, inputs))
     }
 }
 
@@ -331,6 +450,7 @@ async fn drive_turn(
                 if abort_requested(&state) {
                     complete_intentional_abort(turn, &state, &events).await;
                 } else {
+                    requeue_uncommitted_steers(&state, &events);
                     fail_turn(&state, &events, &rollback, error.to_string());
                 }
                 return;
@@ -338,6 +458,9 @@ async fn drive_turn(
         };
 
         for event in point.events().iter().cloned() {
+            if matches!(event, AgentEvent::InputCommitted { .. }) {
+                mark_steer_committed(&state);
+            }
             let _ = events.send(RuntimeEvent::Agent(event));
         }
 
@@ -346,6 +469,7 @@ async fn drive_turn(
             if abort_requested(&state) {
                 complete_intentional_abort(turn, &state, &events).await;
             } else {
+                requeue_uncommitted_steers(&state, &events);
                 fail_turn(&state, &events, &rollback, error.to_string());
             }
             return;
@@ -359,12 +483,14 @@ async fn drive_turn(
                         let _ = events.send(RuntimeEvent::Agent(event));
                     }
                     Err(error) => {
+                        requeue_uncommitted_steers(&state, &events);
                         fail_turn(&state, &events, &rollback, error.to_string());
                         return;
                     }
                 }
             }
 
+            requeue_uncommitted_steers(&state, &events);
             let history = turn.into_history().await;
             complete_pending_ack(&state, history.clone());
             if events
@@ -392,6 +518,7 @@ async fn complete_intentional_abort(
         }
     }
 
+    requeue_uncommitted_steers(state, events);
     let history = turn.into_history().await;
     complete_pending_ack(state, history.clone());
     if events
@@ -413,6 +540,36 @@ fn abort_requested(state: &Arc<Mutex<RuntimeState>>) -> bool {
             ..
         }
     )
+}
+
+fn mark_steer_committed(state: &Arc<Mutex<RuntimeState>>) {
+    let mut state = state.lock().expect("runtime state mutex poisoned");
+    if let RuntimeTurn::Running { pending_steers, .. } = &mut state.turn {
+        pending_steers.pop_front();
+    }
+}
+
+fn requeue_uncommitted_steers(
+    state: &Arc<Mutex<RuntimeState>>,
+    events: &mpsc::UnboundedSender<RuntimeEvent>,
+) {
+    let inputs = {
+        let mut state = state.lock().expect("runtime state mutex poisoned");
+        let inputs = {
+            let RuntimeTurn::Running { pending_steers, .. } = &mut state.turn else {
+                return;
+            };
+            pending_steers.drain(..).collect::<Vec<_>>()
+        };
+        if !inputs.is_empty() {
+            state.queue.push_front(inputs.clone());
+        }
+        inputs
+    };
+
+    for input in inputs {
+        let _ = events.send(RuntimeEvent::SteerQueued { input });
+    }
 }
 
 fn fail_turn(
@@ -456,7 +613,7 @@ fn complete_failure(state: &Arc<Mutex<RuntimeState>>, history: AgentHistory) {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentRuntime, RuntimeEvent, SubmitError};
+    use super::{AgentRuntime, DeliveryIntent, DeliveryResult, RuntimeEvent, SubmitError};
     use copro_agent::{AgentEvent, AgentTurnConfig, ToolExecutionPolicy, ToolRouter, async_trait};
     use copro_api::error::{Error, Result};
     use copro_api::message::{
@@ -466,7 +623,8 @@ mod tests {
     use copro_api::response::FinishReason;
     use copro_api::stream::{Model, ModelStream, OutputContentDelta, OutputStreamEvent};
     use copro_api::tool::ToolDefinition;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
     use tokio::sync::mpsc;
 
@@ -484,6 +642,49 @@ mod tests {
                     usage: None,
                 }),
             ]))
+        }
+    }
+
+    struct CapturingDoneModel {
+        requests: Arc<StdMutex<Vec<GenerateRequest>>>,
+    }
+
+    impl Model for CapturingDoneModel {
+        fn stream(&self, request: GenerateRequest) -> ModelStream {
+            self.requests
+                .lock()
+                .expect("captured request mutex poisoned")
+                .push(request);
+            Box::pin(futures_util::stream::iter(vec![Ok(
+                OutputStreamEvent::Finished {
+                    reason: FinishReason::Stop,
+                    usage: None,
+                },
+            )]))
+        }
+    }
+
+    struct FirstPendingThenDoneModel {
+        requests: Arc<StdMutex<Vec<GenerateRequest>>>,
+        streams: AtomicUsize,
+    }
+
+    impl Model for FirstPendingThenDoneModel {
+        fn stream(&self, request: GenerateRequest) -> ModelStream {
+            self.requests
+                .lock()
+                .expect("captured request mutex poisoned")
+                .push(request);
+            if self.streams.fetch_add(1, Ordering::SeqCst) == 0 {
+                Box::pin(futures_util::stream::pending())
+            } else {
+                Box::pin(futures_util::stream::iter(vec![Ok(
+                    OutputStreamEvent::Finished {
+                        reason: FinishReason::Stop,
+                        usage: None,
+                    },
+                )]))
+            }
         }
     }
 
@@ -553,6 +754,15 @@ mod tests {
         InputMessage::User(vec![InputContent::Text(text.to_string())])
     }
 
+    fn deliver(
+        runtime: &mut AgentRuntime,
+        intent: DeliveryIntent,
+        text: &str,
+        events: mpsc::UnboundedSender<RuntimeEvent>,
+    ) -> std::result::Result<DeliveryResult, SubmitError> {
+        runtime.accept_user_input(user_message(text), intent, events)
+    }
+
     fn runtime_messages(runtime: &AgentRuntime) -> Option<Vec<Message>> {
         runtime.history().map(|history| history.messages().to_vec())
     }
@@ -586,6 +796,27 @@ mod tests {
         .expect("runtime stayed busy");
     }
 
+    async fn wait_until_request_count(
+        requests: &Arc<StdMutex<Vec<GenerateRequest>>>,
+        count: usize,
+    ) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if requests
+                    .lock()
+                    .expect("captured request mutex poisoned")
+                    .len()
+                    >= count
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("request was not captured");
+    }
+
     #[test]
     fn runtime_can_start_with_initial_history() {
         let history = copro_agent::AgentHistory::from_messages(vec![developer_message(
@@ -606,7 +837,10 @@ mod tests {
         let mut runtime = runtime(TextModel);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        runtime.submit(user_message("hi"), tx).unwrap();
+        assert_eq!(
+            deliver(&mut runtime, DeliveryIntent::Submit, "hi", tx),
+            Ok(DeliveryResult::Submitted)
+        );
 
         let event = recv_terminal_event(&mut rx).await;
         let RuntimeEvent::TurnFinished { history } = event else {
@@ -638,7 +872,10 @@ mod tests {
         let mut runtime = runtime(TextModel);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        runtime.submit(user_message("first"), tx.clone()).unwrap();
+        assert_eq!(
+            deliver(&mut runtime, DeliveryIntent::Submit, "first", tx.clone()),
+            Ok(DeliveryResult::Submitted)
+        );
 
         let event = recv_terminal_event(&mut rx).await;
         let RuntimeEvent::TurnFinished { history } = event else {
@@ -646,7 +883,7 @@ mod tests {
         };
 
         assert_eq!(
-            runtime.submit(user_message("second"), tx),
+            deliver(&mut runtime, DeliveryIntent::Submit, "second", tx),
             Err(SubmitError::Busy)
         );
         assert!(runtime.is_busy());
@@ -654,7 +891,153 @@ mod tests {
         runtime.finish_success(history);
 
         let (tx, _rx) = mpsc::unbounded_channel();
-        assert_eq!(runtime.submit(user_message("second"), tx), Ok(()));
+        assert_eq!(
+            deliver(&mut runtime, DeliveryIntent::Submit, "second", tx),
+            Ok(DeliveryResult::Submitted)
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_inputs_start_separate_follow_up_turns() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut runtime = AgentRuntime::new(
+            AgentTurnConfig::default(),
+            Arc::new(CapturingDoneModel {
+                requests: Arc::clone(&requests),
+            }),
+            Arc::new(NoopTools),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        assert_eq!(
+            deliver(&mut runtime, DeliveryIntent::Submit, "first", tx.clone()),
+            Ok(DeliveryResult::Submitted)
+        );
+        let RuntimeEvent::TurnFinished { history } = recv_terminal_event(&mut rx).await else {
+            panic!("expected first turn finished event");
+        };
+
+        assert_eq!(
+            deliver(&mut runtime, DeliveryIntent::Queue, "second", tx.clone()),
+            Ok(DeliveryResult::Queued)
+        );
+        assert_eq!(
+            deliver(&mut runtime, DeliveryIntent::Queue, "third", tx),
+            Ok(DeliveryResult::Queued)
+        );
+        runtime.finish_success(history);
+
+        let RuntimeEvent::TurnFinished { history } = recv_terminal_event(&mut rx).await else {
+            panic!("expected second turn finished event");
+        };
+        runtime.finish_success(history);
+
+        let RuntimeEvent::TurnFinished { history } = recv_terminal_event(&mut rx).await else {
+            panic!("expected third turn finished event");
+        };
+        runtime.finish_success(history);
+
+        assert!(!runtime.is_busy());
+        assert_eq!(
+            *requests.lock().expect("captured request mutex poisoned"),
+            vec![
+                GenerateRequest {
+                    messages: vec![Message::user(vec![InputContent::Text("first".to_string())])],
+                    tools: Vec::new(),
+                    tool_choice: None,
+                    hosted_tools: Vec::new(),
+                    options: Default::default(),
+                },
+                GenerateRequest {
+                    messages: vec![
+                        Message::user(vec![InputContent::Text("first".to_string())]),
+                        Message::assistant(Vec::new()),
+                        Message::user(vec![InputContent::Text("second".to_string())]),
+                    ],
+                    tools: Vec::new(),
+                    tool_choice: None,
+                    hosted_tools: Vec::new(),
+                    options: Default::default(),
+                },
+                GenerateRequest {
+                    messages: vec![
+                        Message::user(vec![InputContent::Text("first".to_string())]),
+                        Message::assistant(Vec::new()),
+                        Message::user(vec![InputContent::Text("second".to_string())]),
+                        Message::assistant(Vec::new()),
+                        Message::user(vec![InputContent::Text("third".to_string())]),
+                    ],
+                    tools: Vec::new(),
+                    tool_choice: None,
+                    hosted_tools: Vec::new(),
+                    options: Default::default(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn uncommitted_steers_fallback_as_one_follow_up_turn() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut runtime = AgentRuntime::new(
+            AgentTurnConfig::default(),
+            Arc::new(FirstPendingThenDoneModel {
+                requests: Arc::clone(&requests),
+                streams: AtomicUsize::new(0),
+            }),
+            Arc::new(NoopTools),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        assert_eq!(
+            deliver(&mut runtime, DeliveryIntent::Submit, "first", tx.clone()),
+            Ok(DeliveryResult::Submitted)
+        );
+        wait_until_request_count(&requests, 1).await;
+        assert_eq!(
+            deliver(&mut runtime, DeliveryIntent::Steer, "second", tx.clone()),
+            Ok(DeliveryResult::Steered)
+        );
+        assert_eq!(
+            deliver(&mut runtime, DeliveryIntent::Steer, "third", tx.clone()),
+            Ok(DeliveryResult::Steered)
+        );
+        runtime.abort_active().await.unwrap();
+
+        let RuntimeEvent::TurnFinished { history } = recv_terminal_event(&mut rx).await else {
+            panic!("expected aborted first turn to finish");
+        };
+        runtime.finish_success(history);
+
+        let RuntimeEvent::TurnFinished { history } = recv_terminal_event(&mut rx).await else {
+            panic!("expected fallback turn to finish");
+        };
+        runtime.finish_success(history);
+
+        assert!(!runtime.is_busy());
+        assert_eq!(
+            *requests.lock().expect("captured request mutex poisoned"),
+            vec![
+                GenerateRequest {
+                    messages: vec![Message::user(vec![InputContent::Text("first".to_string())])],
+                    tools: Vec::new(),
+                    tool_choice: None,
+                    hosted_tools: Vec::new(),
+                    options: Default::default(),
+                },
+                GenerateRequest {
+                    messages: vec![
+                        Message::user(vec![InputContent::Text("first".to_string())]),
+                        Message::user(vec![InputContent::Text("second".to_string())]),
+                        Message::user(vec![InputContent::Text("third".to_string())]),
+                    ],
+                    tools: Vec::new(),
+                    tool_choice: None,
+                    hosted_tools: Vec::new(),
+                    options: Default::default(),
+                },
+            ]
+        );
     }
 
     #[tokio::test]
@@ -662,7 +1045,10 @@ mod tests {
         let mut runtime = runtime(TextModel);
         let (tx, rx) = mpsc::unbounded_channel();
 
-        runtime.submit(user_message("hi"), tx).unwrap();
+        assert_eq!(
+            deliver(&mut runtime, DeliveryIntent::Submit, "hi", tx),
+            Ok(DeliveryResult::Submitted)
+        );
         drop(rx);
 
         wait_until_not_busy(&runtime).await;
@@ -676,7 +1062,10 @@ mod tests {
         );
 
         let (tx, _rx) = mpsc::unbounded_channel();
-        assert_eq!(runtime.submit(user_message("again"), tx), Ok(()));
+        assert_eq!(
+            deliver(&mut runtime, DeliveryIntent::Submit, "again", tx),
+            Ok(DeliveryResult::Submitted)
+        );
     }
 
     #[tokio::test]
@@ -684,7 +1073,10 @@ mod tests {
         let mut runtime = runtime(FailingModel);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        runtime.submit(user_message("hi"), tx).unwrap();
+        assert_eq!(
+            deliver(&mut runtime, DeliveryIntent::Submit, "hi", tx),
+            Ok(DeliveryResult::Submitted)
+        );
 
         let event = recv_terminal_event(&mut rx).await;
         let RuntimeEvent::TurnFailed { history, message } = event else {
@@ -705,7 +1097,10 @@ mod tests {
         let mut runtime = runtime(DeltaThenFailModel);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        runtime.submit(user_message("hi"), tx).unwrap();
+        assert_eq!(
+            deliver(&mut runtime, DeliveryIntent::Submit, "hi", tx),
+            Ok(DeliveryResult::Submitted)
+        );
 
         let (history, message) = loop {
             let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -733,10 +1128,13 @@ mod tests {
         let mut runtime = runtime(PendingModel);
         let (tx, _rx) = mpsc::unbounded_channel();
 
-        runtime.submit(user_message("first"), tx.clone()).unwrap();
+        assert_eq!(
+            deliver(&mut runtime, DeliveryIntent::Submit, "first", tx.clone()),
+            Ok(DeliveryResult::Submitted)
+        );
 
         assert_eq!(
-            runtime.submit(user_message("second"), tx),
+            deliver(&mut runtime, DeliveryIntent::Submit, "second", tx),
             Err(SubmitError::Busy)
         );
         assert!(runtime.is_busy());

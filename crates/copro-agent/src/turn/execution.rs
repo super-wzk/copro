@@ -276,6 +276,24 @@ impl<'a> AgentTurn<'a> {
                 Ok(ActionExecution::Outcome(AgentOutcome::ToolsLoaded(tools)))
             }
             AgentAction::BuildRequest { tools } => {
+                let pending_inputs = self.state.pending_inputs.drain();
+                for input in pending_inputs {
+                    let message_index = self.state.history.messages().len();
+                    self.state.history.push_input(input.clone());
+                    if !emit(
+                        events,
+                        AgentEvent::InputCommitted {
+                            step_id: step.id,
+                            message_index,
+                            input,
+                        },
+                    )
+                    .await
+                    {
+                        return Ok(ActionExecution::Stop);
+                    }
+                }
+
                 let request = turn.build_request(
                     self.state.history.messages(),
                     tools.clone(),

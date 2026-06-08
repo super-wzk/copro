@@ -322,6 +322,12 @@ pub enum BlockKind {
     Tool(ToolBlockState),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingDelivery {
+    Steer,
+    Queue,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantItem {
     Text(String),

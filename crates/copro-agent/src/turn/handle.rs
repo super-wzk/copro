@@ -1,12 +1,12 @@
 use super::{
     AgentCheckpoint, AgentControl, AgentControlKind, AgentControlSignal, AgentOutcome, AgentStep,
-    AgentStepId, AgentStepReport, AgentStreamItem, AgentTurnState,
+    AgentStepId, AgentStepReport, AgentStreamItem, AgentTurnState, PendingTurnInputs,
 };
 use crate::cancel::TurnCancellation;
 use crate::event::{AgentEvent, AgentStream};
 use crate::history::AgentHistory;
 use copro_api::error::{Error, Result};
-use copro_api::message::{OutputContent, ToolCall, ToolCallId, ToolResult};
+use copro_api::message::{InputMessage, OutputContent, ToolCall, ToolCallId, ToolResult};
 use copro_api::response::FinishReason;
 use std::collections::HashSet;
 use std::fmt;
@@ -31,6 +31,7 @@ pub struct AgentTurnHandle {
     cancellation: TurnCancellation,
     driver_active: Arc<AtomicBool>,
     completion: AgentTurnCompletion,
+    pending_inputs: PendingTurnInputs,
 }
 
 #[derive(Clone)]
@@ -78,6 +79,7 @@ impl AgentTurnHandle {
         events: mpsc::Receiver<AgentStreamItem>,
         cancellation: TurnCancellation,
         completion: AgentTurnCompletion,
+        pending_inputs: PendingTurnInputs,
     ) -> Self {
         Self {
             events: Arc::new(Mutex::new(events)),
@@ -91,6 +93,7 @@ impl AgentTurnHandle {
             cancellation,
             driver_active: Arc::new(AtomicBool::new(false)),
             completion,
+            pending_inputs,
         }
     }
 
@@ -248,6 +251,10 @@ impl AgentTurnHandle {
             inner.defer_preempt();
         }
         Ok(())
+    }
+
+    pub fn push_input(&self, input: InputMessage) {
+        self.pending_inputs.push(input);
     }
 
     pub async fn state(&self) -> Result<AgentTurnState> {

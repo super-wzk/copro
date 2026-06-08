@@ -1,6 +1,6 @@
 use crate::turn::{AgentOutcome, AgentStep, AgentStepId};
 use copro_api::error::Result;
-use copro_api::message::{OutputContent, ToolCall, ToolResult};
+use copro_api::message::{InputMessage, OutputContent, ToolCall, ToolResult};
 use copro_api::response::{FinishReason, Usage};
 use copro_api::stream::OutputContentDelta;
 use std::pin::Pin;
@@ -39,6 +39,11 @@ pub enum AgentEvent {
         outcome: AgentOutcome,
     },
 
+    InputCommitted {
+        step_id: AgentStepId,
+        message_index: usize,
+        input: InputMessage,
+    },
     ModelDelta {
         step_id: AgentStepId,
         content_index: usize,
@@ -75,7 +80,8 @@ impl AgentEvent {
             | Self::StepStarted { step }
             | Self::StepCompleted { step, .. }
             | Self::ControlRequired { step, .. } => Some(step.id),
-            Self::ModelDelta { step_id, .. }
+            Self::InputCommitted { step_id, .. }
+            | Self::ModelDelta { step_id, .. }
             | Self::AssistantCommitted { step_id, .. }
             | Self::ToolStarted { step_id, .. }
             | Self::ToolResultCommitted { step_id, .. } => Some(*step_id),
