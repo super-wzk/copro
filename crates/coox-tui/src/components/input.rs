@@ -125,6 +125,98 @@ impl InputEditor {
         self.cursor_visual_hint = None;
     }
 
+    pub fn move_word_left(&mut self) {
+        let mut target = self.cursor_byte;
+
+        while let Some((index, ch)) = previous_char_before(&self.text, target) {
+            if is_word_char(ch) {
+                break;
+            }
+            target = index;
+        }
+
+        while let Some((index, ch)) = previous_char_before(&self.text, target) {
+            if !is_word_char(ch) {
+                break;
+            }
+            target = index;
+        }
+
+        self.cursor_byte = target;
+        self.cursor_visual_hint = None;
+    }
+
+    pub fn move_word_right(&mut self) {
+        let mut target = self.cursor_byte;
+
+        while let Some((index, ch)) = next_char_at(&self.text, target) {
+            if is_word_char(ch) {
+                break;
+            }
+            target = index + ch.len_utf8();
+        }
+
+        while let Some((index, ch)) = next_char_at(&self.text, target) {
+            if !is_word_char(ch) {
+                break;
+            }
+            target = index + ch.len_utf8();
+        }
+
+        self.cursor_byte = target;
+        self.cursor_visual_hint = None;
+    }
+
+    pub fn move_line_start(&mut self) {
+        self.cursor_byte = self.text[..self.cursor_byte]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        self.cursor_visual_hint = None;
+    }
+
+    pub fn move_line_end(&mut self) {
+        self.cursor_byte = self.text[self.cursor_byte..]
+            .find('\n')
+            .map(|offset| self.cursor_byte + offset)
+            .unwrap_or(self.text.len());
+        self.cursor_visual_hint = None;
+    }
+
+    pub fn move_visual_line_start(&mut self, width: usize) {
+        let (positions, _) = self.visual_positions(width);
+        let current = self.position_for_cursor(&positions, width);
+        let Some(target) = visual_line_position(&positions, current.row, VisualLineEdge::Start)
+        else {
+            return;
+        };
+
+        self.cursor_byte = target.byte;
+        self.cursor_visual_hint = Some(CursorVisualHint::new(width, target.row));
+    }
+
+    pub fn move_visual_line_end(&mut self, width: usize) {
+        let (positions, _) = self.visual_positions(width);
+        let current = self.position_for_cursor(&positions, width);
+        let Some(target) = visual_line_position(&positions, current.row, VisualLineEdge::End)
+        else {
+            return;
+        };
+
+        self.cursor_byte = target.byte;
+        self.cursor_visual_hint = Some(CursorVisualHint::new(width, target.row));
+    }
+
+    pub fn move_buffer_start(&mut self) {
+        self.cursor_byte = 0;
+        self.cursor_visual_hint = None;
+    }
+
+    pub fn move_buffer_end(&mut self) {
+        self.cursor_byte = self.text.len();
+        self.cursor_visual_hint = None;
+    }
+
     pub fn move_up(&mut self, width: usize) {
         self.move_vertical(width, -1);
     }
@@ -318,6 +410,21 @@ fn normalize_input_insert(text: &str) -> String {
         .join("\n")
 }
 
+fn previous_char_before(text: &str, byte: usize) -> Option<(usize, char)> {
+    text[..byte].char_indices().next_back()
+}
+
+fn next_char_at(text: &str, byte: usize) -> Option<(usize, char)> {
+    text[byte..]
+        .char_indices()
+        .next()
+        .map(|(offset, ch)| (byte + offset, ch))
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
+}
+
 fn next_display_col(text: &str, row_start: usize, index: usize, end: usize, col: usize) -> usize {
     if text[index..end].is_ascii() {
         col + display_width(&text[index..end])
@@ -380,6 +487,28 @@ fn visual_position_for_row_col(
         .copied()
         .or_else(|| row_positions.first().copied())
         .unwrap_or_default()
+}
+
+fn visual_line_position(
+    positions: &[VisualPosition],
+    row: usize,
+    edge: VisualLineEdge,
+) -> Option<VisualPosition> {
+    let row_positions = positions
+        .iter()
+        .copied()
+        .filter(|position| position.row == row);
+
+    match edge {
+        VisualLineEdge::Start => row_positions.min_by_key(|position| position.col),
+        VisualLineEdge::End => row_positions.max_by_key(|position| position.col),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisualLineEdge {
+    Start,
+    End,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1242,6 +1371,87 @@ mod tests {
 
         input.move_right();
         assert_eq!(input.cursor(), 4);
+    }
+
+    #[test]
+    fn word_cursor_movement_uses_unicode_word_boundaries() {
+        let text = "你好, swift cursor";
+        let mut input = InputEditor::default();
+        input.insert_str(text);
+
+        input.move_word_left();
+        assert_eq!(input.cursor(), "你好, swift ".len());
+
+        input.move_word_left();
+        assert_eq!(input.cursor(), "你好, ".len());
+
+        input.move_word_left();
+        assert_eq!(input.cursor(), 0);
+
+        input.move_word_right();
+        assert_eq!(input.cursor(), "你好".len());
+
+        input.move_word_right();
+        assert_eq!(input.cursor(), "你好, swift".len());
+
+        input.move_word_right();
+        assert_eq!(input.cursor(), text.len());
+    }
+
+    #[test]
+    fn line_cursor_movement_uses_hard_newline_boundaries() {
+        let text = "alpha\nbeta gamma";
+        let mut input = InputEditor::default();
+        input.insert_str(text);
+
+        input.move_line_start();
+        assert_eq!(input.cursor(), "alpha\n".len());
+
+        input.move_line_end();
+        assert_eq!(input.cursor(), text.len());
+
+        input.move_line_start();
+        input.move_left();
+        input.move_line_start();
+        assert_eq!(input.cursor(), 0);
+
+        input.move_line_end();
+        assert_eq!(input.cursor(), "alpha".len());
+    }
+
+    #[test]
+    fn visual_line_cursor_movement_uses_soft_wrap_boundaries() {
+        let mut input = InputEditor::default();
+        input.insert_str("abcd");
+
+        input.move_visual_line_start(2);
+        assert_eq!(input.cursor(), 2);
+        assert_eq!(input.cursor_visual_position(2), (1, 0));
+
+        input.move_visual_line_end(2);
+        assert_eq!(input.cursor(), 4);
+        assert_eq!(input.cursor_visual_position(2), (1, 2));
+
+        input.move_buffer_start();
+        input.move_visual_line_end(2);
+        assert_eq!(input.cursor(), 2);
+        assert_eq!(input.cursor_visual_position(2), (0, 2));
+
+        input.move_visual_line_start(2);
+        assert_eq!(input.cursor(), 0);
+        assert_eq!(input.cursor_visual_position(2), (0, 0));
+    }
+
+    #[test]
+    fn buffer_cursor_movement_uses_document_boundaries() {
+        let mut input = InputEditor::default();
+        input.insert_str("alpha\nbeta");
+
+        input.move_buffer_start();
+        assert_eq!(input.cursor(), 0);
+
+        input.move_buffer_end();
+        assert_eq!(input.cursor(), "alpha\nbeta".len());
     }
 
     #[test]

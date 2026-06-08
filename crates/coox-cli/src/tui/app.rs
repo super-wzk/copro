@@ -3,12 +3,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::agent::config::{RuntimeConfig, build_model};
+use crate::agent::config::{build_model, RuntimeConfig};
 use crate::agent::events::{apply_agent_event, apply_runtime_error};
 use crate::agent::runtime::{AgentRuntime, RuntimeEvent, RuntimeTurnSnapshot, SubmitError};
 use crate::command::{
-    AppCommand, InputIntent, RuntimeCommand, SessionSnapshot, SlashCommandRegistry, SlashError,
-    TurnSnapshot, UiCommand, builtins, parse_input,
+    builtins, parse_input, AppCommand, InputIntent, RuntimeCommand, SessionSnapshot,
+    SlashCommandRegistry, SlashError, TurnSnapshot, UiCommand,
 };
 use crate::tui::components::{
     command_menu::CommandMenu,
@@ -22,7 +22,7 @@ use coox_tui::{
     clipboard::ClipboardHandler,
     components::{
         image::ImageRenderer,
-        input::{INPUT_BOX_PADDING, InputBox, InputEditor},
+        input::{InputBox, InputEditor, INPUT_BOX_PADDING},
         scroll_view::ScrollViewState,
     },
     selection::{Selection, SelectionManager, SelectionMap, TextPosition},
@@ -34,11 +34,11 @@ use crossterm::event::{
     MouseEventKind,
 };
 use ratatui::{
-    Frame, Terminal,
-    backend::Backend,
-    buffer::Buffer,
+    backend::Backend, buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     widgets::FrameExt,
+    Frame,
+    Terminal,
 };
 use tokio::sync::mpsc;
 
@@ -882,6 +882,60 @@ fn handle_key(app: &mut App, key: KeyEvent, input_width: usize) -> DirtyState {
                 app.command_menu.input_changed();
                 DirtyState::frame()
             }
+            KeyCode::Char('a' | 'A') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.input.move_line_start();
+                DirtyState::frame()
+            }
+            KeyCode::Char('e' | 'E') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.input.move_line_end();
+                DirtyState::frame()
+            }
+            // KeyCode::Home if key.modifiers.is_empty() => {
+            //     app.input.move_buffer_start();
+            //     DirtyState::frame()
+            // }
+            // KeyCode::End if key.modifiers.is_empty() => {
+            //     app.input.move_buffer_end();
+            //     DirtyState::frame()
+            // }
+            // KeyCode::Up if key.modifiers.contains(KeyModifiers::SUPER) => {
+            //     app.input.move_buffer_start();
+            //     DirtyState::frame()
+            // }
+            // KeyCode::Down if key.modifiers.contains(KeyModifiers::SUPER) => {
+            //     app.input.move_buffer_end();
+            //     DirtyState::frame()
+            // }
+            // KeyCode::Left if key.modifiers.contains(KeyModifiers::SUPER) => {
+            //     app.input.move_visual_line_start(input_width);
+            //     DirtyState::frame()
+            // }
+            // KeyCode::Right if key.modifiers.contains(KeyModifiers::SUPER) => {
+            //     app.input.move_visual_line_end(input_width);
+            //     DirtyState::frame()
+            // }
+            // KeyCode::Left
+            //     if key.modifiers.contains(KeyModifiers::ALT)
+            //         || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            // {
+            //     app.input.move_word_left();
+            //     DirtyState::frame()
+            // }
+            // KeyCode::Right
+            //     if key.modifiers.contains(KeyModifiers::ALT)
+            //         || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            // {
+            //     app.input.move_word_right();
+            //     DirtyState::frame()
+            // }
+            KeyCode::Char('b' | 'B') if key.modifiers.contains(KeyModifiers::ALT) => {
+                app.input.move_word_left();
+                DirtyState::frame()
+            }
+            KeyCode::Char('f' | 'F') if key.modifiers.contains(KeyModifiers::ALT) => {
+                app.input.move_word_right();
+                DirtyState::frame()
+            }
             KeyCode::Left => {
                 app.input.move_left();
                 DirtyState::frame()
@@ -1182,14 +1236,14 @@ fn push_notification(app: &mut App, kind: NotificationKind, message: impl Into<S
 mod tests {
     use super::*;
     use copro_agent::AgentHistory;
-    use copro_agent::{AgentTurnConfig, ToolExecutionPolicy, ToolRouter, async_trait};
+    use copro_agent::{async_trait, AgentTurnConfig, ToolExecutionPolicy, ToolRouter};
     use copro_api::error::{Error, Result};
     use copro_api::message::{Message, ToolCall, ToolResult};
     use copro_api::request::GenerateRequest;
     use copro_api::response::FinishReason;
     use copro_api::stream::{Model, ModelStream, OutputContentDelta, OutputStreamEvent};
     use copro_api::tool::ToolDefinition;
-    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Modifier};
+    use ratatui::{backend::TestBackend, buffer::Buffer, style::Modifier, Terminal};
     use std::sync::Arc;
 
     struct FinishedModel;
@@ -2457,6 +2511,148 @@ mod tests {
             20,
         );
         assert_eq!(app.input.cursor(), 4);
+    }
+
+    #[test]
+    fn option_arrow_keys_move_input_cursor_by_word() {
+        let mut app = app_with(FinishedModel);
+        let text = "alpha beta";
+        insert_text(&mut app.input, text);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            20,
+        );
+        assert_eq!(app.input.cursor(), "alpha ".len());
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            20,
+        );
+        assert_eq!(app.input.cursor(), text.len());
+    }
+
+    #[test]
+    fn option_word_fallback_keys_move_input_cursor_by_word() {
+        let mut app = app_with(FinishedModel);
+        let text = "alpha beta";
+        insert_text(&mut app.input, text);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            20,
+        );
+        assert_eq!(app.input.cursor(), "alpha ".len());
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+            20,
+        );
+        assert_eq!(app.input.cursor(), text.len());
+    }
+
+    #[test]
+    fn control_arrow_keys_move_input_cursor_by_word() {
+        let mut app = app_with(FinishedModel);
+        let text = "alpha beta";
+        insert_text(&mut app.input, text);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+            20,
+        );
+        assert_eq!(app.input.cursor(), "alpha ".len());
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+            20,
+        );
+        assert_eq!(app.input.cursor(), text.len());
+    }
+
+    #[test]
+    fn command_arrow_keys_move_input_cursor_to_visual_line_edges() {
+        let mut app = app_with(FinishedModel);
+        let text = "abcd";
+        insert_text(&mut app.input, text);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::SUPER),
+            2,
+        );
+        assert_eq!(app.input.cursor(), 2);
+        assert_eq!(app.input.cursor_visual_position(2), (1, 0));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SUPER),
+            2,
+        );
+        assert_eq!(app.input.cursor(), text.len());
+        assert_eq!(app.input.cursor_visual_position(2), (1, 2));
+    }
+
+    #[test]
+    fn command_vertical_arrows_and_home_end_move_input_cursor_to_buffer_edges() {
+        let mut app = app_with(FinishedModel);
+        let text = "alpha\nbeta";
+        insert_text(&mut app.input, text);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER),
+            20,
+        );
+        assert_eq!(app.input.cursor(), 0);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+            20,
+        );
+        assert_eq!(app.input.cursor(), text.len());
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+            20,
+        );
+        assert_eq!(app.input.cursor(), 0);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER),
+            20,
+        );
+        assert_eq!(app.input.cursor(), text.len());
+    }
+
+    #[test]
+    fn control_a_e_move_input_cursor_to_hard_line_edges() {
+        let mut app = app_with(FinishedModel);
+        let text = "alpha\nbeta";
+        insert_text(&mut app.input, text);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            20,
+        );
+        assert_eq!(app.input.cursor(), "alpha\n".len());
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            20,
+        );
+        assert_eq!(app.input.cursor(), text.len());
     }
 
     #[test]

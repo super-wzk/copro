@@ -1,6 +1,10 @@
 use std::io;
 
 use coox_tui::components::image::ImageRenderer;
+#[cfg(not(windows))]
+use crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::{
     cursor::{DisableBlinking, SetCursorStyle},
     event::{DisableMouseCapture, EnableMouseCapture},
@@ -45,12 +49,25 @@ impl Tui {
 }
 
 fn enter_terminal_screen(writer: &mut impl io::Write) -> io::Result<()> {
+    execute!(writer, EnterAlternateScreen, EnableMouseCapture)?;
+    push_keyboard_enhancement_flags(writer)?;
+    execute!(writer, DisableBlinking)
+}
+
+#[cfg(not(windows))]
+fn push_keyboard_enhancement_flags(writer: &mut impl io::Write) -> io::Result<()> {
     execute!(
         writer,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        DisableBlinking
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS,
+        )
     )
+}
+
+#[cfg(windows)]
+fn push_keyboard_enhancement_flags(_writer: &mut impl io::Write) -> io::Result<()> {
+    Ok(())
 }
 
 impl Drop for Tui {
@@ -70,12 +87,19 @@ fn restore_terminal() -> io::Result<()> {
 }
 
 fn restore_terminal_screen(writer: &mut impl io::Write) -> io::Result<()> {
-    execute!(
-        writer,
-        SetCursorStyle::DefaultUserShape,
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )
+    execute!(writer, SetCursorStyle::DefaultUserShape)?;
+    pop_keyboard_enhancement_flags(writer)?;
+    execute!(writer, DisableMouseCapture, LeaveAlternateScreen)
+}
+
+#[cfg(not(windows))]
+fn pop_keyboard_enhancement_flags(writer: &mut impl io::Write) -> io::Result<()> {
+    execute!(writer, PopKeyboardEnhancementFlags)
+}
+
+#[cfg(windows)]
+fn pop_keyboard_enhancement_flags(_writer: &mut impl io::Write) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -106,6 +130,7 @@ mod tests {
         assert!(output.contains("\u{1b}[?1002h"));
         assert!(output.contains("\u{1b}[?1003h"));
         assert!(output.contains("\u{1b}[?1006h"));
+        assert!(output.contains("\u{1b}[>5u"));
     }
 
     #[test]
@@ -119,5 +144,6 @@ mod tests {
         assert!(output.contains("\u{1b}[?1002l"));
         assert!(output.contains("\u{1b}[?1003l"));
         assert!(output.contains("\u{1b}[?1006l"));
+        assert!(output.contains("\u{1b}[<1u"));
     }
 }
