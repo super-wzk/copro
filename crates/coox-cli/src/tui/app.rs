@@ -890,44 +890,44 @@ fn handle_key(app: &mut App, key: KeyEvent, input_width: usize) -> DirtyState {
                 app.input.move_line_end();
                 DirtyState::frame()
             }
-            // KeyCode::Home if key.modifiers.is_empty() => {
-            //     app.input.move_buffer_start();
-            //     DirtyState::frame()
-            // }
-            // KeyCode::End if key.modifiers.is_empty() => {
-            //     app.input.move_buffer_end();
-            //     DirtyState::frame()
-            // }
-            // KeyCode::Up if key.modifiers.contains(KeyModifiers::SUPER) => {
-            //     app.input.move_buffer_start();
-            //     DirtyState::frame()
-            // }
-            // KeyCode::Down if key.modifiers.contains(KeyModifiers::SUPER) => {
-            //     app.input.move_buffer_end();
-            //     DirtyState::frame()
-            // }
-            // KeyCode::Left if key.modifiers.contains(KeyModifiers::SUPER) => {
-            //     app.input.move_visual_line_start(input_width);
-            //     DirtyState::frame()
-            // }
-            // KeyCode::Right if key.modifiers.contains(KeyModifiers::SUPER) => {
-            //     app.input.move_visual_line_end(input_width);
-            //     DirtyState::frame()
-            // }
-            // KeyCode::Left
-            //     if key.modifiers.contains(KeyModifiers::ALT)
-            //         || key.modifiers.contains(KeyModifiers::CONTROL) =>
-            // {
-            //     app.input.move_word_left();
-            //     DirtyState::frame()
-            // }
-            // KeyCode::Right
-            //     if key.modifiers.contains(KeyModifiers::ALT)
-            //         || key.modifiers.contains(KeyModifiers::CONTROL) =>
-            // {
-            //     app.input.move_word_right();
-            //     DirtyState::frame()
-            // }
+            KeyCode::Home if key.modifiers.is_empty() => {
+                app.input.move_buffer_start();
+                DirtyState::frame()
+            }
+            KeyCode::End if key.modifiers.is_empty() => {
+                app.input.move_buffer_end();
+                DirtyState::frame()
+            }
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SUPER) => {
+                app.input.move_buffer_start();
+                DirtyState::frame()
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SUPER) => {
+                app.input.move_buffer_end();
+                DirtyState::frame()
+            }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SUPER) => {
+                app.input.move_visual_line_start(input_width);
+                DirtyState::frame()
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SUPER) => {
+                app.input.move_visual_line_end(input_width);
+                DirtyState::frame()
+            }
+            KeyCode::Left
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                app.input.move_word_left();
+                DirtyState::frame()
+            }
+            KeyCode::Right
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                app.input.move_word_right();
+                DirtyState::frame()
+            }
             KeyCode::Char('b' | 'B') if key.modifiers.contains(KeyModifiers::ALT) => {
                 app.input.move_word_left();
                 DirtyState::frame()
